@@ -1,0 +1,50 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package libmotionphoto.motion_photo;
+
+option java_multiple_files = true;
+option java_package = "com.google.libmotionphoto.motionphoto.proto";
+option optimize_for = LITE_RUNTIME;
+
+enum BlockType {
+  BLOCK_TYPE_UNKNOWN = 0;
+  BLOCK_TYPE_EXIF = 1;
+  BLOCK_TYPE_XMP = 2;
+  BLOCK_TYPE_ICC = 3;
+  BLOCK_TYPE_PROPRIETARY = 4;
+  BLOCK_TYPE_JFIF = 5;
+  BLOCK_TYPE_LAST = 6;  // Must be updated when adding new types.
+}
+
+message MetadataBlock {
+  BlockType type = 1;
+  string format_identifier = 2;
+  bytes raw_bytes = 3;
+  // Note: This proto is only used for the ephemeral JNI bridge between C++ and
+  // Java in the same process.
+  optional string payload_type_url = 8;
+  optional bytes decoded_payload_bytes = 9;
+
+  reserved 4;
+  int64 offset = 5;
+  optional int64 video_offset_in_block = 6;
+  optional int64 video_length = 7;
+}
+
+message MetadataCollection {
+  repeated MetadataBlock blocks = 1;
+}

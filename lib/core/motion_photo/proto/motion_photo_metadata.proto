@@ -1,0 +1,44 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package libmotionphoto.motion_photo;
+
+option java_multiple_files = true;
+option java_package = "com.google.libmotionphoto.motionphoto.proto";
+option optimize_for = LITE_RUNTIME;
+
+message MotionPhotoMetadata {
+  enum MotionPhotoType {
+    MOTION_PHOTO_TYPE_UNKNOWN = 0;
+    MOTION_PHOTO_TYPE_REGULAR_PHOTO = 1;
+    MOTION_PHOTO_TYPE_MOTION_PHOTO = 2;
+  }
+
+  MotionPhotoType type = 1;
+  int32 version = 2;
+  int64 primary_image_timestamp_us = 3;
+
+  // Video track details (stabilization, scores)
+  optional bool low_res_video_stabilized = 4;
+  optional bool high_res_video_stabilized = 5;
+  optional int32 score_model_version = 6;
+
+  message FrameScore {
+    float score = 1;
+    int64 timestamp_us = 2;
+  }
+  repeated FrameScore high_res_video_scores = 7;
+}

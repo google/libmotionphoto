@@ -1,0 +1,32 @@
+<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Adobe XMP Core 5.1.0-jc003">
+  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+    <rdf:Description rdf:about=""
+      xmlns:Metadata="http://ns.google.com/1.0/motion_photo_video_metadata/">
+      <Metadata:Flags>
+        <Metadata:LowRes Metadata:Stabilized="0"/>
+        <Metadata:HighRes Metadata:Stabilized="0" />
+      </Metadata:Flags>
+      <Metadata:Scores Metadata:ModelVersion="1">
+        <Metadata:PrimaryImage>
+          <Metadata:Frame Metadata:Score="0.1" Metadata:Time="500000" />
+        </Metadata:PrimaryImage>
+        <Metadata:HighResTrack>
+          <rdf:Seq>
+            <rdf:li>
+              <Metadata:Frame Metadata:Score="0.4" Metadata:Time="0" />
+            </rdf:li>
+            <rdf:li>
+              <Metadata:Frame Metadata:Score="0.6" Metadata:Time="1000000" />
+            </rdf:li>
+            <rdf:li>
+              <Metadata:Frame Metadata:Score="0.3" Metadata:Time="2000000" />
+            </rdf:li>
+            <rdf:li>
+              <Metadata:Frame Metadata:Score="0.5" Metadata:Time="3000000" />
+            </rdf:li>
+          </rdf:Seq>
+        </Metadata:HighResTrack>
+      </Metadata:Scores>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>

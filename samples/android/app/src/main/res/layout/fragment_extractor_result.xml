@@ -1,0 +1,372 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+ Copyright 2026 Google LLC
+
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+-->
+<androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:padding="16dp">
+
+    <TextView
+        android:id="@+id/tv_title"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:text="@string/title_extraction_result"
+        android:textSize="18sp"
+        android:textStyle="bold"
+        android:gravity="center"
+        android:paddingBottom="16dp"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"/>
+
+    <!-- TABS (Preview first, Logs second) -->
+    <com.google.android.material.tabs.TabLayout
+        android:id="@+id/extractor_tab_layout"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        app:layout_constraintTop_toBottomOf="@id/tv_title"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent">
+        <com.google.android.material.tabs.TabItem
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/tab_preview" />
+        <com.google.android.material.tabs.TabItem
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/tab_compare" />
+        <com.google.android.material.tabs.TabItem
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/tab_logs" />
+    </com.google.android.material.tabs.TabLayout>
+
+    <!-- TAB CONTENT CONTAINER -->
+    <FrameLayout
+        android:id="@+id/fl_tab_content_container"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:layout_marginTop="8dp"
+        app:layout_constraintTop_toBottomOf="@id/extractor_tab_layout"
+        app:layout_constraintBottom_toTopOf="@+id/btn_extractor_download"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent">
+
+        <!-- Tab 1: Preview (Default, visible initially) -->
+        <androidx.constraintlayout.widget.ConstraintLayout
+            android:id="@+id/ll_extractor_result_preview"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:visibility="visible">
+
+            <!-- SUB-TABS (Image, Video, Metadata) -->
+            <com.google.android.material.tabs.TabLayout
+                android:id="@+id/extractor_preview_sub_tab_layout"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:background="?android:attr/windowBackground"
+                app:layout_constraintTop_toTopOf="parent"
+                app:layout_constraintStart_toStartOf="parent"
+                app:layout_constraintEnd_toEndOf="parent">
+                <com.google.android.material.tabs.TabItem
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/subtab_image" />
+                <com.google.android.material.tabs.TabItem
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/subtab_video" />
+                <com.google.android.material.tabs.TabItem
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/subtab_metadata" />
+            </com.google.android.material.tabs.TabLayout>
+
+            <!-- SUB-TAB CONTENT CONTAINER -->
+            <FrameLayout
+                android:id="@+id/fl_subtab_content"
+                android:layout_width="0dp"
+                android:layout_height="0dp"
+                android:layout_marginTop="8dp"
+                app:layout_constraintTop_toBottomOf="@id/extractor_preview_sub_tab_layout"
+                app:layout_constraintBottom_toBottomOf="parent"
+                app:layout_constraintStart_toStartOf="parent"
+                app:layout_constraintEnd_toEndOf="parent">
+
+                <!-- Sub-Tab 1: Image (Default, visible initially) -->
+                <ImageView
+                    android:id="@+id/iv_extractor_result_image"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent"
+                    android:scaleType="fitCenter"
+                    android:background="#CCCCCC"
+                    android:contentDescription="@null"/>
+
+                <!-- Sub-Tab 2: Video (Hidden initially) -->
+                <FrameLayout
+                    android:id="@+id/fl_extractor_result_video_container"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent"
+                    android:visibility="gone">
+                    <androidx.media3.ui.PlayerView
+                        android:id="@+id/pv_extractor_result_video"
+                        android:layout_width="match_parent"
+                        android:layout_height="match_parent"
+                        android:layout_gravity="center"
+                        app:use_controller="true"
+                        app:resize_mode="fit"/>
+                </FrameLayout>
+
+                <!-- Sub-Tab 3: Metadata (Hidden initially) -->
+                <ScrollView
+                    android:id="@+id/sv_extractor_result_metadata"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent"
+                    android:background="#DDDDDD"
+                    android:visibility="gone">
+                    <androidx.constraintlayout.widget.ConstraintLayout
+                        android:id="@+id/cl_metadata_blocks_container"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:padding="8dp"/>
+                </ScrollView>
+            </FrameLayout>
+        </androidx.constraintlayout.widget.ConstraintLayout>
+
+        <!-- Tab 2: Compare (Interactive Split-Slider View) -->
+        <androidx.constraintlayout.widget.ConstraintLayout
+            android:id="@+id/ll_extractor_result_compare"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:visibility="gone">
+
+            <FrameLayout
+                android:id="@+id/fl_compare_overlay_container"
+                android:layout_width="0dp"
+                android:layout_height="0dp"
+                android:background="#000000"
+                app:layout_constraintTop_toTopOf="parent"
+                app:layout_constraintBottom_toTopOf="@+id/slider_compare_split"
+                app:layout_constraintStart_toStartOf="parent"
+                app:layout_constraintEnd_toEndOf="parent">
+
+                <!-- Video View (Right / Bottom layer) -->
+                <FrameLayout
+                    android:id="@+id/fl_compare_video_container"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent">
+                    <androidx.media3.ui.PlayerView
+                        android:id="@+id/pv_compare_video"
+                        android:layout_width="match_parent"
+                        android:layout_height="match_parent"
+                        android:layout_gravity="center"
+                        app:use_controller="false"
+                        app:resize_mode="fit"/>
+                </FrameLayout>
+
+                <!-- Still Image View (Left / Top layer clipped) -->
+                <ImageView
+                    android:id="@+id/iv_compare_image"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent"
+                    android:scaleType="fitCenter"
+                    android:background="#00000000"
+                    android:contentDescription="@null"/>
+
+                <!-- Vertical Divider Line -->
+                <View
+                    android:id="@+id/v_compare_divider"
+                    android:layout_width="4dp"
+                    android:layout_height="match_parent"
+                    android:background="#FFFFFF"/>
+            </FrameLayout>
+
+            <com.google.android.material.slider.Slider
+                android:id="@+id/slider_compare_split"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:valueFrom="0.0"
+                android:valueTo="100.0"
+                android:value="50.0"
+                android:layout_marginTop="2dp"
+                android:layout_marginBottom="2dp"
+                app:layout_constraintTop_toBottomOf="@id/fl_compare_overlay_container"
+                app:layout_constraintBottom_toTopOf="@id/cl_compare_info_cards_container"
+                app:layout_constraintStart_toStartOf="parent"
+                app:layout_constraintEnd_toEndOf="parent"/>
+
+            <!-- Info Cards Container (Holds Still & Video info cards side-by-side) -->
+            <androidx.constraintlayout.widget.ConstraintLayout
+                android:id="@+id/cl_compare_info_cards_container"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginBottom="4dp"
+                app:layout_constraintTop_toBottomOf="@id/slider_compare_split"
+                app:layout_constraintBottom_toBottomOf="parent"
+                app:layout_constraintStart_toStartOf="parent"
+                app:layout_constraintEnd_toEndOf="parent">
+
+                <!-- Still Image Info Card (Left) -->
+                <com.google.android.material.card.MaterialCardView
+                    android:id="@+id/cv_still_card"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginEnd="4dp"
+                    app:cardCornerRadius="8dp"
+                    app:cardElevation="2dp"
+                    app:strokeWidth="1dp"
+                    app:strokeColor="#DDDDDD"
+                    app:layout_constraintTop_toTopOf="parent"
+                    app:layout_constraintBottom_toBottomOf="parent"
+                    app:layout_constraintStart_toStartOf="parent"
+                    app:layout_constraintEnd_toStartOf="@+id/cv_video_card">
+                    <androidx.constraintlayout.widget.ConstraintLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:padding="6dp"
+                        android:background="#F8F9FA">
+                        <TextView
+                            android:id="@+id/tv_still_gainmap_label"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:text="@string/card_still_gainmap"
+                            android:textSize="12sp"
+                            android:textStyle="bold"
+                            android:textColor="@color/google_blue"
+                            app:layout_constraintTop_toTopOf="parent"
+                            app:layout_constraintStart_toStartOf="parent"
+                            app:layout_constraintEnd_toEndOf="parent"/>
+                        <TextView
+                            android:id="@+id/tv_compare_still_info"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:fontFamily="monospace"
+                            android:textSize="11sp"
+                            android:textColor="#333333"
+                            android:text="@string/card_still_sample_info"
+                            app:layout_constraintTop_toBottomOf="@id/tv_still_gainmap_label"
+                            app:layout_constraintStart_toStartOf="parent"
+                            app:layout_constraintEnd_toEndOf="parent"/>
+                    </androidx.constraintlayout.widget.ConstraintLayout>
+                </com.google.android.material.card.MaterialCardView>
+
+                <!-- Video Frame Info Card (Right) -->
+                <com.google.android.material.card.MaterialCardView
+                    android:id="@+id/cv_video_card"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="4dp"
+                    app:cardCornerRadius="8dp"
+                    app:cardElevation="2dp"
+                    app:strokeWidth="1dp"
+                    app:strokeColor="#DDDDDD"
+                    app:layout_constraintTop_toTopOf="parent"
+                    app:layout_constraintBottom_toBottomOf="parent"
+                    app:layout_constraintStart_toEndOf="@id/cv_still_card"
+                    app:layout_constraintEnd_toEndOf="parent">
+                    <androidx.constraintlayout.widget.ConstraintLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:padding="6dp"
+                        android:background="#F8F9FA">
+                        <TextView
+                            android:id="@+id/tv_video_hdr_label"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:text="@string/card_video_hdr"
+                            android:textSize="12sp"
+                            android:textStyle="bold"
+                            android:textColor="@color/google_green"
+                            app:layout_constraintTop_toTopOf="parent"
+                            app:layout_constraintStart_toStartOf="parent"
+                            app:layout_constraintEnd_toEndOf="parent"/>
+                        <TextView
+                            android:id="@+id/tv_compare_video_info"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:fontFamily="monospace"
+                            android:textSize="11sp"
+                            android:textColor="#333333"
+                            android:text="@string/card_video_sample_info"
+                            app:layout_constraintTop_toBottomOf="@id/tv_video_hdr_label"
+                            app:layout_constraintStart_toStartOf="parent"
+                            app:layout_constraintEnd_toEndOf="parent"/>
+                    </androidx.constraintlayout.widget.ConstraintLayout>
+                </com.google.android.material.card.MaterialCardView>
+            </androidx.constraintlayout.widget.ConstraintLayout>
+        </androidx.constraintlayout.widget.ConstraintLayout>
+
+        <!-- Tab 1 Placeholder: Shown when preview tab selected but not extracted yet or failed -->
+        <TextView
+            android:id="@+id/tv_extractor_preview_placeholder"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:gravity="center"
+            android:text="@string/label_extracting"
+            android:visibility="gone"/>
+
+        <!-- Tab 2: Logs (Hidden initially) -->
+        <ScrollView
+            android:id="@+id/sv_extractor_logs"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:background="#EEEEEE"
+            android:visibility="gone">
+            <HorizontalScrollView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content">
+                <TextView
+                    android:id="@+id/tv_extractor_log"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:fontFamily="monospace"
+                    android:padding="8dp"
+                    android:text="@string/placeholder_logs" />
+            </HorizontalScrollView>
+        </ScrollView>
+    </FrameLayout>
+
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/btn_extractor_download"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:text="@string/btn_download"
+        android:layout_marginTop="8dp"
+        android:visibility="gone"
+        app:icon="@android:drawable/ic_menu_save"
+        app:cornerRadius="24dp"
+        app:backgroundTint="@color/google_green"
+        app:layout_constraintBottom_toTopOf="@+id/btn_extractor_back_to_select"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"/>
+
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/btn_extractor_back_to_select"
+        style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:text="@string/btn_back_to_select"
+        android:layout_marginTop="8dp"
+        app:cornerRadius="24dp"
+        android:textColor="@color/google_grey"
+        app:strokeColor="@color/google_grey"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"/>
+
+</androidx.constraintlayout.widget.ConstraintLayout>

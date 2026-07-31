@@ -1,0 +1,54 @@
+<!--
+ Copyright 2026 Google LLC
+
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+-->
+<resources>
+    <string name="app_name" description="Name of the application [CHAR LIMIT=50]">Motion Photo Playground</string>
+    <string name="title_triage" description="Title of triage screen [CHAR LIMIT=50]">Motion Photo Triage</string>
+    <string name="btn_creator_demo" description="Button label for Creator Demo [CHAR LIMIT=50]">Creator Demo</string>
+    <string name="btn_capture_demo" description="Button label for Capture Demo [CHAR LIMIT=50]">Capture Demo</string>
+    <string name="btn_extractor_demo" description="Button label for Extractor Demo [CHAR LIMIT=50]">Extractor Demo</string>
+    <string name="label_select_image" description="Label for selecting an image [CHAR LIMIT=50]">Select Image</string>
+    <string name="label_select_video" description="Label for selecting a video [CHAR LIMIT=50]">Select Video</string>
+    <string name="label_build_motion_photo" description="Label for building a motion photo [CHAR LIMIT=50]">Build Motion Photo</string>
+    <string name="label_extract_video" description="Label for extracting video track [CHAR LIMIT=50]">Extract Video Track</string>
+    <string name="title_extraction_result" description="Title of extraction result screen [CHAR LIMIT=50]">Extraction Result</string>
+    <string name="tab_preview" description="Tab title for preview [CHAR LIMIT=50]">Preview</string>
+    <string name="tab_compare" description="Tab title for compare [CHAR LIMIT=50]">Compare</string>
+    <string name="tab_logs" description="Tab title for logs [CHAR LIMIT=50]">Logs</string>
+    <string name="subtab_image" description="Subtab title for image [CHAR LIMIT=50]">Image</string>
+    <string name="subtab_video" description="Subtab title for video [CHAR LIMIT=50]">Video</string>
+    <string name="subtab_metadata" description="Subtab title for metadata [CHAR LIMIT=50]">Metadata</string>
+    <string name="card_still_gainmap" description="Header card label for still gain map [CHAR LIMIT=50]">📷 Still (Gain Map)</string>
+    <string name="card_still_sample_info" description="Sample info text for still image [CHAR LIMIT=NONE]">Format: UltraHDR JPEG\nGain Map: Present\nColor Mode: HDR\nHeadroom: %1$s</string>
+    <string name="card_video_hdr" description="Header card label for video track [CHAR LIMIT=50]">🎬 Video</string>
+    <string name="card_video_sample_info" description="Sample info text for video track [CHAR LIMIT=NONE]">Format: %2$s-bit HEVC (P010)\nAGTM: None\nColor Format: RGBA_1010102\nHeadroom: %1$s</string>
+    <string name="label_extracting" description="Status text when extracting [CHAR LIMIT=50]">Extracting&#8230;</string>
+    <string name="placeholder_logs" description="Placeholder text for logs view [CHAR LIMIT=NONE]">Logs will appear here&#8230;</string>
+    <string name="btn_download" description="Button label to download extracted media [CHAR LIMIT=50]">Download</string>
+    <string name="btn_back_to_select" description="Button label to return to selection screen [CHAR LIMIT=50]">Back to Select</string>
+    <string name="title_capture_demo" description="Title of live capture demo screen [CHAR LIMIT=50]">Motion Photo Live Capture</string>
+    <string name="btn_capture_motion_photo" description="Button label to trigger motion photo capture [CHAR LIMIT=50]">Capture Motion Photo</string>
+    <string name="btn_main_menu" description="Button label to return to main menu [CHAR LIMIT=50]">Main Menu</string>
+    <string name="label_capture_logs" description="Header label for capture logs section [CHAR LIMIT=50]">Capture Logs:</string>
+    <string name="status_init_camera" description="Initial camera status text [CHAR LIMIT=50]">Status: Initializing Camera&#8230;</string>
+    <string name="title_creator_result" description="Title of creator result screen [CHAR LIMIT=50]">Step 4: Result</string>
+    <string name="btn_play_motion" description="Button label to play motion photo video [CHAR LIMIT=50]">Play Motion</string>
+    <string name="btn_pause_motion" description="Button label to pause motion photo video [CHAR LIMIT=50]">Pause Motion</string>
+    <string name="btn_show_still" description="Button label to show still photo [CHAR LIMIT=50]">Show Still</string>
+    <string name="placeholder_building" description="Placeholder when building motion photo [CHAR LIMIT=50]">Building motion photo&#8230;</string>
+    <string name="btn_download_motion_photo" description="Button label to download motion photo [CHAR LIMIT=50]">Download Motion Photo</string>
+    <string name="btn_back_to_capture" description="Button label to return to live capture screen [CHAR LIMIT=50]">Back to Capture</string>
+    <string name="btn_back_to_build" description="Button label to return to build configuration screen [CHAR LIMIT=50]">Back to Build</string>
+</resources>

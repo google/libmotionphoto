@@ -16,8 +16,6 @@ The directory structure and code dependencies for this package are:
     *   Code in this library may depend only on components in the base directory
 *   jpeg - The JPEG components
     *   Code in this library may depend only on components in base and extras
-*   tools - Top level tools that use the other components
-    *   Code in this library can depend on any other components in this package
 *   utils - Useful utility type components
     *   Code in this library may depend only on components in the base directory
 *   xml - A simplfied but very memory efficient XML parser

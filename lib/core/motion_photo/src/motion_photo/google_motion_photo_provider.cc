@@ -52,8 +52,8 @@ bool GoogleMotionPhotoProvider::Identify(const RawMetadataBlock& block) {
   }
 
   if (block.type == "XMP" && block.format_identifier == "standard.xmp") {
-    std::string_view xml(reinterpret_cast<const char*>(block.bytes.data()),
-                         block.bytes.size());
+    absl::string_view xml(reinterpret_cast<const char*>(block.bytes.data()),
+                          block.bytes.size());
     return (absl::StrContains(xml, "http://ns.google.com/photos/1.0/camera/") ||
             absl::StrContains(xml,
                               "http://ns.google.com/photos/1.0/container/")) &&

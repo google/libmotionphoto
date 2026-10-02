@@ -17,15 +17,18 @@ name: Java API Doc Sync Check
 on:
   pull_request:
     paths:
-      - 'java/com/google/libmotionphoto/motionphoto/**'
-      - 'java/java_api_description.md'
+      - 'lib/java/src/main/java/com/google/libmotionphoto/motionphoto/**'
+      - 'lib/java/java_api_description.md'
+
+permissions:
+  contents: read
 
 jobs:
   check-doc:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
 

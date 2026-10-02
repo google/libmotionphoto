@@ -32,12 +32,12 @@ fi
 JAVA_CHANGED=false
 DOC_CHANGED=false
 
-JAVA_PATH_PATTERN="java/com/google/libmotionphoto/motionphoto/[^/]+\.java"
-DOC_PATH="java/java_api_description.md"
+JAVA_PATH_PATTERN="lib/java/src/main/java/com/google/libmotionphoto/motionphoto/[^/]+\.java"
+DOC_PATH="lib/java/java_api_description.md"
 
 for file in $CHANGED_FILES; do
   # Strip arbitrary prefixes to make path relative to repository root
-  clean_file=$(echo "$file" | sed -E 's|^(.*[/\\])?(java/.*)|\2|')
+  clean_file=$(echo "$file" | sed -E 's|^(.*[/\\])?(lib/java/.*)|\2|')
   if [[ "$clean_file" =~ $JAVA_PATH_PATTERN ]]; then
     JAVA_CHANGED=true
     echo "Detected Java API change: $clean_file"

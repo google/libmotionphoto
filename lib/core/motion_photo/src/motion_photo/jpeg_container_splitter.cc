@@ -135,7 +135,7 @@ class JpegContainerSplitter : public ContainerSplitter,
         ExtractBlock(segment, "XMP", "standard.xmp", 29);  // skip namespace
         if (!blocks_.empty() &&
             blocks_.back().format_identifier == "standard.xmp") {
-          std::string_view xml(
+          absl::string_view xml(
               reinterpret_cast<const char*>(blocks_.back().bytes.data()),
               blocks_.back().bytes.size());
           size_t length = ParseVideoLengthFromXmp(xml);
@@ -164,35 +164,68 @@ class JpegContainerSplitter : public ContainerSplitter,
   void Finish(image_io::JpegScanner* scanner) override {}
 
  private:
-  static size_t ParseVideoLengthFromXmp(std::string_view xml) {
-    // 1. Check Container:Directory Item:Length where
-    // Item:Semantic="MotionPhoto" Handles both Item:Semantic="MotionPhoto"
-    // Item:Length="..." and reversed attribute order.
+  static bool HasMotionPhotoFlag(absl::string_view xml) {
+    if (absl::StrContains(xml, "MotionPhoto=\"1\"") ||
+        absl::StrContains(xml, "MotionPhoto='1'")) {
+      return true;
+    }
+    size_t elem_pos = xml.find(":MotionPhoto>");
+    while (elem_pos != absl::string_view::npos) {
+      size_t val_start = elem_pos + 13;
+      while (val_start < xml.size() &&
+             (xml[val_start] == ' ' || xml[val_start] == '\t' ||
+              xml[val_start] == '\n' || xml[val_start] == '\r')) {
+        ++val_start;
+      }
+      if (val_start < xml.size() && xml[val_start] == '1') {
+        size_t val_end = val_start + 1;
+        while (val_end < xml.size() &&
+               (xml[val_end] == ' ' || xml[val_end] == '\t' ||
+                xml[val_end] == '\n' || xml[val_end] == '\r')) {
+          ++val_end;
+        }
+        if (val_end < xml.size() && xml[val_end] == '<') {
+          return true;
+        }
+      }
+      elem_pos = xml.find(":MotionPhoto>", elem_pos + 1);
+    }
+    return false;
+  }
+
+  static size_t ParseVideoLengthFromXmp(absl::string_view xml) {
+    if (!HasMotionPhotoFlag(xml)) {
+      return 0;
+    }
+
+    // 1. Check Container:Directory Item:Length in attribute form where
+    // Item:Semantic="MotionPhoto" (handles any attribute order and quote
+    // style).
     size_t motion_photo_pos = xml.find("MotionPhoto");
-    while (motion_photo_pos != std::string_view::npos) {
+    while (motion_photo_pos != absl::string_view::npos) {
       // Find enclosing tag bounds '<...>'
       size_t tag_start = xml.rfind('<', motion_photo_pos);
       size_t tag_end = xml.find('>', motion_photo_pos);
-      if (tag_start != std::string_view::npos &&
-          tag_end != std::string_view::npos && tag_start < tag_end) {
-        std::string_view tag = xml.substr(tag_start, tag_end - tag_start + 1);
-        absl::string_view absl_tag(tag.data(), tag.size());
-        if (absl::StrContains(absl_tag, "Item:Length") ||
-            absl::StrContains(absl_tag, "Length")) {
-          size_t len_attr = tag.find("Length=\"");
-          size_t val_start = (len_attr != std::string_view::npos)
-                                 ? len_attr + 8
-                                 : std::string_view::npos;
-          if (val_start == std::string_view::npos) {
-            len_attr = tag.find("Length='");
-            if (len_attr != std::string_view::npos) {
-              val_start = len_attr + 8;
+      if (tag_start != absl::string_view::npos &&
+          tag_end != absl::string_view::npos && tag_start < tag_end) {
+        absl::string_view tag = xml.substr(tag_start, tag_end - tag_start + 1);
+        if ((absl::StrContains(tag, "Item:Semantic=\"MotionPhoto\"") ||
+             absl::StrContains(tag, "Item:Semantic='MotionPhoto'")) &&
+            absl::StrContains(tag, "Item:Length")) {
+          size_t len_attr = tag.find("Item:Length=\"");
+          size_t val_start = (len_attr != absl::string_view::npos)
+                                 ? len_attr + 13
+                                 : absl::string_view::npos;
+          if (val_start == absl::string_view::npos) {
+            len_attr = tag.find("Item:Length='");
+            if (len_attr != absl::string_view::npos) {
+              val_start = len_attr + 13;
             }
           }
-          if (val_start != std::string_view::npos) {
+          if (val_start != absl::string_view::npos) {
             char quote = tag[val_start - 1];
             size_t val_end = tag.find(quote, val_start);
-            if (val_end != std::string_view::npos) {
+            if (val_end != absl::string_view::npos) {
               std::string val_str(tag.substr(val_start, val_end - val_start));
               try {
                 int64_t len = std::stoll(val_str);
@@ -206,50 +239,52 @@ class JpegContainerSplitter : public ContainerSplitter,
       motion_photo_pos = xml.find("MotionPhoto", motion_photo_pos + 1);
     }
 
-    // 2. Check GCamera:MicroVideoOffset / Camera:MicroVideoOffset
-    size_t offset_pos = xml.find("MicroVideoOffset=\"");
-    size_t val_start = (offset_pos != std::string_view::npos)
-                           ? offset_pos + 18
-                           : std::string_view::npos;
-    if (val_start == std::string_view::npos) {
-      offset_pos = xml.find("MicroVideoOffset='");
-      if (offset_pos != std::string_view::npos) {
-        val_start = offset_pos + 18;
+    // 2. Check Container:Directory Item:Length in XML element form:
+    // <Item:Semantic>MotionPhoto</Item:Semantic> ...
+    // <Item:Length>...</Item:Length>
+    size_t semantic_elem = xml.find("<Item:Semantic>");
+    while (semantic_elem != absl::string_view::npos) {
+      size_t semantic_end = xml.find("</Item:Semantic>", semantic_elem);
+      if (semantic_end == absl::string_view::npos) {
+        break;
       }
-    }
-    if (val_start != std::string_view::npos) {
-      char quote = xml[val_start - 1];
-      size_t val_end = xml.find(quote, val_start);
-      if (val_end != std::string_view::npos) {
-        std::string val_str(xml.substr(val_start, val_end - val_start));
-        try {
-          int64_t len = std::stoll(val_str);
-          if (len > 0) return static_cast<size_t>(len);
-        } catch (...) {
+      absl::string_view semantic_val =
+          xml.substr(semantic_elem + 15, semantic_end - (semantic_elem + 15));
+      if (absl::StrContains(semantic_val, "MotionPhoto")) {
+        size_t item_start = xml.rfind("<Container:Item", semantic_elem);
+        if (item_start == absl::string_view::npos) {
+          item_start = xml.rfind("<rdf:li", semantic_elem);
+        }
+        size_t item_end = xml.find("</Container:Item>", semantic_end);
+        if (item_end == absl::string_view::npos) {
+          item_end = xml.find("</rdf:li>", semantic_end);
+        }
+        if (item_start != absl::string_view::npos &&
+            item_end != absl::string_view::npos && item_start < item_end) {
+          absl::string_view item_block =
+              xml.substr(item_start, item_end - item_start);
+          size_t len_start = item_block.find("<Item:Length>");
+          size_t len_end = item_block.find("</Item:Length>");
+          if (len_start != absl::string_view::npos &&
+              len_end != absl::string_view::npos && len_start + 13 < len_end) {
+            std::string val_str(
+                item_block.substr(len_start + 13, len_end - (len_start + 13)));
+            try {
+              int64_t len = std::stoll(val_str);
+              if (len > 0) return static_cast<size_t>(len);
+            } catch (...) {
+            }
+          }
         }
       }
-    }
-
-    // Check XML element: <(GCamera|Camera):MicroVideoOffset>...</...>
-    size_t elem_pos = xml.find(":MicroVideoOffset>");
-    if (elem_pos != std::string_view::npos) {
-      size_t text_start = elem_pos + 18;
-      size_t text_end = xml.find('<', text_start);
-      if (text_end != std::string_view::npos) {
-        std::string val_str(xml.substr(text_start, text_end - text_start));
-        try {
-          int64_t len = std::stoll(val_str);
-          if (len > 0) return static_cast<size_t>(len);
-        } catch (...) {
-        }
-      }
+      semantic_elem = xml.find("<Item:Semantic>", semantic_end + 16);
     }
 
     return 0;
   }
 
-  void ExtractBlock(const image_io::JpegSegment& segment, std::string_view type,
-                    std::string_view format_id, size_t skip_bytes) {
+  void ExtractBlock(const image_io::JpegSegment& segment, absl::string_view type,
+                    absl::string_view format_id, size_t skip_bytes) {
     size_t start = segment.GetPayloadDataLocation() + skip_bytes;
     size_t end = segment.GetDataRange().GetEnd();
     if (start < end) {

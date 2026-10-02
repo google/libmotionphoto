@@ -26,7 +26,7 @@
 
 #include "image_io/base/message_handler.h"
 #include "image_io/base/string_ref_data_source.h"
-#include "legacy_micro_video_metadata.pb.h"
+#include "legacy_micro_video_metadata.pb.h"  // NOLINT
 #include "motion_photo/google_motion_photo_provider.h"
 #include "motion_photo/metadata_block.h"
 #include "motion_photo/metadata_engine.h"
@@ -126,6 +126,7 @@ TEST(LegacyMicroVideoProviderTest, DecodeToSemantic) {
   EXPECT_EQ(metadata.legacy_micro_video(), 1);
   EXPECT_EQ(metadata.primary_image_timestamp_us(), 1475413);
   EXPECT_EQ(metadata.version(), 1);
+  EXPECT_EQ(metadata.micro_video_offset(), 4261545);
 
   EXPECT_TRUE(provider.IsMotionPhoto(type_url, payload_str));
 }
@@ -133,13 +134,30 @@ TEST(LegacyMicroVideoProviderTest, DecodeToSemantic) {
 TEST(LegacyMicroVideoProviderTest, GetVideoInfo) {
   LegacyMicroVideoProvider provider;
 
+  RawMetadataBlock xmp_block;
+  xmp_block.type = "XMP";
+  xmp_block.format_identifier = "standard.xmp";
+  std::string xmp_data =
+      "<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF "
+      "xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:"
+      "Description xmlns:GCamera='http://ns.google.com/photos/1.0/camera/' "
+      "GCamera:MicroVideo='1' GCamera:MicroVideoVersion='1' "
+      "GCamera:MicroVideoOffset='4261545'/></rdf:RDF></x:xmpmeta>";
+  xmp_block.bytes.assign(xmp_data.begin(), xmp_data.end());
+
+  size_t offset_in_block = 0;
+  size_t length = 0;
+  EXPECT_TRUE(provider.GetVideoInfo(xmp_block, &offset_in_block, &length));
+  EXPECT_EQ(offset_in_block, 0);
+  EXPECT_EQ(length, 4261545);
+
   RawMetadataBlock trailer_block;
   trailer_block.type = "PROPRIETARY";
   trailer_block.format_identifier = "container.trailer";
   trailer_block.bytes.resize(4261545);
 
-  size_t offset_in_block = 0;
-  size_t length = 0;
+  offset_in_block = 0;
+  length = 0;
   EXPECT_TRUE(provider.GetVideoInfo(trailer_block, &offset_in_block, &length));
   EXPECT_EQ(offset_in_block, 0);
   EXPECT_EQ(length, 4261545);
@@ -231,6 +249,39 @@ TEST(LegacyMicroVideoProviderTest, GlobalRegistryIntegration) {
 
   EXPECT_TRUE(MetadataEngine::IsMotionPhoto(collection));
   EXPECT_EQ(collection.blocks_size(), 2);
+
+  // 1. When 3P plugins are disabled, IsMotionPhoto returns false.
+  HandlerOptions disabled_options;
+  disabled_options.disable_3p_plugins = true;
+  EXPECT_FALSE(MetadataEngine::IsMotionPhoto(collection, disabled_options));
+
+  // Even if enabled_3p_plugins lists the plugin, disable_3p_plugins=true takes
+  // precedence and returns false.
+  disabled_options.enabled_3p_plugins = {"legacy_micro_video"};
+  EXPECT_FALSE(MetadataEngine::IsMotionPhoto(collection, disabled_options));
+
+  // 2. When all 3P plugins are enabled (disable_3p_plugins=false,
+  // enabled_3p_plugins empty), IsMotionPhoto returns true.
+  HandlerOptions all_enabled_options;
+  all_enabled_options.disable_3p_plugins = false;
+  EXPECT_TRUE(MetadataEngine::IsMotionPhoto(collection, all_enabled_options));
+
+  // 3. When certain 3P plugins are enabled and the format is recognized by an
+  // enabled 3P plugin, IsMotionPhoto returns true.
+  HandlerOptions specific_enabled_options;
+  specific_enabled_options.disable_3p_plugins = false;
+  specific_enabled_options.enabled_3p_plugins = {"other_plugin",
+                                                 "legacy_micro_video"};
+  EXPECT_TRUE(
+      MetadataEngine::IsMotionPhoto(collection, specific_enabled_options));
+
+  // 4. When certain 3P plugins are enabled and the format is NOT recognized by
+  // any enabled 3P plugin, IsMotionPhoto returns false.
+  HandlerOptions unmatched_enabled_options;
+  unmatched_enabled_options.disable_3p_plugins = false;
+  unmatched_enabled_options.enabled_3p_plugins = {"other_plugin"};
+  EXPECT_FALSE(
+      MetadataEngine::IsMotionPhoto(collection, unmatched_enabled_options));
 }
 
 TEST(LegacyMicroVideoProviderTest, ExtractMetadata_LegacyMicroVideo) {

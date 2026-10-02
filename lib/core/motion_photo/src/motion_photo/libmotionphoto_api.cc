@@ -67,10 +67,10 @@ bool WriteBufferToFile(const std::string& path, const uint8_t* data, size_t size
 }
 
 // Internal helper copying nested image_io fields into clean native structs.
-void PopulateNativeMetadata(const ::libmotionphoto::motion_photo::MotionPhoto& photo,
-                            MotionPhotoMetadata* out) {
+void PopulateNativeMetadata(
+    const ::libmotionphoto::motion_photo::MotionPhoto& photo,
+    MotionPhotoMetadata* out) {
   if (out == nullptr) return;
-  out->is_motion_photo = photo.IsMotionPhoto();
   const auto& camera = photo.GetCameraMetadata();
   if (camera.motion_photo_presentation_timestamp_us.WasAssigned() &&
       camera.motion_photo_presentation_timestamp_us.IsValid()) {
@@ -233,7 +233,8 @@ class FdDataSource : public ::photos_editing_formats::image_io::DataSource {
 
 bool ParseMotionPhotoFromFile(const std::string& filepath,
                               MotionPhotoMetadata* out_metadata,
-                              MessageCallback callback) {
+                              MessageCallback callback,
+                              const HandlerOptions& options) {
   ::photos_editing_formats::image_io::MessageHandler message_handler;
   if (callback) {
     message_handler.SetMessageWriter(
@@ -263,7 +264,10 @@ bool ParseMotionPhotoFromFile(const std::string& filepath,
   ::libmotionphoto::motion_photo::MetadataCollection collection =
       engine.Parse(&data_source, file_size, file_type);
 
-  bool is_mp = engine.IsMotionPhoto(collection);
+  ::libmotionphoto::motion_photo::HandlerOptions engine_options;
+  engine_options.disable_3p_plugins = options.disable_3p_plugins;
+  engine_options.enabled_3p_plugins = options.enabled_3p_plugins;
+  bool is_mp = engine.IsMotionPhoto(collection, engine_options);
 
   if (out_metadata != nullptr) {
     out_metadata->is_motion_photo = is_mp;
@@ -273,7 +277,7 @@ bool ParseMotionPhotoFromFile(const std::string& filepath,
     size_t bytes_parsed = 0;
 
     for (const auto& block : collection.blocks()) {
-      if (block.has_video_length() && block.video_length() > 0) {
+      if (is_mp && block.has_video_length() && block.video_length() > 0) {
         out_metadata->video_length = block.video_length();
       }
       if (block.type() == ::libmotionphoto::motion_photo::BLOCK_TYPE_XMP ||
@@ -332,7 +336,8 @@ bool ParseMotionPhotoFromFile(const std::string& filepath,
 
 bool ParseMotionPhotoFromFd(int fd, int64_t offset, int64_t length,
                             MotionPhotoMetadata* out_metadata,
-                            MessageCallback callback) {
+                            MessageCallback callback,
+                            const HandlerOptions& options) {
   if (fd < 0 || offset < 0 || length <= 0) {
     return false;
   }
@@ -375,7 +380,10 @@ bool ParseMotionPhotoFromFd(int fd, int64_t offset, int64_t length,
   ::libmotionphoto::motion_photo::MetadataCollection collection =
       engine.Parse(&data_source, length, file_type);
 
-  bool is_mp = engine.IsMotionPhoto(collection);
+  ::libmotionphoto::motion_photo::HandlerOptions engine_options;
+  engine_options.disable_3p_plugins = options.disable_3p_plugins;
+  engine_options.enabled_3p_plugins = options.enabled_3p_plugins;
+  bool is_mp = engine.IsMotionPhoto(collection, engine_options);
 
   if (out_metadata != nullptr) {
     out_metadata->is_motion_photo = is_mp;
@@ -385,7 +393,7 @@ bool ParseMotionPhotoFromFd(int fd, int64_t offset, int64_t length,
     size_t bytes_parsed = 0;
 
     for (const auto& block : collection.blocks()) {
-      if (block.has_video_length() && block.video_length() > 0) {
+      if (is_mp && block.has_video_length() && block.video_length() > 0) {
         out_metadata->video_length = block.video_length();
       }
       if (block.type() == ::libmotionphoto::motion_photo::BLOCK_TYPE_XMP ||
@@ -444,7 +452,8 @@ bool ParseMotionPhotoFromFd(int fd, int64_t offset, int64_t length,
 
 bool ParseMotionPhotoFromMemory(const uint8_t* data, size_t size,
                                 MotionPhotoMetadata* out_metadata,
-                                MessageCallback callback) {
+                                MessageCallback callback,
+                                const HandlerOptions& options) {
   if (data == nullptr || size == 0) {
     return false;
   }
@@ -476,7 +485,10 @@ bool ParseMotionPhotoFromMemory(const uint8_t* data, size_t size,
   ::libmotionphoto::motion_photo::MetadataCollection collection =
       engine.Parse(&data_source, size, file_type);
 
-  bool is_mp = engine.IsMotionPhoto(collection);
+  ::libmotionphoto::motion_photo::HandlerOptions engine_options;
+  engine_options.disable_3p_plugins = options.disable_3p_plugins;
+  engine_options.enabled_3p_plugins = options.enabled_3p_plugins;
+  bool is_mp = engine.IsMotionPhoto(collection, engine_options);
 
   if (out_metadata != nullptr) {
     out_metadata->is_motion_photo = is_mp;
@@ -486,7 +498,7 @@ bool ParseMotionPhotoFromMemory(const uint8_t* data, size_t size,
     size_t bytes_parsed = 0;
 
     for (const auto& block : collection.blocks()) {
-      if (block.has_video_length() && block.video_length() > 0) {
+      if (is_mp && block.has_video_length() && block.video_length() > 0) {
         out_metadata->video_length = block.video_length();
       }
       if (block.type() == ::libmotionphoto::motion_photo::BLOCK_TYPE_XMP ||

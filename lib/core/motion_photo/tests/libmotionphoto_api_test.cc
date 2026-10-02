@@ -22,6 +22,7 @@
 #include <filesystem>
 #include <fstream>
 #include <ios>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -298,6 +299,76 @@ TEST(LibMotionPhotoApiTest, BitReaderAndBoxReaderBoundarySafe) {
   MotionPhotoMetadata metadata;
   EXPECT_FALSE(ParseMotionPhotoFromMemory(truncated_mp4, sizeof(truncated_mp4),
                                           &metadata));
+}
+
+TEST(LibMotionPhotoApiTest, ParseMotionPhoto3pPluginOptions) {
+  // Construct synthetic Legacy MicroVideo JPEG in memory (recognized by the
+  // "legacy_micro_video" 3P plugin, not by 1P GoogleMotionPhotoProvider).
+  std::string xmp_content =
+      "<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF "
+      "xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:"
+      "Description xmlns:GCamera='http://ns.google.com/photos/1.0/camera/' "
+      "GCamera:MicroVideo='1' GCamera:MicroVideoVersion='1' "
+      "GCamera:MicroVideoOffset='16' "
+      "GCamera:MicroVideoPresentationTimestampUs='1500000'/></rdf:RDF></"
+      "x:xmpmeta>";
+
+  std::string jpeg_data;
+  jpeg_data.push_back(static_cast<char>(0xFF));
+  jpeg_data.push_back(static_cast<char>(0xD8));  // SOI
+  jpeg_data.push_back(static_cast<char>(0xFF));
+  jpeg_data.push_back(static_cast<char>(0xE1));  // APP1
+  uint16_t app1_len = 2 + 29 + xmp_content.size();
+  jpeg_data.push_back(static_cast<char>(app1_len >> 8));
+  jpeg_data.push_back(static_cast<char>(app1_len & 0xFF));
+  jpeg_data.append("http://ns.adobe.com/xap/1.0/\0", 29);
+  jpeg_data.append(xmp_content);
+  jpeg_data.push_back(static_cast<char>(0xFF));
+  jpeg_data.push_back(static_cast<char>(0xD9));  // EOI
+  std::string mp4_trailer = "....ftypmp42....";
+  jpeg_data.append(mp4_trailer);
+
+  const auto* raw_ptr = reinterpret_cast<const uint8_t*>(jpeg_data.data());
+  size_t raw_size = jpeg_data.size();
+
+  // 1. Default (all 3P plugins enabled): is_motion_photo should be true.
+  MotionPhotoMetadata meta_default;
+  EXPECT_TRUE(ParseMotionPhotoFromMemory(raw_ptr, raw_size, &meta_default));
+  EXPECT_TRUE(meta_default.is_motion_photo);
+  EXPECT_EQ(meta_default.video_length,
+            static_cast<int64_t>(mp4_trailer.size()));
+
+  // 2. 3P plugins disabled: is_motion_photo should be false.
+  HandlerOptions disabled_opts;
+  disabled_opts.disable_3p_plugins = true;
+  MotionPhotoMetadata meta_disabled;
+  EXPECT_FALSE(ParseMotionPhotoFromMemory(raw_ptr, raw_size, &meta_disabled,
+                                          nullptr, disabled_opts));
+  EXPECT_FALSE(meta_disabled.is_motion_photo);
+  EXPECT_EQ(meta_disabled.video_length, 0);
+
+  // 3. Specific 3P plugin enabled ("legacy_micro_video") and recognizes format:
+  // is_motion_photo should be true.
+  HandlerOptions enabled_matching_opts;
+  enabled_matching_opts.disable_3p_plugins = false;
+  enabled_matching_opts.enabled_3p_plugins = {"legacy_micro_video"};
+  MotionPhotoMetadata meta_matching;
+  EXPECT_TRUE(ParseMotionPhotoFromMemory(raw_ptr, raw_size, &meta_matching,
+                                         nullptr, enabled_matching_opts));
+  EXPECT_TRUE(meta_matching.is_motion_photo);
+  EXPECT_EQ(meta_matching.video_length,
+            static_cast<int64_t>(mp4_trailer.size()));
+
+  // 4. Specific 3P plugin enabled ("other_plugin") that does not recognize
+  // format: is_motion_photo should be false.
+  HandlerOptions enabled_unmatched_opts;
+  enabled_unmatched_opts.disable_3p_plugins = false;
+  enabled_unmatched_opts.enabled_3p_plugins = {"other_plugin"};
+  MotionPhotoMetadata meta_unmatched;
+  EXPECT_FALSE(ParseMotionPhotoFromMemory(raw_ptr, raw_size, &meta_unmatched,
+                                          nullptr, enabled_unmatched_opts));
+  EXPECT_FALSE(meta_unmatched.is_motion_photo);
+  EXPECT_EQ(meta_unmatched.video_length, 0);
 }
 
 }  // namespace api

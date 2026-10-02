@@ -12,11 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <fcntl.h>
 #include <jni.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -28,13 +30,15 @@
 #include <utility>
 #include <vector>
 
+#include "image_io/base/data_destination.h"
 #include "image_io/base/data_segment.h"
 #include "image_io/base/data_segment_data_source.h"
+#include "image_io/base/data_source.h"
 #include "image_io/base/message_handler.h"
 #include "image_io/base/types.h"
 #include "image_io/utils/file_utils.h"
 #include "image_io/utils/string_outputter.h"
-#include "metadata_collection.pb.h"
+#include "metadata_collection.pb.h"  // NOLINT
 #include "motion_photo/camera_metadata.h"
 #include "motion_photo/google_motion_photo_provider.h"
 #include "motion_photo/metadata_engine.h"
@@ -58,6 +62,185 @@ using libmotionphoto::jni::ScopedLocalRef;
 using libmotionphoto::jni::ScopedUtfChars;
 using libmotionphoto::jni::ThrowOutOfMemoryError;
 using libmotionphoto::jni::ThrowRuntimeException;
+
+// Lazy random-access DataSource backed by pread() on an open file descriptor.
+// Reads 64 KB chunks on demand over the full [0, total_length_) range without
+// buffering the entire file in memory.
+class FdDataSource : public libmotionphoto::image_io::DataSource {
+ public:
+  FdDataSource(int fd, int64_t base_offset, int64_t total_length)
+      : fd_(fd), base_offset_(base_offset), total_length_(total_length) {}
+
+  ~FdDataSource() override = default;
+
+  void Reset() override { current_data_segment_.reset(); }
+
+  std::shared_ptr<libmotionphoto::image_io::DataSegment> GetDataSegment(
+      size_t begin, size_t min_size) override {
+    if (current_data_segment_ && current_data_segment_->Contains(begin)) {
+      size_t remaining = current_data_segment_->GetEnd() - begin;
+      if (remaining >= min_size) {
+        return current_data_segment_;
+      }
+    }
+    current_data_segment_ = Read(begin, min_size);
+    return current_data_segment_;
+  }
+
+  TransferDataResult TransferData(
+      const libmotionphoto::image_io::DataRange& data_range, size_t best_size,
+      libmotionphoto::image_io::DataDestination* data_destination) override {
+    namespace ii = libmotionphoto::image_io;
+    bool data_transferred = false;
+    ii::DataDestination::TransferStatus status =
+        ii::DataDestination::kTransferDone;
+    if (data_destination && data_range.IsValid() && fd_ >= 0) {
+      size_t min_size = std::min(data_range.GetLength(), best_size);
+      if (current_data_segment_ &&
+          current_data_segment_->GetLength() >= min_size &&
+          current_data_segment_->GetDataRange().Contains(data_range)) {
+        status = data_destination->Transfer(data_range, *current_data_segment_);
+        data_transferred = true;
+      } else {
+        size_t chunk_size = std::max(min_size, static_cast<size_t>(64 * 1024));
+        for (size_t begin = data_range.GetBegin(); begin < data_range.GetEnd();
+             begin += chunk_size) {
+          size_t end = std::min(data_range.GetEnd(), begin + chunk_size);
+          auto data_segment = Read(begin, end - begin);
+          if (data_segment && data_segment->GetLength() > 0) {
+            status = data_destination->Transfer(data_segment->GetDataRange(),
+                                                *data_segment);
+            data_transferred = true;
+          }
+          if (status != ii::DataDestination::kTransferOk || !data_segment ||
+              data_segment->GetLength() == 0) {
+            break;
+          }
+        }
+      }
+    }
+    if (data_transferred) {
+      return status == ii::DataDestination::kTransferError
+                 ? kTransferDataError
+                 : kTransferDataSuccess;
+    }
+    return data_destination ? kTransferDataNone : kTransferDataError;
+  }
+
+ private:
+  std::shared_ptr<libmotionphoto::image_io::DataSegment> Read(size_t begin,
+                                                              size_t min_size) {
+    namespace ii = libmotionphoto::image_io;
+    if (fd_ < 0 || total_length_ <= 0 ||
+        begin >= static_cast<size_t>(total_length_)) {
+      return nullptr;
+    }
+    size_t chunk_size = std::max(min_size, static_cast<size_t>(64 * 1024));
+    size_t to_read =
+        std::min(chunk_size, static_cast<size_t>(total_length_) - begin);
+    if (to_read == 0) {
+      return nullptr;
+    }
+
+    auto buffer = std::make_shared<std::vector<ii::Byte>>(to_read);
+    size_t total_bytes_read = 0;
+    while (total_bytes_read < to_read) {
+      ssize_t bytes = pread(
+          fd_, buffer->data() + total_bytes_read, to_read - total_bytes_read,
+          static_cast<off_t>(base_offset_ + begin + total_bytes_read));
+      if (bytes <= 0) {
+        if (bytes < 0 && errno == EINTR) continue;
+        break;
+      }
+      total_bytes_read += static_cast<size_t>(bytes);
+    }
+
+    if (total_bytes_read == 0) {
+      return nullptr;
+    }
+
+    auto segment = ii::DataSegment::Create(
+        ii::DataRange(begin, begin + total_bytes_read), buffer->data(),
+        ii::DataSegment::BufferDispositionPolicy::kDontDelete);
+    return std::shared_ptr<ii::DataSegment>(
+        segment.get(), [segment, buffer](ii::DataSegment*) {});
+  }
+
+  int fd_ = -1;
+  int64_t base_offset_ = 0;
+  int64_t total_length_ = 0;
+  std::shared_ptr<libmotionphoto::image_io::DataSegment> current_data_segment_;
+};
+
+jbyteArray ParseMetadataFromFd(JNIEnv* env, int fd, int64_t offset,
+                               int64_t length, bool owns_fd) {
+  struct ScopedFd {
+    int fd;
+    bool owns;
+    ~ScopedFd() {
+      if (owns && fd >= 0) {
+        close(fd);
+      }
+    }
+  } fd_closer{fd, owns_fd};
+
+  if (env == nullptr || fd < 0 || offset < 0 || length < 0) {
+    return nullptr;
+  }
+
+  struct stat sb;
+  if (fstat(fd, &sb) != 0 || sb.st_size <= 0) {
+    return nullptr;
+  }
+
+  int64_t slice_length = length;
+  if (slice_length == 0) {
+    if (offset >= sb.st_size) {
+      return nullptr;
+    }
+    slice_length = sb.st_size - offset;
+  } else {
+    if (slice_length > sb.st_size || offset > sb.st_size - slice_length) {
+      return nullptr;
+    }
+  }
+  if (slice_length <= 0) {
+    return nullptr;
+  }
+
+  namespace mp = libmotionphoto::motion_photo;
+  namespace ii = libmotionphoto::image_io;
+
+  ii::MessageHandler message_handler;
+  FdDataSource data_source(fd, offset, slice_length);
+
+  mp::MetadataEngine engine(&message_handler);
+  engine.RegisterProvider(std::make_unique<mp::GoogleMotionPhotoProvider>());
+
+  mp::FileType file_type = mp::FileType::kJpeg;
+  mp::MetadataCollection collection =
+      engine.Parse(&data_source, static_cast<size_t>(slice_length), file_type);
+
+  for (int i = 0; i < collection.blocks_size(); ++i) {
+    if (collection.blocks(i).format_identifier() == "container.trailer") {
+      collection.mutable_blocks(i)->clear_raw_bytes();
+    }
+  }
+
+  std::vector<uint8_t> proto_bytes(collection.ByteSizeLong());
+  if (!collection.SerializeToArray(proto_bytes.data(), proto_bytes.size())) {
+    return nullptr;
+  }
+
+  jbyteArray j_array = env->NewByteArray(proto_bytes.size());
+  if (j_array == nullptr) {
+    return nullptr;
+  }
+  env->SetByteArrayRegion(j_array, 0, proto_bytes.size(),
+                          reinterpret_cast<const jbyte*>(proto_bytes.data()));
+
+  return j_array;
+}
 
 }  // namespace
 
@@ -353,47 +536,12 @@ Java_com_google_libmotionphoto_motionphoto_MetadataEngineJni_parseMetadata(
     if (!file_path_chars.ok()) {
       return nullptr;
     }
-    std::string file_path(file_path_chars.c_str());
-
-    namespace mp = libmotionphoto::motion_photo;
-    namespace ii = libmotionphoto::image_io;
-
-    ii::MessageHandler message_handler;
-    std::shared_ptr<ii::DataSegment> data_segment =
-        ii::ReadEntireFile(file_path, &message_handler);
-    if (!data_segment) {
+    int fd = open(file_path_chars.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
       return nullptr;
     }
-    size_t file_size = data_segment->GetLength();
-    auto data_source =
-        std::make_unique<ii::DataSegmentDataSource>(data_segment);
-
-    mp::MetadataEngine engine(&message_handler);
-    engine.RegisterProvider(std::make_unique<mp::GoogleMotionPhotoProvider>());
-
-    mp::FileType file_type = mp::FileType::kJpeg;
-    mp::MetadataCollection collection =
-        engine.Parse(data_source.get(), file_size, file_type);
-
-    for (int i = 0; i < collection.blocks_size(); ++i) {
-      if (collection.blocks(i).format_identifier() == "container.trailer") {
-        collection.mutable_blocks(i)->clear_raw_bytes();
-      }
-    }
-
-    std::vector<uint8_t> proto_bytes(collection.ByteSizeLong());
-    if (!collection.SerializeToArray(proto_bytes.data(), proto_bytes.size())) {
-      return nullptr;
-    }
-
-    jbyteArray j_array = env->NewByteArray(proto_bytes.size());
-    if (j_array == nullptr) {
-      return nullptr;
-    }
-    env->SetByteArrayRegion(j_array, 0, proto_bytes.size(),
-                            reinterpret_cast<const jbyte*>(proto_bytes.data()));
-
-    return j_array;
+    return ParseMetadataFromFd(env, fd, /*offset=*/0, /*length=*/0,
+                               /*owns_fd=*/true);
   } catch (const std::bad_alloc& e) {
     ThrowOutOfMemoryError(env, e.what());
     return nullptr;
@@ -414,73 +562,7 @@ Java_com_google_libmotionphoto_motionphoto_MetadataEngineJni_parseMetadataFd__IJ
     return nullptr;
   }
   try {
-    size_t file_size = 0;
-    if (jlength > 0) {
-      file_size = static_cast<size_t>(jlength);
-    } else {
-      struct stat sb;
-      if (fstat(fd, &sb) != -1 && sb.st_size > 0) {
-        file_size = static_cast<size_t>(sb.st_size);
-      }
-    }
-    if (file_size == 0) {
-      return nullptr;
-    }
-
-    namespace mp = libmotionphoto::motion_photo;
-    namespace ii = libmotionphoto::image_io;
-
-    auto heap_buffer = std::make_unique<ii::Byte[]>(file_size);
-    size_t bytes_read = 0;
-    off_t read_offset = static_cast<off_t>(joffset);
-
-    while (bytes_read < file_size) {
-      ssize_t r = pread(fd, heap_buffer.get() + bytes_read,
-                        file_size - bytes_read, read_offset + bytes_read);
-      if (r <= 0) {
-        if (r < 0 && errno == EINTR) continue;
-        break;
-      }
-      bytes_read += r;
-    }
-
-    if (bytes_read < file_size) {
-      return nullptr;
-    }
-
-    ii::MessageHandler message_handler;
-    ii::DataRange range(0, file_size);
-    std::shared_ptr<ii::DataSegment> data_segment = ii::DataSegment::Create(
-        range, heap_buffer.release(), ii::DataSegment::kDelete);
-    auto data_source =
-        std::make_unique<ii::DataSegmentDataSource>(data_segment);
-
-    mp::MetadataEngine engine(&message_handler);
-    engine.RegisterProvider(std::make_unique<mp::GoogleMotionPhotoProvider>());
-
-    mp::FileType file_type = mp::FileType::kJpeg;
-    mp::MetadataCollection collection =
-        engine.Parse(data_source.get(), file_size, file_type);
-
-    for (int i = 0; i < collection.blocks_size(); ++i) {
-      if (collection.blocks(i).format_identifier() == "container.trailer") {
-        collection.mutable_blocks(i)->clear_raw_bytes();
-      }
-    }
-
-    std::vector<uint8_t> proto_bytes(collection.ByteSizeLong());
-    if (!collection.SerializeToArray(proto_bytes.data(), proto_bytes.size())) {
-      return nullptr;
-    }
-
-    jbyteArray j_array = env->NewByteArray(proto_bytes.size());
-    if (j_array == nullptr) {
-      return nullptr;
-    }
-    env->SetByteArrayRegion(j_array, 0, proto_bytes.size(),
-                            reinterpret_cast<const jbyte*>(proto_bytes.data()));
-
-    return j_array;
+    return ParseMetadataFromFd(env, fd, joffset, jlength, /*owns_fd=*/false);
   } catch (const std::bad_alloc& e) {
     ThrowOutOfMemoryError(env, e.what());
     return nullptr;

@@ -134,7 +134,8 @@ bool LegacyMicroVideoProvider::GetVideoInfo(const RawMetadataBlock& block,
       *out_offset_in_block = 0;
     }
     if (out_length) {
-      *out_length = block.bytes.size();
+      *out_length = (block.total_payload_size > 0) ? block.total_payload_size
+                                                   : block.bytes.size();
     }
     return true;
   }

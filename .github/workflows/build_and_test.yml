@@ -16,9 +16,9 @@ name: Build and Test (Linux & macOS)
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main, master, Development ]
   pull_request:
-    branches: [ main, master ]
+    branches: [ main, master, Development ]
 
 permissions:
   contents: read

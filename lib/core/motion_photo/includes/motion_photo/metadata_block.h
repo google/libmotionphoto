@@ -27,6 +27,9 @@ struct RawMetadataBlock {
   std::string format_identifier;
   std::vector<uint8_t> bytes;
   size_t offset = 0;
+  // If non-zero, represents the full size of the underlying payload block
+  // in cases where `bytes` only buffers a prefix (e.g. for container trailers).
+  size_t total_payload_size = 0;
 };
 
 }  // namespace motion_photo

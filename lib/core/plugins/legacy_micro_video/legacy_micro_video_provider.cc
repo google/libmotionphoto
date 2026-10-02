@@ -23,7 +23,7 @@
 #include <string_view>
 #include <vector>
 
-#include "legacy_micro_video_metadata.pb.h"
+#include "legacy_micro_video_metadata.pb.h"  // NOLINT
 #include "motion_photo/metadata_block.h"
 
 namespace libmotionphoto {
@@ -31,7 +31,7 @@ namespace motion_photo {
 
 namespace {
 
-int64_t ExtractInt64Attr(std::string_view xml, const std::string& attr_name) {
+int64_t ExtractInt64Attr(absl::string_view xml, const std::string& attr_name) {
   std::regex attr_regex(R"((?:GCamera|Camera):)" + attr_name +
                         R"(\s*=\s*["'](-?\d+)["'])");
   std::cmatch match;
@@ -54,12 +54,12 @@ int64_t ExtractInt64Attr(std::string_view xml, const std::string& attr_name) {
 bool LegacyMicroVideoProvider::Identify(const RawMetadataBlock& block) {
   if (block.type == "XMP" && block.format_identifier == "standard.xmp") {
     absl::string_view xml(reinterpret_cast<const char*>(block.bytes.data()),
-                          block.bytes.size());
+                         block.bytes.size());
     return absl::StrContains(xml, "MicroVideo");
   }
   if (block.format_identifier == "container.trailer") {
     if (block.bytes.size() >= 8) {
-      std::string_view tag(
+      absl::string_view tag(
           reinterpret_cast<const char*>(block.bytes.data() + 4), 4);
       if (tag == "ftyp" || tag == "moov" || tag == "mdat" || tag == "free" ||
           tag == "skip" || tag == "wide") {
@@ -76,7 +76,7 @@ bool LegacyMicroVideoProvider::DecodeToSemantic(
   if (block.type != "XMP") {
     return false;
   }
-  std::string_view xml(reinterpret_cast<const char*>(block.bytes.data()),
+  absl::string_view xml(reinterpret_cast<const char*>(block.bytes.data()),
                        block.bytes.size());
 
   LegacyMicroVideoMetadata metadata;
@@ -94,6 +94,11 @@ bool LegacyMicroVideoProvider::DecodeToSemantic(
   int64_t version = ExtractInt64Attr(xml, "MicroVideoVersion");
   if (version > 0) {
     metadata.set_version(version);
+  }
+
+  int64_t offset = ExtractInt64Attr(xml, "MicroVideoOffset");
+  if (offset > 0) {
+    metadata.set_micro_video_offset(offset);
   }
 
   if (out_type_url) {
@@ -129,12 +134,28 @@ bool LegacyMicroVideoProvider::IsMotionPhoto(
 bool LegacyMicroVideoProvider::GetVideoInfo(const RawMetadataBlock& block,
                                             size_t* out_offset_in_block,
                                             size_t* out_length) const {
+  if (block.type == "XMP" && block.format_identifier == "standard.xmp") {
+    absl::string_view xml(reinterpret_cast<const char*>(block.bytes.data()),
+                         block.bytes.size());
+    int64_t offset = ExtractInt64Attr(xml, "MicroVideoOffset");
+    if (offset > 0) {
+      if (out_offset_in_block) {
+        *out_offset_in_block = 0;
+      }
+      if (out_length) {
+        *out_length = static_cast<size_t>(offset);
+      }
+      return true;
+    }
+    return false;
+  }
   if (block.format_identifier == "container.trailer") {
     if (out_offset_in_block) {
       *out_offset_in_block = 0;
     }
     if (out_length) {
-      *out_length = block.bytes.size();
+      *out_length = (block.total_payload_size > 0) ? block.total_payload_size
+                                                   : block.bytes.size();
     }
     return true;
   }

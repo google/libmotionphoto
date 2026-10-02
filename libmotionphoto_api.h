@@ -74,6 +74,12 @@ struct MotionPhotoMetadata {
   ContainerMetadata container;
 };
 
+// Options for controlling third-party (3P) metadata plugin evaluation.
+struct HandlerOptions {
+  bool disable_3p_plugins = false;
+  std::vector<std::string> enabled_3p_plugins;
+};
+
 // =========================================================================
 // 1. Parsing & Inspection (Decoding / Metadata Extraction)
 // =========================================================================
@@ -82,19 +88,22 @@ struct MotionPhotoMetadata {
 // Returns true if the file is a valid Motion Photo.
 bool ParseMotionPhotoFromFile(const std::string& filepath,
                               MotionPhotoMetadata* out_metadata,
-                              MessageCallback callback = nullptr);
+                              MessageCallback callback = nullptr,
+                              const HandlerOptions& options = {});
 
 // Parse Motion Photo metadata from a POSIX file descriptor slice (fd, offset, length).
 // Returns true if parsing succeeded and the payload is a valid Motion Photo.
 bool ParseMotionPhotoFromFd(int fd, int64_t offset, int64_t length,
                             MotionPhotoMetadata* out_metadata,
-                            MessageCallback callback = nullptr);
+                            MessageCallback callback = nullptr,
+                            const HandlerOptions& options = {});
 
 // Parse Motion Photo metadata from an in-memory byte buffer.
 // Returns true if parsing succeeded and the payload is a valid Motion Photo.
 bool ParseMotionPhotoFromMemory(const uint8_t* data, size_t size,
                                 MotionPhotoMetadata* out_metadata,
-                                MessageCallback callback = nullptr);
+                                MessageCallback callback = nullptr,
+                                const HandlerOptions& options = {});
 
 // =========================================================================
 // 2. Container Validation (Checking)

@@ -15,23 +15,30 @@
 #include "libmotionphoto_api.h"
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <fstream>
 #include <functional>
+#include <ios>
+#include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "image_io/base/data_destination.h"
 #include "image_io/base/data_range.h"
 #include "image_io/base/data_segment.h"
 #include "image_io/base/data_segment_data_source.h"
+#include "image_io/base/data_source.h"
 #include "image_io/base/message_handler.h"
 #include "image_io/base/message_writer.h"
-#include "image_io/utils/file_utils.h"
+#include "image_io/base/types.h"
 #include "image_io/utils/string_outputter.h"
 #include "image_io/utils/string_outputter_message_writer.h"
 #include "motion_photo/camera_metadata.h"
@@ -60,10 +67,10 @@ bool WriteBufferToFile(const std::string& path, const uint8_t* data, size_t size
 }
 
 // Internal helper copying nested image_io fields into clean native structs.
-void PopulateNativeMetadata(const ::libmotionphoto::motion_photo::MotionPhoto& photo,
-                            MotionPhotoMetadata* out) {
+void PopulateNativeMetadata(
+    const ::libmotionphoto::motion_photo::MotionPhoto& photo,
+    MotionPhotoMetadata* out) {
   if (out == nullptr) return;
-  out->is_motion_photo = photo.IsMotionPhoto();
   const auto& camera = photo.GetCameraMetadata();
   if (camera.motion_photo_presentation_timestamp_us.WasAssigned() &&
       camera.motion_photo_presentation_timestamp_us.IsValid()) {
@@ -94,6 +101,130 @@ void PopulateNativeMetadata(const ::libmotionphoto::motion_photo::MotionPhoto& p
   }
 }
 
+// Lazy DataSource backed by pread() on an open file descriptor.
+// Only fetches requested chunks (e.g. initial 64-128 KB headers) into RAM,
+// avoiding full-file buffering in memory.
+class FdDataSource : public ::photos_editing_formats::image_io::DataSource {
+ public:
+  FdDataSource(int fd, int64_t base_offset, int64_t total_length,
+               bool owns_fd = false)
+      : fd_(fd),
+        base_offset_(base_offset),
+        total_length_(total_length),
+        owns_fd_(owns_fd) {}
+
+  ~FdDataSource() override {
+    if (owns_fd_ && fd_ >= 0) {
+      close(fd_);
+      fd_ = -1;
+    }
+  }
+
+  void Reset() override { current_data_segment_.reset(); }
+
+  std::shared_ptr<::photos_editing_formats::image_io::DataSegment>
+  GetDataSegment(size_t begin, size_t min_size) override {
+    if (current_data_segment_ && current_data_segment_->Contains(begin)) {
+      size_t remaining = current_data_segment_->GetEnd() - begin;
+      if (remaining >= min_size) {
+        return current_data_segment_;
+      }
+    }
+    current_data_segment_ = Read(begin, min_size);
+    return current_data_segment_;
+  }
+
+  TransferDataResult TransferData(
+      const ::photos_editing_formats::image_io::DataRange& data_range,
+      size_t best_size,
+      ::photos_editing_formats::image_io::DataDestination* data_destination)
+      override {
+    bool data_transferred = false;
+    ::photos_editing_formats::image_io::DataDestination::TransferStatus status =
+        ::photos_editing_formats::image_io::DataDestination::kTransferDone;
+    if (data_destination && data_range.IsValid() && fd_ >= 0) {
+      size_t min_size = std::min(data_range.GetLength(), best_size);
+      if (current_data_segment_ &&
+          current_data_segment_->GetLength() >= min_size &&
+          current_data_segment_->GetDataRange().Contains(data_range)) {
+        status = data_destination->Transfer(data_range, *current_data_segment_);
+        data_transferred = true;
+      } else {
+        size_t chunk_size = std::max(min_size, static_cast<size_t>(64 * 1024));
+        for (size_t begin = data_range.GetBegin(); begin < data_range.GetEnd();
+             begin += chunk_size) {
+          size_t end = std::min(data_range.GetEnd(), begin + chunk_size);
+          auto data_segment = Read(begin, end - begin);
+          if (data_segment && data_segment->GetLength() > 0) {
+            status = data_destination->Transfer(data_segment->GetDataRange(),
+                                                *data_segment);
+            data_transferred = true;
+          }
+          if (status != ::photos_editing_formats::image_io::DataDestination::
+                            kTransferOk ||
+              !data_segment || data_segment->GetLength() == 0) {
+            break;
+          }
+        }
+      }
+    }
+    if (data_transferred) {
+      return status == ::photos_editing_formats::image_io::DataDestination::
+                           kTransferError
+                 ? kTransferDataError
+                 : kTransferDataSuccess;
+    }
+    return data_destination ? kTransferDataNone : kTransferDataError;
+  }
+
+ private:
+  std::shared_ptr<::photos_editing_formats::image_io::DataSegment> Read(
+      size_t begin, size_t min_size) {
+    if (fd_ < 0 || begin >= static_cast<size_t>(total_length_)) {
+      return nullptr;
+    }
+    size_t chunk_size = std::max(min_size, static_cast<size_t>(64 * 1024));
+    size_t to_read =
+        std::min(chunk_size, static_cast<size_t>(total_length_) - begin);
+    if (to_read == 0) {
+      return nullptr;
+    }
+
+    auto buffer =
+        std::make_shared<std::vector<::photos_editing_formats::image_io::Byte>>(
+            to_read);
+    size_t total_bytes_read = 0;
+    while (total_bytes_read < to_read) {
+      ssize_t bytes = pread(fd_, buffer->data() + total_bytes_read,
+                            to_read - total_bytes_read,
+                            base_offset_ + begin + total_bytes_read);
+      if (bytes <= 0) break;
+      total_bytes_read += bytes;
+    }
+
+    if (total_bytes_read == 0) {
+      return nullptr;
+    }
+
+    auto segment = ::photos_editing_formats::image_io::DataSegment::Create(
+        ::photos_editing_formats::image_io::DataRange(begin,
+                                                      begin + total_bytes_read),
+        buffer->data(),
+        ::photos_editing_formats::image_io::DataSegment::
+            BufferDispositionPolicy::kDontDelete);
+    return std::shared_ptr<::photos_editing_formats::image_io::DataSegment>(
+        segment.get(),
+        [segment, buffer](::photos_editing_formats::image_io::DataSegment*) {});
+  }
+
+  int fd_ = -1;
+  int64_t base_offset_ = 0;
+  int64_t total_length_ = 0;
+  bool owns_fd_ = false;
+  std::shared_ptr<::photos_editing_formats::image_io::DataSegment>
+      current_data_segment_;
+};
+
 }  // namespace
 
 // =========================================================================
@@ -102,7 +233,8 @@ void PopulateNativeMetadata(const ::libmotionphoto::motion_photo::MotionPhoto& p
 
 bool ParseMotionPhotoFromFile(const std::string& filepath,
                               MotionPhotoMetadata* out_metadata,
-                              MessageCallback callback) {
+                              MessageCallback callback,
+                              const HandlerOptions& options) {
   ::photos_editing_formats::image_io::MessageHandler message_handler;
   if (callback) {
     message_handler.SetMessageWriter(
@@ -117,17 +249,25 @@ bool ParseMotionPhotoFromFile(const std::string& filepath,
   ::libmotionphoto::motion_photo::FileType file_type =
       ::libmotionphoto::motion_photo::GetFileTypeFromFileName(filepath);
 
-  std::shared_ptr<::photos_editing_formats::image_io::DataSegment> data_segment =
-      ::photos_editing_formats::image_io::ReadEntireFile(filepath, &message_handler);
-  if (!data_segment || data_segment->GetLength() == 0) {
+  int fd = open(filepath.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
     return false;
   }
+  struct stat st;
+  if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+    close(fd);
+    return false;
+  }
+  int64_t file_size = st.st_size;
 
-  ::photos_editing_formats::image_io::DataSegmentDataSource data_source(data_segment);
+  FdDataSource data_source(fd, /*base_offset=*/0, file_size, /*owns_fd=*/true);
   ::libmotionphoto::motion_photo::MetadataCollection collection =
-      engine.Parse(&data_source, data_segment->GetLength(), file_type);
+      engine.Parse(&data_source, file_size, file_type);
 
-  bool is_mp = engine.IsMotionPhoto(collection);
+  ::libmotionphoto::motion_photo::HandlerOptions engine_options;
+  engine_options.disable_3p_plugins = options.disable_3p_plugins;
+  engine_options.enabled_3p_plugins = options.enabled_3p_plugins;
+  bool is_mp = engine.IsMotionPhoto(collection, engine_options);
 
   if (out_metadata != nullptr) {
     out_metadata->is_motion_photo = is_mp;
@@ -137,7 +277,7 @@ bool ParseMotionPhotoFromFile(const std::string& filepath,
     size_t bytes_parsed = 0;
 
     for (const auto& block : collection.blocks()) {
-      if (block.has_video_length() && block.video_length() > 0) {
+      if (is_mp && block.has_video_length() && block.video_length() > 0) {
         out_metadata->video_length = block.video_length();
       }
       if (block.type() == ::libmotionphoto::motion_photo::BLOCK_TYPE_XMP ||
@@ -151,7 +291,7 @@ bool ParseMotionPhotoFromFile(const std::string& filepath,
 
     if (::libmotionphoto::motion_photo::IsHeif(file_type)) {
       ::libmotionphoto::motion_photo::MotionPhotoHeifInfoBuilder heif_builder(&message_handler);
-      if (heif_builder.Build(&data_source, data_segment->GetLength())) {
+      if (heif_builder.Build(&data_source, file_size)) {
         const auto& xmp_range = heif_builder.GetXmpStringRange();
         if (xmp_range.GetLength() > 0) {
           std::shared_ptr<::photos_editing_formats::image_io::DataSegment> xmp_segment =
@@ -196,21 +336,31 @@ bool ParseMotionPhotoFromFile(const std::string& filepath,
 
 bool ParseMotionPhotoFromFd(int fd, int64_t offset, int64_t length,
                             MotionPhotoMetadata* out_metadata,
-                            MessageCallback callback) {
-  if (fd < 0 || length <= 0) {
+                            MessageCallback callback,
+                            const HandlerOptions& options) {
+  if (fd < 0 || offset < 0 || length <= 0) {
     return false;
+  }
+  if (static_cast<uint64_t>(offset) >
+      std::numeric_limits<uint64_t>::max() - static_cast<uint64_t>(length)) {
+    return false;
+  }
+  struct stat st;
+  if (fstat(fd, &st) == 0 && st.st_size >= 0) {
+    if (offset + length > st.st_size) {
+      return false;
+    }
   }
 
-  std::vector<uint8_t> buffer(length);
-  size_t bytes_read = 0;
-  while (bytes_read < static_cast<size_t>(length)) {
-    ssize_t r = pread(fd, buffer.data() + bytes_read,
-                      length - bytes_read, offset + bytes_read);
-    if (r <= 0) break;
-    bytes_read += r;
-  }
-  if (bytes_read < static_cast<size_t>(length)) {
-    return false;
+  // Read a small 12-byte header to sniff file type without buffering entire
+  // length.
+  ::libmotionphoto::motion_photo::FileType file_type =
+      ::libmotionphoto::motion_photo::FileType::kJpeg;
+  char header_buf[12];
+  ssize_t header_read = pread(fd, header_buf, sizeof(header_buf), offset);
+  if (header_read >= 12 && header_buf[4] == 'f' && header_buf[5] == 't' &&
+      header_buf[6] == 'y' && header_buf[7] == 'p') {
+    file_type = ::libmotionphoto::motion_photo::FileType::kHeic;
   }
 
   ::photos_editing_formats::image_io::MessageHandler message_handler;
@@ -225,22 +375,15 @@ bool ParseMotionPhotoFromFd(int fd, int64_t offset, int64_t length,
 
   ::libmotionphoto::motion_photo::MetadataEngine engine(&message_handler);
 
-  ::libmotionphoto::motion_photo::FileType file_type =
-      ::libmotionphoto::motion_photo::FileType::kJpeg;
-  if (buffer.size() >= 12 && buffer[4] == 'f' && buffer[5] == 't' &&
-      buffer[6] == 'y' && buffer[7] == 'p') {
-    file_type = ::libmotionphoto::motion_photo::FileType::kHeic;
-  }
-
-  auto data_segment = ::photos_editing_formats::image_io::DataSegment::Create(
-      ::photos_editing_formats::image_io::DataRange(0, buffer.size()), buffer.data(),
-      ::photos_editing_formats::image_io::DataSegment::BufferDispositionPolicy::kDontDelete);
-  ::photos_editing_formats::image_io::DataSegmentDataSource data_source(data_segment);
+  FdDataSource data_source(fd, offset, length, /*owns_fd=*/false);
 
   ::libmotionphoto::motion_photo::MetadataCollection collection =
-      engine.Parse(&data_source, buffer.size(), file_type);
+      engine.Parse(&data_source, length, file_type);
 
-  bool is_mp = engine.IsMotionPhoto(collection);
+  ::libmotionphoto::motion_photo::HandlerOptions engine_options;
+  engine_options.disable_3p_plugins = options.disable_3p_plugins;
+  engine_options.enabled_3p_plugins = options.enabled_3p_plugins;
+  bool is_mp = engine.IsMotionPhoto(collection, engine_options);
 
   if (out_metadata != nullptr) {
     out_metadata->is_motion_photo = is_mp;
@@ -250,7 +393,7 @@ bool ParseMotionPhotoFromFd(int fd, int64_t offset, int64_t length,
     size_t bytes_parsed = 0;
 
     for (const auto& block : collection.blocks()) {
-      if (block.has_video_length() && block.video_length() > 0) {
+      if (is_mp && block.has_video_length() && block.video_length() > 0) {
         out_metadata->video_length = block.video_length();
       }
       if (block.type() == ::libmotionphoto::motion_photo::BLOCK_TYPE_XMP ||
@@ -264,7 +407,7 @@ bool ParseMotionPhotoFromFd(int fd, int64_t offset, int64_t length,
 
     if (::libmotionphoto::motion_photo::IsHeif(file_type)) {
       ::libmotionphoto::motion_photo::MotionPhotoHeifInfoBuilder heif_builder(&message_handler);
-      if (heif_builder.Build(&data_source, buffer.size())) {
+      if (heif_builder.Build(&data_source, length)) {
         const auto& xmp_range = heif_builder.GetXmpStringRange();
         if (xmp_range.GetLength() > 0) {
           std::shared_ptr<::photos_editing_formats::image_io::DataSegment> xmp_segment =
@@ -309,7 +452,8 @@ bool ParseMotionPhotoFromFd(int fd, int64_t offset, int64_t length,
 
 bool ParseMotionPhotoFromMemory(const uint8_t* data, size_t size,
                                 MotionPhotoMetadata* out_metadata,
-                                MessageCallback callback) {
+                                MessageCallback callback,
+                                const HandlerOptions& options) {
   if (data == nullptr || size == 0) {
     return false;
   }
@@ -341,7 +485,10 @@ bool ParseMotionPhotoFromMemory(const uint8_t* data, size_t size,
   ::libmotionphoto::motion_photo::MetadataCollection collection =
       engine.Parse(&data_source, size, file_type);
 
-  bool is_mp = engine.IsMotionPhoto(collection);
+  ::libmotionphoto::motion_photo::HandlerOptions engine_options;
+  engine_options.disable_3p_plugins = options.disable_3p_plugins;
+  engine_options.enabled_3p_plugins = options.enabled_3p_plugins;
+  bool is_mp = engine.IsMotionPhoto(collection, engine_options);
 
   if (out_metadata != nullptr) {
     out_metadata->is_motion_photo = is_mp;
@@ -351,7 +498,7 @@ bool ParseMotionPhotoFromMemory(const uint8_t* data, size_t size,
     size_t bytes_parsed = 0;
 
     for (const auto& block : collection.blocks()) {
-      if (block.has_video_length() && block.video_length() > 0) {
+      if (is_mp && block.has_video_length() && block.video_length() > 0) {
         out_metadata->video_length = block.video_length();
       }
       if (block.type() == ::libmotionphoto::motion_photo::BLOCK_TYPE_XMP ||
@@ -445,14 +592,17 @@ int CheckMotionPhotoFromMemory(const uint8_t* data, size_t size,
 bool ExtractPrimaryImageFromFile(const std::string& input_filepath,
                                  const std::string& output_image_path,
                                  MessageCallback callback) {
-  ::libmotionphoto::motion_photo::MotionPhotoExtractorParams params;
-  params.motion_photo_file_name = input_filepath;
-  params.primary_image_file_name_output = output_image_path;
-  ::photos_editing_formats::image_io::StringOutputter outputter([callback](const std::string& msg) {
-    if (callback) callback(msg);
-  });
-  int status = ::libmotionphoto::motion_photo::ExtractMotionPhoto(params, outputter);
-  return status == 0;
+  int fd = open(input_filepath.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return false;
+  struct stat st;
+  if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+    close(fd);
+    return false;
+  }
+  bool res =
+      ExtractPrimaryImageFromFd(fd, 0, st.st_size, output_image_path, callback);
+  close(fd);
+  return res;
 }
 
 bool ExtractPrimaryImageFromFd(int fd, int64_t offset, int64_t length,
@@ -490,14 +640,17 @@ bool ExtractPrimaryImageFromMemory(const uint8_t* data, size_t size,
 bool ExtractVideoTrackFromFile(const std::string& input_filepath,
                                const std::string& output_video_path,
                                MessageCallback callback) {
-  ::libmotionphoto::motion_photo::MotionPhotoExtractorParams params;
-  params.motion_photo_file_name = input_filepath;
-  params.video_file_name_output = output_video_path;
-  ::photos_editing_formats::image_io::StringOutputter outputter([callback](const std::string& msg) {
-    if (callback) callback(msg);
-  });
-  int status = ::libmotionphoto::motion_photo::ExtractMotionPhoto(params, outputter);
-  return status == 0;
+  int fd = open(input_filepath.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return false;
+  struct stat st;
+  if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+    close(fd);
+    return false;
+  }
+  bool res =
+      ExtractVideoTrackFromFd(fd, 0, st.st_size, output_video_path, callback);
+  close(fd);
+  return res;
 }
 
 bool ExtractVideoTrackFromFd(int fd, int64_t offset, int64_t length,

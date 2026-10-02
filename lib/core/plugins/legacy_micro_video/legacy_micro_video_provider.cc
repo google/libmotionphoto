@@ -53,8 +53,8 @@ int64_t ExtractInt64Attr(std::string_view xml, const std::string& attr_name) {
 
 bool LegacyMicroVideoProvider::Identify(const RawMetadataBlock& block) {
   if (block.type == "XMP" && block.format_identifier == "standard.xmp") {
-    std::string_view xml(reinterpret_cast<const char*>(block.bytes.data()),
-                         block.bytes.size());
+    absl::string_view xml(reinterpret_cast<const char*>(block.bytes.data()),
+                          block.bytes.size());
     return absl::StrContains(xml, "MicroVideo");
   }
   if (block.format_identifier == "container.trailer") {

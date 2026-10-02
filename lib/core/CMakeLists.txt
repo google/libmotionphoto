@@ -26,9 +26,13 @@ find_package(Protobuf CONFIG QUIET)
 if (NOT Protobuf_FOUND)
   find_package(Protobuf REQUIRED)
 endif()
-find_package(absl CONFIG QUIET)
-if (NOT absl_FOUND)
-  find_package(absl QUIET)
+include(cmake/Dependencies.cmake)
+
+if (LIBMOTIONPHOTO_USE_SYSTEM_DEPS)
+  find_package(absl CONFIG QUIET)
+  if (NOT absl_FOUND)
+    find_package(absl QUIET)
+  endif()
 endif()
 if (NOT TARGET absl::strings)
   include(FetchContent)
@@ -36,6 +40,7 @@ if (NOT TARGET absl::strings)
     abseil_cpp
     GIT_REPOSITORY https://github.com/abseil/abseil-cpp.git
     GIT_TAG 20240116.2
+    GIT_SHALLOW TRUE
   )
   set(ABSL_PROPAGATE_CXX_STANDARD ON CACHE BOOL "" FORCE)
   FetchContent_MakeAvailable(abseil_cpp)
@@ -57,8 +62,6 @@ if (NOT TARGET protobuf::protoc AND PROTOC_BINARY)
     IMPORTED_LOCATION "${PROTOC_BINARY}"
   )
 endif()
-
-include(cmake/Dependencies.cmake)
 
 if (LIBHEIF_FOUND)
   add_compile_definitions(MOTION_PHOTO_HEIC_SUPPORT=1)
@@ -230,7 +233,7 @@ if (ANDROID)
       motion_photo_extractor_lib
       motion_photo
       protobuf::libprotobuf-lite
-      absl::log_internal_check_op
+      $<$<TARGET_EXISTS:absl::log_internal_check_op>:absl::log_internal_check_op>
   )
   target_link_options(motion_photo_jni PRIVATE "-Wl,-z,max-page-size=16384")
 else()
@@ -244,7 +247,7 @@ else()
         motion_photo_extractor_lib
         motion_photo
         protobuf::libprotobuf-lite
-        absl::log_internal_check_op
+        $<$<TARGET_EXISTS:absl::log_internal_check_op>:absl::log_internal_check_op>
         ${JNI_LIBRARIES}
     )
   endif()

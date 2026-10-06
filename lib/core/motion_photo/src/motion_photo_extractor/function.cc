@@ -30,7 +30,6 @@
 #include "image_io/utils/string_outputter_message_writer.h"
 #include "metadata_collection.pb.h"
 #include "motion_photo/metadata_engine.h"
-#include "motion_photo/motion_photo_checker.h"
 #include "motion_photo/motion_photo_reader.h"
 #include "motion_photo/motion_photo_utils.h"
 #include "motion_photo/motion_photo_writer.h"
@@ -81,7 +80,7 @@ string GetProgramName(std::string_view arg0) {
     program_name = arg0.substr(last_slash + 1);
   }
   if (program_name.empty()) {
-    program_name = "motion_photo_checker";
+    program_name = "motion_photo_extractor";
   }
   return program_name;
 }
@@ -255,7 +254,6 @@ int ExtractMotionPhoto(const MotionPhotoExtractorParams& params,
 
   MotionPhoto motion_photo(file_type);
   MotionPhotoReader motion_photo_reader(&motion_photo, &message_handler);
-  MotionPhotoChecker motion_photo_checker(motion_photo, &message_handler);
 
   unique_ptr<DataSource> data_source;
   tie(data_source, file_size) =
@@ -272,12 +270,14 @@ int ExtractMotionPhoto(const MotionPhotoExtractorParams& params,
   int64_t video_length = -1;
   int64_t image_size = -1;
 
-  for (const auto& block : collection.blocks()) {
-    if (block.format_identifier() == "container.trailer") {
-      image_size = block.offset();
-      if (block.has_video_offset_in_block() && block.has_video_length()) {
-        video_offset = block.offset() + block.video_offset_in_block();
-        video_length = block.video_length();
+  if (engine.IsMotionPhoto(collection)) {
+    for (const auto& block : collection.blocks()) {
+      if (block.format_identifier() == "container.trailer") {
+        image_size = block.offset();
+        if (block.has_video_offset_in_block() && block.has_video_length()) {
+          video_offset = block.offset() + block.video_offset_in_block();
+          video_length = block.video_length();
+        }
       }
     }
   }
@@ -337,26 +337,21 @@ int ExtractMotionPhoto(const MotionPhotoExtractorParams& params,
   }
   motion_photo.SetMpvdBox(mpvd_box);
 
-  // Parse the XMP metadata string from the data source and check the values.
-  if (!ParseAndCheckXmpMetadata(data_source.get(), file_size, file_type,
-                                params.motion_photo_file_name, xmp_range,
-                                std_image_size, params.metadata_file_name_output,
-                                &motion_photo, &motion_photo_reader,
-                                &motion_photo_checker, outputter)) {
+  // Parse the XMP metadata string without running strict MotionPhotoChecker rules.
+  if (!ParseXmpMetadata(data_source.get(), params.motion_photo_file_name,
+                        xmp_range, params.metadata_file_name_output,
+                        &motion_photo_reader, outputter)) {
+    return 1;
+  }
+  if (!motion_photo.IsMotionPhoto() && !mpvd_box.IsValid()) {
+    message_handler.ReportMessage(Message::kValueError,
+                                  "Input file is not a motion photo");
     return 1;
   }
 
-  // Read and decode and check the MP4 track data and metadata.
   int64_t offset = motion_photo.GetMp4FileOffset(file_size);
 
-  if (offset < file_size) {
-    if (!ReadDecodeAndCheckVideoMetadata(params.motion_photo_file_name, offset,
-                                         &motion_photo, &motion_photo_reader,
-                                         &motion_photo_checker, outputter,
-                                         &message_handler)) {
-      return 0;
-    }
-
+  if (offset >= 0 && offset < static_cast<int64_t>(file_size)) {
     if (!params.video_file_name_output.empty()) {
       WriteToOutput(params.motion_photo_file_name,
                     params.video_file_name_output, offset, file_size);

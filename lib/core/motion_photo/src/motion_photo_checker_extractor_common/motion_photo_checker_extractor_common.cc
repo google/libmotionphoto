@@ -250,15 +250,12 @@ tuple<size_t, DataRange, MpvdBox> GetImageSizeAndXmpRange(
   return make_tuple(image_size, primary_xmp_range, mpvd_box);
 }
 
-bool ParseAndCheckXmpMetadata(DataSource* data_source, size_t file_size,
-                              FileType file_type,
-                              const string& motion_photo_file_name,
-                              const DataRange& xmp_range, size_t image_size,
-                              const std::string& metadata_file_name_output,
-                              MotionPhoto* motion_photo,
-                              MotionPhotoReader* motion_photo_reader,
-                              MotionPhotoChecker* motion_photo_checker,
-                              const StringOutputter& outputter) {
+bool ParseXmpMetadata(DataSource* data_source,
+                      const string& motion_photo_file_name,
+                      const DataRange& xmp_range,
+                      const std::string& metadata_file_name_output,
+                      MotionPhotoReader* motion_photo_reader,
+                      const StringOutputter& outputter) {
   outputter("\nParsing XMP metadata\n");
   const size_t kMaxXmpLineLength = 100;
   DataLineMap data_line_map;
@@ -271,8 +268,22 @@ bool ParseAndCheckXmpMetadata(DataSource* data_source, size_t file_size,
     WriteToOutput(motion_photo_file_name, metadata_file_name_output,
                   xmp_range.GetBegin(), xmp_range.GetEnd());
   }
-  if (!motion_photo_reader->ReadImageMetadata({xmp_range}, data_source,
-                                              &bytes_parsed)) {
+  return motion_photo_reader->ReadImageMetadata({xmp_range}, data_source,
+                                                &bytes_parsed);
+}
+
+bool ParseAndCheckXmpMetadata(DataSource* data_source, size_t file_size,
+                              FileType file_type,
+                              const string& motion_photo_file_name,
+                              const DataRange& xmp_range, size_t image_size,
+                              const std::string& metadata_file_name_output,
+                              MotionPhoto* motion_photo,
+                              MotionPhotoReader* motion_photo_reader,
+                              MotionPhotoChecker* motion_photo_checker,
+                              const StringOutputter& outputter) {
+  if (!ParseXmpMetadata(data_source, motion_photo_file_name, xmp_range,
+                        metadata_file_name_output, motion_photo_reader,
+                        outputter)) {
     return false;
   }
 

@@ -15,8 +15,11 @@
 #include <absl/strings/match.h>
 #include <absl/strings/string_view.h>
 
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <ios>
 #include <iostream>
 #include <string>
 
@@ -215,6 +218,58 @@ TEST(MotionPhotoExtractorFunctionTest, StillOnlyImageRejection) {
   int status = MotionPhotoExtractorFunction(5, argv, [](absl::string_view) {});
   EXPECT_NE(status, 0);
   EXPECT_FALSE(fs::exists(kDummyVideo));
+
+  fs::remove_all(kTestDir);
+}
+
+// Ensures extractor succeeds directly without running strict MotionPhotoChecker
+// validation rules (e.g. when GCamera:MotionPhotoVersion is "2" instead of "1",
+// which MotionPhotoChecker rejects with an error).
+TEST(MotionPhotoExtractorFunctionTest, ExtractionBypassesCheckerValidation) {
+  const string kTestDir = CreateTestDir("ExtractionBypassesCheckerValidation");
+  const string kSrcJpg =
+      "lib/core/motion_photo/testdata/motion_photo_single_video_track.MP.jpg";
+  const string kModifiedJpg =
+      (fs::path(kTestDir) / "non_conforming_version.jpg").string();
+  const string kOutputFileImage =
+      (fs::path(kTestDir) / "extracted_still.jpg").string();
+  const string kOutputFileVideo =
+      (fs::path(kTestDir) / "extracted_video.mp4").string();
+
+  std::ifstream in(kSrcJpg, std::ios::binary);
+  string bytes((std::istreambuf_iterator<char>(in)),
+               std::istreambuf_iterator<char>());
+  const string kTarget = "MotionPhotoVersion=\"1\"";
+  const string kReplacement = "MotionPhotoVersion=\"2\"";
+  size_t pos = bytes.find(kTarget);
+  EXPECT_NE(pos, string::npos);
+  if (pos != string::npos) {
+    bytes.replace(pos, kTarget.size(), kReplacement);
+  }
+  {
+    std::ofstream out(kModifiedJpg, std::ios::binary);
+    out.write(bytes.data(), bytes.size());
+  }
+
+  const char* argv[] = {"MotionPhotoExtractor",     "-mi",
+                        kModifiedJpg.c_str(),       "-po",
+                        kOutputFileImage.c_str(),   "-vo",
+                        kOutputFileVideo.c_str()};
+
+  bool has_zero_errors = false;
+  int status = MotionPhotoExtractorFunction(7, argv, [&](absl::string_view str) {
+    if (absl::StrContains(str, "0 errors")) {
+      has_zero_errors = true;
+    }
+  });
+
+  EXPECT_EQ(status, 0);
+  EXPECT_TRUE(has_zero_errors);
+  EXPECT_TRUE(fs::exists(kOutputFileImage));
+  EXPECT_TRUE(fs::exists(kOutputFileVideo));
+
+  MotionPhotoMp4FileReader mp4_reader;
+  EXPECT_TRUE(mp4_reader.Read(kOutputFileVideo, 0));
 
   fs::remove_all(kTestDir);
 }

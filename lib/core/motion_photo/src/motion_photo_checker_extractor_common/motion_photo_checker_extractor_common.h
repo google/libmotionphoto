@@ -53,6 +53,16 @@ std::tuple<size_t, image_io::DataRange, MpvdBox> GetImageSizeAndXmpRange(
     const image_io::StringOutputter& outputter,
     image_io::MessageHandler* message_handler);
 
+// Parses the XMP metadata without running MotionPhotoChecker validations.
+// Optionally writes the metadata to metadata_file_name_output.
+bool ParseXmpMetadata(
+    image_io::DataSource* data_source,
+    const std::string& motion_photo_file_name,
+    const image_io::DataRange& xmp_range,
+    const std::string& metadata_file_name_output,
+    MotionPhotoReader* motion_photo_reader,
+    const image_io::StringOutputter& outputter);
+
 // Parses and checks the XMP metadata.
 // Optionally writes the metadata to metadata_file_name_output.
 bool ParseAndCheckXmpMetadata(

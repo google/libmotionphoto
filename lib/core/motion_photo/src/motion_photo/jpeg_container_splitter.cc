@@ -308,12 +308,9 @@ class JpegContainerSplitter : public ContainerSplitter,
 
 }  // namespace
 
-std::unique_ptr<ContainerSplitter> CreateContainerSplitter(
-    FileType type, image_io::MessageHandler* message_handler) {
-  if (type == FileType::kJpeg) {
-    return std::make_unique<JpegContainerSplitter>(message_handler);
-  }
-  return nullptr;
+std::unique_ptr<ContainerSplitter> CreateJpegContainerSplitter(
+    image_io::MessageHandler* message_handler) {
+  return std::make_unique<JpegContainerSplitter>(message_handler);
 }
 
 }  // namespace motion_photo

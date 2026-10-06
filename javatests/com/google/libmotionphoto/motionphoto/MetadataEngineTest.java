@@ -86,6 +86,32 @@ public class MetadataEngineTest {
   }
 
   @Test
+  public void parseMetadata_heicMotionPhoto_isMotionPhoto() throws Exception {
+    String heicPath = TestUtil.getTestDataPath("motion_photo_single_video_track.MP.heic");
+
+    byte[] pathBytes = MetadataEngine.parseMetadata(heicPath);
+    assertThat(pathBytes).isNotNull();
+    assertThat(MetadataEngine.isMotionPhoto(pathBytes)).isTrue();
+
+    File file = new File(heicPath);
+    try (ParcelFileDescriptor pfd =
+        ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)) {
+      byte[] fdBytes = MetadataEngine.parseMetadataFd(pfd.getFd(), 0, file.length());
+      assertThat(fdBytes).isEqualTo(pathBytes);
+    }
+  }
+
+  @Test
+  public void parseMetadata_heicWithoutVideo_isNotMotionPhoto() {
+    // The XMP says motion photo, but the file has no 'mpvd' video box.
+    byte[] protoBytes =
+        MetadataEngine.parseMetadata(TestUtil.getTestDataPath("motion_photo_photo_only.heic"));
+
+    assertThat(protoBytes).isNotNull();
+    assertThat(MetadataEngine.isMotionPhoto(protoBytes)).isFalse();
+  }
+
+  @Test
   public void extractAgtm_viaPathAndMemory_returnsValidJson() throws Exception {
     String agtmJsonPath = MetadataEngine.extractAgtm(agtmPhotoPath);
     assertThat(agtmJsonPath).isNotNull();

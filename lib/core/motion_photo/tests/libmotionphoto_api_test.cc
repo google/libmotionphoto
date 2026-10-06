@@ -22,6 +22,7 @@
 #include <filesystem>
 #include <fstream>
 #include <ios>
+#include <iterator>
 #include <limits>
 #include <string>
 #include <vector>
@@ -58,6 +59,30 @@ TEST(LibMotionPhotoApiTest, ParseMotionPhotoFromFileHeic) {
   EXPECT_EQ(metadata.video_mime, "video/mp4");
   EXPECT_TRUE(metadata.container.items.size() >= 2u);
   EXPECT_TRUE(metadata.video_length > 0);
+}
+
+TEST(LibMotionPhotoApiTest, ParseMotionPhotoHeicWithoutOutputMetadata) {
+  std::string file_path =
+      "lib/core/motion_photo/testdata/motion_photo_single_video_track.MP.heic";
+  EXPECT_TRUE(ParseMotionPhotoFromFile(file_path, nullptr));
+
+  std::ifstream file(file_path, std::ios::binary);
+  std::vector<uint8_t> buffer((std::istreambuf_iterator<char>(file)),
+                              std::istreambuf_iterator<char>());
+  ASSERT_FALSE(buffer.empty());
+  EXPECT_TRUE(
+      ParseMotionPhotoFromMemory(buffer.data(), buffer.size(), nullptr));
+}
+
+TEST(LibMotionPhotoApiTest, ParseMotionPhotoHeicWithoutVideo) {
+  // Motion photo XMP, but no 'mpvd' box: the video was removed.
+  std::string file_path =
+      "lib/core/motion_photo/testdata/motion_photo_photo_only.heic";
+  EXPECT_FALSE(ParseMotionPhotoFromFile(file_path, nullptr));
+
+  MotionPhotoMetadata metadata;
+  EXPECT_FALSE(ParseMotionPhotoFromFile(file_path, &metadata));
+  EXPECT_FALSE(metadata.is_motion_photo);
 }
 
 // 2. Test ParseMotionPhotoFromFd

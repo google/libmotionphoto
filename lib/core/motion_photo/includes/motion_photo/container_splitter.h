@@ -38,8 +38,14 @@ class ContainerSplitter {
       image_io::DataSource* data_source, size_t file_size) = 0;
 };
 
-std::unique_ptr<ContainerSplitter> CreateContainerSplitter(
-    FileType type, image_io::MessageHandler* message_handler);
+// Returns a splitter for JPEG images.
+std::unique_ptr<ContainerSplitter> CreateJpegContainerSplitter(
+    image_io::MessageHandler* message_handler);
+
+// Returns a splitter for HEIF-based images (HEIC and AVIF) that does not need
+// libheif. It emits the primary image's XMP item as a "standard.xmp" block, and
+// only when the file also has a top-level 'mpvd' (motion photo video) box.
+std::unique_ptr<ContainerSplitter> CreateHeifContainerSplitter();
 
 }  // namespace motion_photo
 }  // namespace libmotionphoto

@@ -208,6 +208,7 @@ if (NOT ANDROID)
     motion_photo/tests/motion_photo_checker_test.cc
     motion_photo/tests/motion_photo_extractor_test.cc
     motion_photo/tests/mp4_box_reader_test.cc
+    motion_photo/tests/heif_container_splitter_test.cc
     motion_photo/tests/libmotionphoto_api_test.cc
   )
   target_include_directories(motion_photo_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/.. motion_photo/includes ${CMAKE_CURRENT_BINARY_DIR})

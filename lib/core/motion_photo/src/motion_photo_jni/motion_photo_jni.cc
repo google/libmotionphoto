@@ -63,6 +63,17 @@ using libmotionphoto::jni::ScopedUtfChars;
 using libmotionphoto::jni::ThrowOutOfMemoryError;
 using libmotionphoto::jni::ThrowRuntimeException;
 
+// Returns kHeic for ISO BMFF images, which start with an 'ftyp' box, and kJpeg
+// otherwise. The metadata engine parses HEIC and AVIF the same way.
+libmotionphoto::motion_photo::FileType SniffFileType(const uint8_t* data,
+                                                     size_t size) {
+  if (data != nullptr && size >= 8 && data[4] == 'f' && data[5] == 't' &&
+      data[6] == 'y' && data[7] == 'p') {
+    return libmotionphoto::motion_photo::FileType::kHeic;
+  }
+  return libmotionphoto::motion_photo::FileType::kJpeg;
+}
+
 // Lazy random-access DataSource backed by pread() on an open file descriptor.
 // Reads 64 KB chunks on demand over the full [0, total_length_) range without
 // buffering the entire file in memory.
@@ -218,6 +229,11 @@ jbyteArray ParseMetadataFromFd(JNIEnv* env, int fd, int64_t offset,
   engine.RegisterProvider(std::make_unique<mp::GoogleMotionPhotoProvider>());
 
   mp::FileType file_type = mp::FileType::kJpeg;
+  if (std::shared_ptr<ii::DataSegment> header_segment =
+          data_source.GetDataSegment(0, 8)) {
+    file_type = SniffFileType(header_segment->GetBuffer(0),
+                              header_segment->GetLength());
+  }
   mp::MetadataCollection collection =
       engine.Parse(&data_source, static_cast<size_t>(slice_length), file_type);
 
@@ -713,11 +729,8 @@ Java_com_google_libmotionphoto_motionphoto_MetadataEngineJni_extractAgtmFromMemo
     mp::MetadataEngine engine(&message_handler);
 
     int64_t target_ts = 0;
-    mp::FileType file_type = mp::FileType::kJpeg;
-    if (len >= 8 && buf.get()[4] == 'f' && buf.get()[5] == 't' &&
-        buf.get()[6] == 'y' && buf.get()[7] == 'p') {
-      file_type = mp::FileType::kHeic;
-    }
+    const mp::FileType file_type =
+        SniffFileType(data, static_cast<size_t>(len));
 
     auto data_segment = ii::DataSegment::Create(
         ii::DataRange(0, len), data,
@@ -804,13 +817,8 @@ Java_com_google_libmotionphoto_motionphoto_MetadataEngineJni_extractAgtmFd__IJJ(
     mp::MetadataEngine engine(&message_handler);
 
     int64_t target_ts = 0;
-    mp::FileType file_type = mp::FileType::kJpeg;
-    if (bytes_read >= 8 && buffer[4] == 'f' && buffer[5] == 't' &&
-        buffer[6] == 'y' && buffer[7] == 'p') {
-      file_type = mp::FileType::kHeic;
-    }
-
     const uint8_t* data = reinterpret_cast<const uint8_t*>(buffer.data());
+    const mp::FileType file_type = SniffFileType(data, bytes_read);
     auto data_segment = ii::DataSegment::Create(
         ii::DataRange(0, bytes_read), data,
         ii::DataSegment::BufferDispositionPolicy::kDontDelete);

@@ -60,7 +60,12 @@ MetadataCollection MetadataEngine::Parse(image_io::DataSource* data_source,
                                          size_t file_size, FileType file_type) {
   MetadataCollection collection;
 
-  auto splitter = CreateContainerSplitter(file_type, message_handler_);
+  std::unique_ptr<ContainerSplitter> splitter;
+  if (file_type == FileType::kJpeg) {
+    splitter = CreateJpegContainerSplitter(message_handler_);
+  } else if (IsHeif(file_type)) {
+    splitter = CreateHeifContainerSplitter();
+  }
   if (!splitter) {
     return collection;
   }

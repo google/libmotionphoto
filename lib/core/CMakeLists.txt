@@ -78,6 +78,7 @@ protobuf_generate(
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/../../samples/android/external/install_arm64-v8a/include
     PROTOS
+        plugins/honor_live_photo/honor_live_photo_metadata.proto
         plugins/legacy_micro_video/legacy_micro_video_metadata.proto
         motion_photo/proto/metadata_collection.proto
         motion_photo/proto/motion_photo_metadata.proto
@@ -203,6 +204,7 @@ if (NOT ANDROID)
   # Tests
   add_executable(motion_photo_tests
     motion_photo/tests/test_main.cc
+    plugins/honor_live_photo/honor_live_photo_provider_test.cc
     plugins/legacy_micro_video/legacy_micro_video_provider_test.cc
     motion_photo/tests/motion_photo_builder_test.cc
     motion_photo/tests/motion_photo_checker_test.cc

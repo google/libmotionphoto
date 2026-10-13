@@ -103,11 +103,7 @@ class JpegContainerSplitter : public ContainerSplitter,
       block.format_identifier = "container.trailer";
       block.offset = trailer_start;
       block.total_payload_size = trailer_length;
-      // Copy only header bytes needed for format verification (e.g. ftyp, moov)
-      // to avoid allocating/copying large video payloads (up to 120 MB) into
-      // RAM.
-      size_t bytes_to_copy = std::min<size_t>(trailer_length, 64);
-      if (CopyFromDataSource(data_source, trailer_start, bytes_to_copy,
+      if (CopyFromDataSource(data_source, trailer_start, trailer_length,
                              &block.bytes)) {
         blocks_.push_back(std::move(block));
       }

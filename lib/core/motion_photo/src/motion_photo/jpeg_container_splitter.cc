@@ -37,29 +37,6 @@ namespace motion_photo {
 
 namespace {
 
-bool CopyFromDataSource(image_io::DataSource* source, size_t start,
-                        size_t length, std::vector<uint8_t>* out) {
-  out->resize(length);
-  size_t bytes_copied = 0;
-  while (bytes_copied < length) {
-    size_t chunk_start = start + bytes_copied;
-    size_t chunk_size = length - bytes_copied;
-    auto segment = source->GetDataSegment(chunk_start, chunk_size);
-    if (!segment) {
-      return false;
-    }
-    const uint8_t* buf = segment->GetBuffer(chunk_start);
-    if (!buf) {
-      return false;
-    }
-    size_t copy_limit =
-        std::min(chunk_size, segment->GetDataRange().GetEnd() - chunk_start);
-    std::copy(buf, buf + copy_limit, out->begin() + bytes_copied);
-    bytes_copied += copy_limit;
-  }
-  return true;
-}
-
 class JpegContainerSplitter : public ContainerSplitter,
                               public image_io::JpegSegmentProcessor {
  public:
@@ -103,10 +80,8 @@ class JpegContainerSplitter : public ContainerSplitter,
       block.format_identifier = "container.trailer";
       block.offset = trailer_start;
       block.total_payload_size = trailer_length;
-      if (CopyFromDataSource(data_source, trailer_start, trailer_length,
-                             &block.bytes)) {
-        blocks_.push_back(std::move(block));
-      }
+      block.data_source = data_source;
+      blocks_.push_back(std::move(block));
     }
     return blocks_;
   }
@@ -132,8 +107,8 @@ class JpegContainerSplitter : public ContainerSplitter,
         if (!blocks_.empty() &&
             blocks_.back().format_identifier == "standard.xmp") {
           absl::string_view xml(
-              reinterpret_cast<const char*>(blocks_.back().bytes.data()),
-              blocks_.back().bytes.size());
+              reinterpret_cast<const char*>(blocks_.back().Data()),
+              blocks_.back().BufferedSize());
           size_t length = ParseVideoLengthFromXmp(xml);
           if (length > 0) {
             xmp_video_length_ = length;

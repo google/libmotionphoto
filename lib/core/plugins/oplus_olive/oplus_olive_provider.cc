@@ -88,22 +88,38 @@ bool ExtractXmpInt64(absl::string_view xml, absl::string_view prop_name,
   return false;
 }
 
-bool HasIsoBmffHeader(const std::vector<uint8_t>& bytes) {
-  if (bytes.size() < 8) {
+bool HasIsoBmffHeader(const RawMetadataBlock& block) {
+  if (block.Size() < 8) {
     return false;
   }
-  absl::string_view tag(reinterpret_cast<const char*>(bytes.data() + 4), 4);
+  const uint8_t* head8 = nullptr;
+  std::vector<uint8_t> scratch;
+  if (!block.ReadView(0, 8, &head8, &scratch)) {
+    return false;
+  }
+  absl::string_view tag(reinterpret_cast<const char*>(head8 + 4), 4);
   return tag == "ftyp" || tag == "moov" || tag == "mdat" || tag == "free" ||
          tag == "skip" || tag == "wide";
 }
 
-bool HasJxrsTail(const std::vector<uint8_t>& bytes) {
-  if (bytes.size() < kJxrsShortFooterSize) {
+bool HasJxrsTail(const RawMetadataBlock& block, uint32_t* out_footer_u32 = nullptr) {
+  const size_t total_size = block.Size();
+  if (total_size < kJxrsShortFooterSize) {
     return false;
   }
-  absl::string_view magic(
-      reinterpret_cast<const char*>(bytes.data() + bytes.size() - 8), 4);
-  return magic == "jxrs";
+  const uint8_t* tail8 = nullptr;
+  std::vector<uint8_t> scratch;
+  if (!block.ReadView(total_size - 8, 8, &tail8, &scratch)) {
+    return false;
+  }
+  absl::string_view magic(reinterpret_cast<const char*>(tail8), 4);
+  if (magic != "jxrs") {
+    return false;
+  }
+  if (out_footer_u32) {
+    *out_footer_u32 = ReadLe32(tail8 + 4);
+  }
+  return true;
 }
 
 bool ExtractMaxJxrsEntryOffset(absl::string_view json_array,
@@ -167,8 +183,11 @@ bool ParseOplusBlock(const RawMetadataBlock& block,
   out_meta->set_primary_image_timestamp_us(-1);
 
   if (block.type == "XMP" && block.format_identifier == "standard.xmp") {
-    absl::string_view xml(reinterpret_cast<const char*>(block.bytes.data()),
-                          block.bytes.size());
+    if (block.Data() == nullptr || block.BufferedSize() == 0) {
+      return false;
+    }
+    absl::string_view xml(reinterpret_cast<const char*>(block.Data()),
+                          block.BufferedSize());
     if (!HasOplusXmpMarkers(xml)) {
       if (error_message) {
         *error_message = "XMP does not contain Oplus OpCamera metadata";
@@ -183,16 +202,16 @@ bool ParseOplusBlock(const RawMetadataBlock& block,
   }
 
   if (block.format_identifier == "container.trailer") {
-    if (HasJxrsTail(block.bytes)) {
-      if (!HasIsoBmffHeader(block.bytes)) {
+    const size_t total_size = block.Size();
+    uint32_t footer_u32 = 0;
+    if (HasJxrsTail(block, &footer_u32)) {
+      if (!HasIsoBmffHeader(block)) {
         if (error_message) {
           *error_message = "Oplus trailer with jxrs footer lacks MP4 header";
         }
         return false;
       }
       out_meta->set_has_jxrs_footer(true);
-      const uint32_t footer_u32 =
-          ReadLe32(block.bytes.data() + block.bytes.size() - 4);
       out_meta->set_jxrs_footer_version(footer_u32);
       if (out_meta->olive_photo_version() == 0 && footer_u32 > 0) {
         out_meta->set_olive_photo_version(
@@ -204,65 +223,79 @@ bool ParseOplusBlock(const RawMetadataBlock& block,
       // Case A: JSON directory preceding "jxrs" + u32LE(footer_len)
       // (OPPO Reno15 Pro Max / OnePlus 11 O Live Photo v2).
       // On real devices, footer_u32 is the length of "[...]\0jxrs<u32>"
-      // (so json_pos = block.bytes.size() - footer_u32); also support
-      // footer_u32 = strlen("[...]\0") (json_pos = size - 8 - footer_u32).
-      if (footer_u32 >= 2 &&
-          static_cast<size_t>(footer_u32) < block.bytes.size()) {
-        size_t json_pos = 0;
-        bool has_json_dir = false;
-        if (block.bytes[block.bytes.size() - footer_u32] == '[') {
-          json_pos = block.bytes.size() - footer_u32;
-          has_json_dir = true;
-        } else if (static_cast<size_t>(footer_u32) + kJxrsShortFooterSize <
-                       block.bytes.size() &&
-                   block.bytes[block.bytes.size() - kJxrsShortFooterSize -
-                               footer_u32] == '[') {
-          json_pos =
-              block.bytes.size() - kJxrsShortFooterSize - footer_u32;
-          has_json_dir = true;
-        }
-        if (has_json_dir) {
-          absl::string_view json_dir(
-              reinterpret_cast<const char*>(block.bytes.data() + json_pos),
-              block.bytes.size() - kJxrsShortFooterSize - json_pos);
-          size_t max_entry_offset = 0;
-          if (xmp_video_len > 0 && xmp_video_len <= json_pos) {
-            out_meta->set_video_offset(0);
-            out_meta->set_video_length(xmp_video_len);
-            return true;
+      // (so json_pos = total_size - footer_u32); also support
+      // footer_u32 = strlen("[...]\0") (json_pos = total_size - 8 - footer_u32).
+      if (footer_u32 >= 2 && footer_u32 <= 65536 &&
+          static_cast<size_t>(footer_u32) < total_size) {
+        const size_t min_cand =
+            (static_cast<size_t>(footer_u32) + kJxrsShortFooterSize < total_size)
+                ? (total_size - kJxrsShortFooterSize - footer_u32)
+                : (total_size - footer_u32);
+        const size_t tail_len = total_size - min_cand;
+        const uint8_t* tail_buf = nullptr;
+        std::vector<uint8_t> tail_scratch;
+        if (block.ReadView(min_cand, tail_len, &tail_buf, &tail_scratch)) {
+          size_t json_pos = 0;
+          bool has_json_dir = false;
+          const size_t cand1 = total_size - footer_u32;
+          if (tail_buf[cand1 - min_cand] == '[') {
+            json_pos = cand1;
+            has_json_dir = true;
+          } else if (static_cast<size_t>(footer_u32) + kJxrsShortFooterSize <
+                         total_size &&
+                     tail_buf[0] == '[') {
+            json_pos = min_cand;
+            has_json_dir = true;
           }
-          if (ExtractMaxJxrsEntryOffset(json_dir, &max_entry_offset) &&
-              max_entry_offset < json_pos) {
-            out_meta->set_video_offset(0);
-            out_meta->set_video_length(json_pos - max_entry_offset);
-            return true;
+          if (has_json_dir) {
+            absl::string_view json_dir(
+                reinterpret_cast<const char*>(tail_buf + (json_pos - min_cand)),
+                total_size - kJxrsShortFooterSize - json_pos);
+            size_t max_entry_offset = 0;
+            if (xmp_video_len > 0 && xmp_video_len <= json_pos) {
+              out_meta->set_video_offset(0);
+              out_meta->set_video_length(xmp_video_len);
+              return true;
+            }
+            if (ExtractMaxJxrsEntryOffset(json_dir, &max_entry_offset) &&
+                max_entry_offset < json_pos) {
+              out_meta->set_video_offset(0);
+              out_meta->set_video_length(json_pos - max_entry_offset);
+              return true;
+            }
           }
         }
       }
 
       // Case B: Explicit OpCamera:VideoLength in XMP.
       if (xmp_video_len > 0 &&
-          xmp_video_len <= block.bytes.size() - kJxrsShortFooterSize) {
+          xmp_video_len <= total_size - kJxrsShortFooterSize) {
         out_meta->set_video_offset(0);
         out_meta->set_video_length(xmp_video_len);
         return true;
       }
 
       // Case C: Fixed 68-byte jxrs checksum footer.
-      if (block.bytes.size() > kJxrsFooterSize) {
-        const char* hash_ptr = reinterpret_cast<const char*>(
-            block.bytes.data() + block.bytes.size() - kJxrsFooterSize);
-        size_t hash_len = 60;
-        while (hash_len > 0 &&
-               (hash_ptr[hash_len - 1] == '\0' || hash_ptr[hash_len - 1] == ' ')) {
-          --hash_len;
+      if (total_size > kJxrsFooterSize) {
+        const uint8_t* ftr_buf = nullptr;
+        std::vector<uint8_t> ftr_scratch;
+        if (block.ReadView(total_size - kJxrsFooterSize, kJxrsFooterSize,
+                           &ftr_buf, &ftr_scratch)) {
+          const char* hash_ptr = reinterpret_cast<const char*>(ftr_buf);
+          size_t hash_len = 60;
+          while (hash_len > 0 && (hash_ptr[hash_len - 1] == '\0' ||
+                                  hash_ptr[hash_len - 1] == ' ')) {
+            --hash_len;
+          }
+          out_meta->set_jxrs_checksum_hex(std::string(hash_ptr, hash_len));
+          out_meta->set_video_offset(0);
+          out_meta->set_video_length(total_size - kJxrsFooterSize);
+        } else {
+          return false;
         }
-        out_meta->set_jxrs_checksum_hex(std::string(hash_ptr, hash_len));
+      } else if (total_size > kJxrsShortFooterSize) {
         out_meta->set_video_offset(0);
-        out_meta->set_video_length(block.bytes.size() - kJxrsFooterSize);
-      } else if (block.bytes.size() > kJxrsShortFooterSize) {
-        out_meta->set_video_offset(0);
-        out_meta->set_video_length(block.bytes.size() - kJxrsShortFooterSize);
+        out_meta->set_video_length(total_size - kJxrsShortFooterSize);
       } else {
         if (error_message) {
           *error_message = "Oplus jxrs trailer has zero video bytes";
@@ -283,12 +316,15 @@ bool ParseOplusBlock(const RawMetadataBlock& block,
 
 bool OplusOliveProvider::Identify(const RawMetadataBlock& block) {
   if (block.type == "XMP" && block.format_identifier == "standard.xmp") {
-    absl::string_view xml(reinterpret_cast<const char*>(block.bytes.data()),
-                          block.bytes.size());
+    if (block.Data() == nullptr || block.BufferedSize() == 0) {
+      return false;
+    }
+    absl::string_view xml(reinterpret_cast<const char*>(block.Data()),
+                          block.BufferedSize());
     return HasOplusXmpMarkers(xml);
   }
   if (block.format_identifier == "container.trailer") {
-    return HasJxrsTail(block.bytes);
+    return HasJxrsTail(block);
   }
   return false;
 }

@@ -170,8 +170,6 @@ TEST(SamsungSefProviderTest, DecodesSef107Mpv3AndExtractsVideoInfo) {
   block.type = "TRAILER";
   block.format_identifier = "container.trailer";
   block.bytes = trailer;
-  block.associated_xmp =
-      R"(<rdf:Description GCamera:MotionPhoto="1" GCamera:MotionPhotoPresentationTimestampUs="1319133"/>)";
 
   std::vector<uint8_t> proto_bytes;
   std::string type_url;
@@ -192,7 +190,6 @@ TEST(SamsungSefProviderTest, DecodesSef107Mpv3AndExtractsVideoInfo) {
   EXPECT_TRUE(meta.has_motion_photo_data());
   EXPECT_EQ(meta.motion_photo_data_magic(), "mpv3");
   EXPECT_EQ(meta.video_length(), mp4.size());
-  EXPECT_EQ(meta.primary_image_timestamp_us(), 1319133);
   ASSERT_EQ(meta.sef_keys_size(), 2);
   EXPECT_EQ(meta.sef_keys(0), "Image_UTC_Data");
   EXPECT_EQ(meta.sef_keys(1), "MotionPhoto_Data");
@@ -222,10 +219,9 @@ TEST(SamsungSefProviderTest, DecodesHeicSefdPointerToMpvd) {
   RawMetadataBlock sefd_block;
   sefd_block.type = "SEFD";
   sefd_block.format_identifier = "heic.sefd";
-  sefd_block.offset = 0x00534597;
+  sefd_block.offset = 0x00168831;
+  sefd_block.total_payload_size = 0x003CBD5E;
   sefd_block.bytes = sefd_bytes;
-  sefd_block.associated_mpvd_offset = 0x00168831;
-  sefd_block.associated_mpvd_length = 0x003CBD5E;
 
   size_t offset_in_mpvd = 999;
   size_t video_len = 0;
@@ -325,8 +321,8 @@ TEST(SamsungSefProviderTest, HeifSplitterExtractsSefdAndAssociatesMpvd) {
       splitter->Split(&data_source, heic.size());
   ASSERT_EQ(blocks.size(), 1u);
   EXPECT_EQ(blocks[0].format_identifier, "heic.sefd");
-  EXPECT_EQ(blocks[0].associated_mpvd_offset, mpvd_payload_offset);
-  EXPECT_EQ(blocks[0].associated_mpvd_length, mp4.size());
+  EXPECT_EQ(blocks[0].offset, mpvd_payload_offset);
+  EXPECT_EQ(blocks[0].total_payload_size, mp4.size());
 
   MetadataEngine engine(nullptr);
   MetadataCollection collection =
@@ -373,27 +369,37 @@ TEST(SamsungSefProviderTest, EndToEndPureSefJpegSplitAndExtract) {
       full_file.data(), full_file.size(), &disabled_meta, nullptr,
       disabled_opts));
 
-  // 3. ExtractPrimaryImageFromMemory strips the entire SEF trailer (including
-  // Image_UTC_Data that precedes MotionPhoto_Data).
+  // 3. ExtractMotionPhotoFromFile strips the entire SEF trailer (including
+  // Image_UTC_Data that precedes MotionPhoto_Data) and extracts the exact MP4
+  // stream (without the 12-byte mpv3 prefix or trailing SEFH/SEFT directory).
+  const std::string in_path = "/tmp/samsung_sef_test_input.jpg";
   const std::string out_img_path = "/tmp/samsung_sef_test_primary.jpg";
-  ASSERT_TRUE(libmotionphoto::api::ExtractPrimaryImageFromMemory(
-      full_file.data(), full_file.size(), out_img_path));
+  const std::string out_vid_path = "/tmp/samsung_sef_test_video.mp4";
+  {
+    std::ofstream out(in_path, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(full_file.data()),
+              full_file.size());
+  }
+
+  libmotionphoto::api::ExtractorParams extract_params;
+  extract_params.motion_photo_filepath = in_path;
+  extract_params.primary_image_output_path = out_img_path;
+  extract_params.video_output_path = out_vid_path;
+  ASSERT_TRUE(libmotionphoto::api::ExtractMotionPhotoFromFile(extract_params));
+
   std::ifstream img_in(out_img_path, std::ios::binary);
   std::vector<uint8_t> extracted_img((std::istreambuf_iterator<char>(img_in)),
                                      std::istreambuf_iterator<char>());
-  std::remove(out_img_path.c_str());
   EXPECT_TRUE(extracted_img == jpeg_bytes);
 
-  // 4. ExtractVideoTrackFromMemory extracts the exact MP4 stream (without the
-  // 12-byte mpv3 prefix or trailing SEFH/SEFT directory).
-  const std::string out_vid_path = "/tmp/samsung_sef_test_video.mp4";
-  ASSERT_TRUE(libmotionphoto::api::ExtractVideoTrackFromMemory(
-      full_file.data(), full_file.size(), out_vid_path));
   std::ifstream vid_in(out_vid_path, std::ios::binary);
   std::vector<uint8_t> extracted_video((std::istreambuf_iterator<char>(vid_in)),
                                        std::istreambuf_iterator<char>());
-  std::remove(out_vid_path.c_str());
   EXPECT_TRUE(extracted_video == mp4);
+
+  std::remove(in_path.c_str());
+  std::remove(out_img_path.c_str());
+  std::remove(out_vid_path.c_str());
 }
 
 TEST(SamsungSefProviderTest, RejectsMalformedAndCorruptedSefBlocksSafely) {

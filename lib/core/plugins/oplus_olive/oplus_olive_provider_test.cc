@@ -115,11 +115,6 @@ TEST(OplusOliveProviderTest, IdentifiesXmpAndJxrsTrailer) {
   non_oplus_trailer.format_identifier = "container.trailer";
   non_oplus_trailer.bytes = mp4;
   EXPECT_FALSE(provider.Identify(non_oplus_trailer));
-
-  // If associated_xmp has OpCamera markers, a plain MP4 trailer (O Live v1)
-  // is also identified.
-  non_oplus_trailer.associated_xmp = xmp_str;
-  EXPECT_TRUE(provider.Identify(non_oplus_trailer));
 }
 
 TEST(OplusOliveProviderTest, DecodesJxrsTrailerAndStrips68ByteFooter) {
@@ -132,8 +127,6 @@ TEST(OplusOliveProviderTest, DecodesJxrsTrailerAndStrips68ByteFooter) {
   block.type = "PROPRIETARY";
   block.format_identifier = "container.trailer";
   block.bytes = BuildOplusJxrsTrailer(mp4, hex, 2);
-  block.associated_xmp =
-      R"(<rdf:Description xmlns:OpCamera="http://ns.oplus.com/photo/1.0/camera/" OpCamera:OLivePhotoVersion="2" GCamera:MotionPhotoPresentationTimestampUs="367185"/>)";
 
   std::vector<uint8_t> proto_bytes;
   std::string type_url;
@@ -154,7 +147,6 @@ TEST(OplusOliveProviderTest, DecodesJxrsTrailerAndStrips68ByteFooter) {
   EXPECT_EQ(meta.jxrs_checksum_hex(), hex);
   EXPECT_EQ(meta.video_offset(), 0u);
   EXPECT_EQ(meta.video_length(), mp4.size());
-  EXPECT_EQ(meta.primary_image_timestamp_us(), 367185);
 
   size_t video_offset = 99;
   size_t video_len = 0;

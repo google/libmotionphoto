@@ -23,6 +23,7 @@
 #include "plugins/honor_live_photo/honor_live_photo_provider.h"
 #include "plugins/legacy_micro_video/legacy_micro_video_provider.h"
 #include "plugins/oplus_olive/oplus_olive_provider.h"
+#include "plugins/samsung_sef/samsung_sef_provider.h"
 
 namespace libmotionphoto {
 namespace motion_photo {
@@ -48,6 +49,7 @@ std::vector<std::shared_ptr<IMetadataProvider>>&
 MetadataProviderRegistry::Registry() {
   static auto* registry =
       new std::vector<std::shared_ptr<IMetadataProvider>>{
+          std::make_shared<SamsungSefProvider>(),
           std::make_shared<OplusOliveProvider>(),
           std::make_shared<HonorLivePhotoProvider>(),
           std::make_shared<LegacyMicroVideoProvider>(),

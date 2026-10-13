@@ -81,6 +81,7 @@ protobuf_generate(
         plugins/honor_live_photo/honor_live_photo_metadata.proto
         plugins/legacy_micro_video/legacy_micro_video_metadata.proto
         plugins/oplus_olive/oplus_olive_metadata.proto
+        plugins/samsung_sef/samsung_sef_metadata.proto
         motion_photo/proto/metadata_collection.proto
         motion_photo/proto/motion_photo_metadata.proto
 )
@@ -208,6 +209,7 @@ if (NOT ANDROID)
     plugins/honor_live_photo/honor_live_photo_provider_test.cc
     plugins/legacy_micro_video/legacy_micro_video_provider_test.cc
     plugins/oplus_olive/oplus_olive_provider_test.cc
+    plugins/samsung_sef/samsung_sef_provider_test.cc
     motion_photo/tests/motion_photo_builder_test.cc
     motion_photo/tests/motion_photo_checker_test.cc
     motion_photo/tests/motion_photo_extractor_test.cc

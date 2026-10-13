@@ -592,13 +592,32 @@ class HeifContainerSplitter : public ContainerSplitter {
   std::vector<RawMetadataBlock> Split(image_io::DataSource* data_source,
                                       size_t file_size) override {
     std::vector<RawMetadataBlock> blocks;
-    if (data_source == nullptr || file_size == 0 || !HasMpvdBox(data_source)) {
+    if (data_source == nullptr || file_size == 0) {
+      return blocks;
+    }
+    std::optional<BoxLocation> mpvd =
+        FindTopLevelBox(data_source, file_size, "mpvd");
+    if (!mpvd.has_value()) {
       return blocks;
     }
     std::optional<RawMetadataBlock> xmp_block =
         ExtractPrimaryXmp(data_source, file_size);
     if (xmp_block.has_value()) {
       blocks.push_back(*std::move(xmp_block));
+    }
+    std::optional<BoxLocation> sefd =
+        FindTopLevelBox(data_source, file_size, "sefd");
+    if (sefd.has_value() && sefd->payload_size > 0 &&
+        sefd->payload_size <= kMaxMetaPayloadSize) {
+      RawMetadataBlock sefd_block;
+      sefd_block.type = "SEFD";
+      sefd_block.format_identifier = "heic.sefd";
+      sefd_block.offset = mpvd->payload_offset;
+      sefd_block.total_payload_size = mpvd->payload_size;
+      if (AppendFromDataSource(data_source, sefd->payload_offset,
+                               sefd->payload_size, &sefd_block.bytes)) {
+        blocks.push_back(std::move(sefd_block));
+      }
     }
     return blocks;
   }

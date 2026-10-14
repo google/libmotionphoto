@@ -234,8 +234,7 @@ bool ParseOplusBlock(const RawMetadataBlock& block,
               block.bytes.size() - kJxrsShortFooterSize - footer_u32;
           has_json_dir = true;
         }
-        if (has_json_dir &&
-            block.bytes.size() - kJxrsShortFooterSize >= json_pos) {
+        if (has_json_dir) {
           absl::string_view json_dir(
               reinterpret_cast<const char*>(block.bytes.data() + json_pos),
               block.bytes.size() - kJxrsShortFooterSize - json_pos);

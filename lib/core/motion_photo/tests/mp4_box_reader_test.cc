@@ -21,6 +21,7 @@
 #include "motion_photo/agtm.h"
 #include "motion_photo/metadata_engine.h"
 #include "motion_photo/tests/test_framework.h"
+#include "motion_photo/video_metadata.h"
 #include "motion_photo_mp4/motion_photo_mp4_file_reader.h"
 
 namespace libmotionphoto {
@@ -156,6 +157,149 @@ TEST(Mp4BoxReaderTest, ParseAgtmPayloadDirectBitstream) {
   // 3. Invalid payload (random garbage without T.35 header and invalid version)
   std::vector<uint8_t> invalid_bytes = {0xFF, 0xFF, 0x12, 0x34};
   EXPECT_FALSE(ParseAgtmPayload(invalid_bytes.data(), invalid_bytes.size(), &meta));
+}
+
+TEST(Mp4BoxReaderTest, ParseMp4WithMalformedTableEntryCountsDoesNotOom) {
+  auto make_box = [](const std::string& type,
+                     const std::vector<uint8_t>& payload) {
+    std::vector<uint8_t> box;
+    uint32_t size = static_cast<uint32_t>(8 + payload.size());
+    box.push_back((size >> 24) & 0xFF);
+    box.push_back((size >> 16) & 0xFF);
+    box.push_back((size >> 8) & 0xFF);
+    box.push_back(size & 0xFF);
+    box.insert(box.end(), type.begin(), type.end());
+    box.insert(box.end(), payload.begin(), payload.end());
+    return box;
+  };
+
+  auto make_trak = [&](uint32_t track_id,
+                       const std::vector<uint8_t>& stbl_children) {
+    auto stbl = make_box("stbl", stbl_children);
+    auto minf = make_box("minf", stbl);
+    auto mdia = make_box("mdia", minf);
+
+    std::vector<uint8_t> tkhd_payload(24, 0);
+    tkhd_payload[15] = static_cast<uint8_t>(track_id);
+    auto tkhd = make_box("tkhd", tkhd_payload);
+
+    std::vector<uint8_t> trak_payload = tkhd;
+    trak_payload.insert(trak_payload.end(), mdia.begin(), mdia.end());
+    return make_box("trak", trak_payload);
+  };
+
+  // Track 1: stsz (uniform_sample_size=0, sample_count=0x7fffffff, 0 entries),
+  //          stsc (count=0x7fffffff, 0 entries),
+  //          stco (count=0x7fffffff, 0 entries).
+  std::vector<uint8_t> stsz_empty_payload = {
+      0x00, 0x00, 0x00, 0x00,  // version + flags
+      0x00, 0x00, 0x00, 0x00,  // uniform_sample_size = 0
+      0x7F, 0xFF, 0xFF, 0xFF   // sample_count = 0x7fffffff
+  };
+  std::vector<uint8_t> count_max_payload = {
+      0x00, 0x00, 0x00, 0x00,  // version + flags
+      0x7F, 0xFF, 0xFF, 0xFF   // count = 0x7fffffff
+  };
+  auto stsz1 = make_box("stsz", stsz_empty_payload);
+  auto stsc1 = make_box("stsc", count_max_payload);
+  auto stco1 = make_box("stco", count_max_payload);
+  std::vector<uint8_t> stbl1_children;
+  stbl1_children.insert(stbl1_children.end(), stsz1.begin(), stsz1.end());
+  stbl1_children.insert(stbl1_children.end(), stsc1.begin(), stsc1.end());
+  stbl1_children.insert(stbl1_children.end(), stco1.begin(), stco1.end());
+  auto trak1 = make_trak(1, stbl1_children);
+
+  // Track 2: co64 (count=0x7fffffff, 0 entries).
+  auto co64_2 = make_box("co64", count_max_payload);
+  auto trak2 = make_trak(2, co64_2);
+
+  // Track 3: stsz with uniform_sample_size=0, sample_count=0x7fffffff, and
+  //          only 1 actual sample size entry (4 bytes), plus 1 valid stsc and
+  //          1 valid stco entry. Verifies sample_count is clamped to
+  //          sample_sizes.size() so ReadSample(3, 2, ...) does not read OOB.
+  std::vector<uint8_t> stsz_one_payload = {
+      0x00, 0x00, 0x00, 0x00,  // version + flags
+      0x00, 0x00, 0x00, 0x00,  // uniform_sample_size = 0
+      0x7F, 0xFF, 0xFF, 0xFF,  // sample_count = 0x7fffffff (spoofed)
+      0x00, 0x00, 0x00, 0x04   // 1 actual entry: sample_size = 4
+  };
+  std::vector<uint8_t> stsc_one_payload = {
+      0x00, 0x00, 0x00, 0x00,  // version + flags
+      0x00, 0x00, 0x00, 0x01,  // count = 1
+      0x00, 0x00, 0x00, 0x01,  // first_chunk = 1
+      0x00, 0x00, 0x00, 0x02,  // samples_per_chunk = 2
+      0x00, 0x00, 0x00, 0x01   // sample_description_index = 1
+  };
+  std::vector<uint8_t> stco_one_payload = {
+      0x00, 0x00, 0x00, 0x00,  // version + flags
+      0x00, 0x00, 0x00, 0x01,  // count = 1
+      0x00, 0x00, 0x00, 0x00   // chunk_offset = 0
+  };
+  auto stsz3 = make_box("stsz", stsz_one_payload);
+  auto stsc3 = make_box("stsc", stsc_one_payload);
+  auto stco3 = make_box("stco", stco_one_payload);
+  std::vector<uint8_t> stbl3_children;
+  stbl3_children.insert(stbl3_children.end(), stsz3.begin(), stsz3.end());
+  stbl3_children.insert(stbl3_children.end(), stsc3.begin(), stsc3.end());
+  stbl3_children.insert(stbl3_children.end(), stco3.begin(), stco3.end());
+  auto trak3 = make_trak(3, stbl3_children);
+
+  std::vector<uint8_t> moov_payload;
+  moov_payload.insert(moov_payload.end(), trak1.begin(), trak1.end());
+  moov_payload.insert(moov_payload.end(), trak2.begin(), trak2.end());
+  moov_payload.insert(moov_payload.end(), trak3.begin(), trak3.end());
+  auto moov = make_box("moov", moov_payload);
+
+  std::vector<uint8_t> ftyp_payload = {'i', 's', 'o', 'm', 0,   0,   2,   0,
+                                       'i', 's', 'o', 'm', 'm', 'p', '4', '1'};
+  auto ftyp = make_box("ftyp", ftyp_payload);
+
+  std::vector<uint8_t> mp4 = ftyp;
+  mp4.insert(mp4.end(), moov.begin(), moov.end());
+
+  Mp4BoxReader reader;
+  EXPECT_TRUE(reader.ParseFromMemory(mp4.data(), mp4.size(), 0));
+
+  const Mp4TrackInfo* track1 = reader.FindTrackById(1);
+  ASSERT_NE(track1, nullptr);
+  EXPECT_EQ(track1->sample_count, 0);
+  EXPECT_EQ(track1->sample_sizes.size(), 0);
+  EXPECT_EQ(track1->sample_sizes.capacity(), 0);
+  EXPECT_EQ(track1->stsc_entries.size(), 0);
+  EXPECT_EQ(track1->stsc_entries.capacity(), 0);
+  EXPECT_EQ(track1->chunk_offsets.size(), 0);
+  EXPECT_EQ(track1->chunk_offsets.capacity(), 0);
+
+  const Mp4TrackInfo* track2 = reader.FindTrackById(2);
+  ASSERT_NE(track2, nullptr);
+  EXPECT_EQ(track2->chunk_offsets.size(), 0);
+  EXPECT_EQ(track2->chunk_offsets.capacity(), 0);
+
+  const Mp4TrackInfo* track3 = reader.FindTrackById(3);
+  ASSERT_NE(track3, nullptr);
+  EXPECT_EQ(track3->sample_sizes.size(), 1);
+  EXPECT_EQ(track3->sample_sizes.capacity(), 1);
+  EXPECT_EQ(track3->sample_count, 1);
+  std::vector<uint8_t> sample;
+  EXPECT_TRUE(reader.ReadSample(3, 1, &sample));
+  EXPECT_FALSE(reader.ReadSample(3, 2, &sample));
+}
+
+TEST(Mp4BoxReaderTest, TrackScoreDescriptorWithMalformedFrameCountDoesNotOom) {
+  // TrackScoreDescriptor (tag = 0xC2, instance_size = 4) with
+  // frame_score_count = 0x7fffffff and 0 FrameScoreDescriptor bytes remaining.
+  std::vector<uint8_t> bytes = {
+      TrackScoreDescriptor::kTag,
+      0x04,                    // instance_size = 4 bytes
+      0x7F, 0xFF, 0xFF, 0xFF   // frame_score_count = 0x7fffffff
+  };
+  image_io::IsoDecoder decoder(bytes.data(), 0, bytes.size());
+  TrackScoreDescriptor descriptor;
+  descriptor.DecodeTagInstanceSizeAndDetails(&decoder);
+  EXPECT_TRUE(decoder.HasErrors());
+  EXPECT_EQ(descriptor.GetNumScoredFrames(), 0);
+  EXPECT_EQ(descriptor.GetFrameScoreDescriptors().size(), 0);
+  EXPECT_EQ(descriptor.GetFrameScoreDescriptors().capacity(), 0);
 }
 
 }  // namespace

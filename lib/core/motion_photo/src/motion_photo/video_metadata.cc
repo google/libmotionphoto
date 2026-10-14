@@ -75,7 +75,12 @@ void TrackScoreDescriptor::DecodeDetails(IsoDecoder* decoder) {
   const char* kFrameName = FrameScoreDescriptor::kName;
   uint32_t frame_score_count = decoder->DecodeUInt32Value();
   frame_score_descriptors_.clear();
-  frame_score_descriptors_.reserve(frame_score_count);
+  constexpr size_t kMinFrameScoreDescriptorSize =
+      1 + 1 + sizeof(float) + sizeof(int64_t);
+  size_t max_entries =
+      decoder->GetRemaining() / kMinFrameScoreDescriptorSize;
+  frame_score_descriptors_.reserve(
+      std::min<size_t>(frame_score_count, max_entries));
   for (uint32_t index = 0; index < frame_score_count && !decoder->HasErrors();
        ++index) {
     if (decoder->DecodeTagValue(kFrameTag, kFrameName)) {

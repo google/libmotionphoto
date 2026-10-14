@@ -76,10 +76,22 @@ bool ExtractXmpInt64(absl::string_view xml, absl::string_view prop_name,
         }
       } else if (after < xml.size() && xml[after] == '>') {
         ++after;
+        while (after < xml.size() &&
+               (xml[after] == ' ' || xml[after] == '\t' || xml[after] == '\r' ||
+                xml[after] == '\n')) {
+          ++after;
+        }
         size_t close_tag = xml.find('<', after);
-        if (close_tag != absl::string_view::npos &&
-            absl::SimpleAtoi(xml.substr(after, close_tag - after), out_val)) {
-          return true;
+        if (close_tag != absl::string_view::npos) {
+          absl::string_view inner = xml.substr(after, close_tag - after);
+          while (!inner.empty() &&
+                 (inner.back() == ' ' || inner.back() == '\t' ||
+                  inner.back() == '\r' || inner.back() == '\n')) {
+            inner.remove_suffix(1);
+          }
+          if (absl::SimpleAtoi(inner, out_val)) {
+            return true;
+          }
         }
       }
       pos = xml.find(needle, pos + 1);
@@ -238,7 +250,8 @@ bool ParseOplusBlock(const RawMetadataBlock& block,
           size_t json_pos = 0;
           bool has_json_dir = false;
           const size_t cand1 = total_size - footer_u32;
-          if (tail_buf[cand1 - min_cand] == '[') {
+          if (footer_u32 > kJxrsShortFooterSize &&
+              tail_buf[cand1 - min_cand] == '[') {
             json_pos = cand1;
             has_json_dir = true;
           } else if (static_cast<size_t>(footer_u32) + kJxrsShortFooterSize <
@@ -247,7 +260,8 @@ bool ParseOplusBlock(const RawMetadataBlock& block,
             json_pos = min_cand;
             has_json_dir = true;
           }
-          if (has_json_dir) {
+          if (has_json_dir &&
+              total_size - kJxrsShortFooterSize >= json_pos) {
             absl::string_view json_dir(
                 reinterpret_cast<const char*>(tail_buf + (json_pos - min_cand)),
                 total_size - kJxrsShortFooterSize - json_pos);

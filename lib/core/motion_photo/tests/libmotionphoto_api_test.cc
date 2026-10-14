@@ -461,6 +461,14 @@ TEST(LibMotionPhotoApiTest, LargeTrailerZeroCopyDetectionFromFdAndMemory) {
   MotionPhotoMetadata fd_meta;
   EXPECT_TRUE(ParseMotionPhotoFromFd(
       fd, 0, static_cast<int64_t>(file_bytes.size()), &fd_meta));
+  // Passing a length larger than the actual file size causes a short pread
+  // near the aligned tail window where total_bytes_read <= (begin - read_begin);
+  // FdDataSource must safely return nullptr (and ParseMotionPhotoFromFd returns
+  // false) without creating an out-of-range DataSegment or crashing.
+  MotionPhotoMetadata inflated_fd_meta;
+  EXPECT_FALSE(ParseMotionPhotoFromFd(
+      fd, 0, static_cast<int64_t>(file_bytes.size() + 2048),
+      &inflated_fd_meta));
   close(fd);
   std::remove(tmp_path.c_str());
   EXPECT_TRUE(fd_meta.is_motion_photo);

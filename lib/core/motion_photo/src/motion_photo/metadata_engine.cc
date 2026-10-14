@@ -20,6 +20,7 @@
 #include <fstream>
 #include <ios>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -69,15 +70,18 @@ bool RawMetadataBlock::ReadView(size_t rel_offset, size_t len,
     return false;
   }
   const size_t abs_offset = offset + rel_offset;
-  // Check already-pinned segments first to avoid redundant DataSource calls.
-  for (const auto& seg : pinned_segments) {
-    if (seg && seg->Contains(abs_offset) &&
-        seg->GetEnd() - abs_offset >= len) {
-      const uint8_t* ptr =
-          reinterpret_cast<const uint8_t*>(seg->GetBuffer(abs_offset));
-      if (ptr != nullptr) {
-        *out_ptr = ptr;
-        return true;
+  if (pinned_segments_mutex) {
+    std::lock_guard<std::mutex> lock(*pinned_segments_mutex);
+    // Check already-pinned segments first to avoid redundant DataSource calls.
+    for (const auto& seg : pinned_segments) {
+      if (seg && seg->Contains(abs_offset) &&
+          seg->GetEnd() - abs_offset >= len) {
+        const uint8_t* ptr =
+            reinterpret_cast<const uint8_t*>(seg->GetBuffer(abs_offset));
+        if (ptr != nullptr) {
+          *out_ptr = ptr;
+          return true;
+        }
       }
     }
   }
@@ -86,7 +90,12 @@ bool RawMetadataBlock::ReadView(size_t rel_offset, size_t len,
     const uint8_t* ptr =
         reinterpret_cast<const uint8_t*>(seg->GetBuffer(abs_offset));
     if (ptr != nullptr) {
-      pinned_segments.push_back(std::move(seg));
+      if (pinned_segments_mutex) {
+        std::lock_guard<std::mutex> lock(*pinned_segments_mutex);
+        pinned_segments.push_back(std::move(seg));
+      } else {
+        pinned_segments.push_back(std::move(seg));
+      }
       *out_ptr = ptr;
       return true;
     }

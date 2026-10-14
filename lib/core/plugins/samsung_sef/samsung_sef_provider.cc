@@ -178,21 +178,11 @@ bool ParseSefBlock(const RawMetadataBlock& block, SamsungSefMetadata* out_meta,
     }
 
     const uint32_t key_len = ReadLe32(rec_hdr + 4);
-    if (8 + static_cast<size_t>(key_len) > rec_length) {
+    if (key_len > 256 || 8 + static_cast<size_t>(key_len) > rec_length) {
       continue;
     }
 
-    const uint8_t* key_buf = rec_hdr;
-    std::vector<uint8_t> key_scratch;
-    const size_t needed_hdr =
-        std::min<size_t>(rec_length, 8 + static_cast<size_t>(key_len) + 12);
-    if (needed_hdr > probe_len) {
-      if (!block.ReadView(rec_pos, needed_hdr, &key_buf, &key_scratch)) {
-        continue;
-      }
-    }
-
-    std::string key(reinterpret_cast<const char*>(key_buf + 8), key_len);
+    std::string key(reinterpret_cast<const char*>(rec_hdr + 8), key_len);
     out_meta->add_sef_keys(key);
 
     if (entry_type == kSefTypeMotionPhotoData || key == "MotionPhoto_Data") {
@@ -201,7 +191,7 @@ bool ParseSefBlock(const RawMetadataBlock& block, SamsungSefMetadata* out_meta,
       const size_t payload_len = rec_length - 8 - key_len;
 
       if (payload_len >= 12) {
-        const uint8_t* payload_hdr = key_buf + 8 + key_len;
+        const uint8_t* payload_hdr = rec_hdr + 8 + key_len;
         absl::string_view magic(reinterpret_cast<const char*>(payload_hdr), 4);
         if (magic == "mpv2" || magic == "mpv3") {
           out_meta->set_motion_photo_data_magic(std::string(magic));

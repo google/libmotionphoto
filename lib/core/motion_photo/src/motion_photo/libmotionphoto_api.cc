@@ -217,7 +217,7 @@ class FdDataSource : public ::photos_editing_formats::image_io::DataSource {
       total_bytes_read += bytes;
     }
 
-    if (total_bytes_read == 0) {
+    if (total_bytes_read <= (begin - read_begin)) {
       return nullptr;
     }
 

@@ -174,7 +174,7 @@ class FdDataSource : public libmotionphoto::image_io::DataSource {
       total_bytes_read += static_cast<size_t>(bytes);
     }
 
-    if (total_bytes_read == 0) {
+    if (total_bytes_read <= (begin - read_begin)) {
       return nullptr;
     }
 

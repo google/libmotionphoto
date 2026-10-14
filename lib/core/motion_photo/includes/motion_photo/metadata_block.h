@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -26,6 +27,9 @@
 namespace libmotionphoto {
 namespace motion_photo {
 
+// Note: RawMetadataBlock is not thread-safe when backed by a lazy `data_source`
+// (since `image_io::DataSource` itself is not thread-safe), though access to
+// `pinned_segments` in `ReadView` is synchronized via `pinned_segments_mutex`.
 struct RawMetadataBlock {
   std::string type;  // "EXIF", "XMP", "ICC", "PROPRIETARY", etc.
   std::string format_identifier;
@@ -43,6 +47,8 @@ struct RawMetadataBlock {
   // without copying the entire payload into `bytes`.
   image_io::DataSource* data_source = nullptr;
   mutable std::vector<std::shared_ptr<image_io::DataSegment>> pinned_segments;
+  mutable std::shared_ptr<std::mutex> pinned_segments_mutex =
+      std::make_shared<std::mutex>();
 
   // Returns a pointer to the buffered bytes (from `bytes` if non-empty, or
   // `data_view` if set).

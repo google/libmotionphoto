@@ -76,10 +76,22 @@ bool ExtractXmpInt64(absl::string_view xml, absl::string_view prop_name,
         }
       } else if (after < xml.size() && xml[after] == '>') {
         ++after;
+        while (after < xml.size() &&
+               (xml[after] == ' ' || xml[after] == '\t' || xml[after] == '\r' ||
+                xml[after] == '\n')) {
+          ++after;
+        }
         size_t close_tag = xml.find('<', after);
-        if (close_tag != absl::string_view::npos &&
-            absl::SimpleAtoi(xml.substr(after, close_tag - after), out_val)) {
-          return true;
+        if (close_tag != absl::string_view::npos) {
+          absl::string_view inner = xml.substr(after, close_tag - after);
+          while (!inner.empty() &&
+                 (inner.back() == ' ' || inner.back() == '\t' ||
+                  inner.back() == '\r' || inner.back() == '\n')) {
+            inner.remove_suffix(1);
+          }
+          if (absl::SimpleAtoi(inner, out_val)) {
+            return true;
+          }
         }
       }
       pos = xml.find(needle, pos + 1);
@@ -210,7 +222,8 @@ bool ParseOplusBlock(const RawMetadataBlock& block,
           static_cast<size_t>(footer_u32) < block.bytes.size()) {
         size_t json_pos = 0;
         bool has_json_dir = false;
-        if (block.bytes[block.bytes.size() - footer_u32] == '[') {
+        if (footer_u32 > kJxrsShortFooterSize &&
+            block.bytes[block.bytes.size() - footer_u32] == '[') {
           json_pos = block.bytes.size() - footer_u32;
           has_json_dir = true;
         } else if (static_cast<size_t>(footer_u32) + kJxrsShortFooterSize <
@@ -221,7 +234,8 @@ bool ParseOplusBlock(const RawMetadataBlock& block,
               block.bytes.size() - kJxrsShortFooterSize - footer_u32;
           has_json_dir = true;
         }
-        if (has_json_dir) {
+        if (has_json_dir &&
+            block.bytes.size() - kJxrsShortFooterSize >= json_pos) {
           absl::string_view json_dir(
               reinterpret_cast<const char*>(block.bytes.data() + json_pos),
               block.bytes.size() - kJxrsShortFooterSize - json_pos);

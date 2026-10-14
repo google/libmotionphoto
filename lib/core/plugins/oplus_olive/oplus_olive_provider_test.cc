@@ -206,6 +206,58 @@ TEST(OplusOliveProviderTest, DecodesPureOpCameraXmp) {
   EXPECT_EQ(meta.primary_image_timestamp_us(), 250000);
 }
 
+TEST(OplusOliveProviderTest, DecodesPrettyPrintedElementXmpWithWhitespace) {
+  OplusOliveProvider provider;
+  RawMetadataBlock xmp_block;
+  xmp_block.type = "XMP";
+  xmp_block.format_identifier = "standard.xmp";
+  std::string xmp_str = R"(
+    <rdf:Description xmlns:OpCamera="http://ns.oplus.com/photo/1.0/camera/">
+      <OpCamera:OLivePhotoVersion>
+        2
+      </OpCamera:OLivePhotoVersion>
+      <OpCamera:VideoLength>  8192 	
+</OpCamera:VideoLength>
+      <OpCamera:PrimaryPresentationTimestampUs>
+        500000
+      </OpCamera:PrimaryPresentationTimestampUs>
+    </rdf:Description>
+  )";
+  xmp_block.bytes.assign(xmp_str.begin(), xmp_str.end());
+
+  std::vector<uint8_t> proto_bytes;
+  std::string type_url;
+  ASSERT_TRUE(
+      provider.DecodeToSemantic(xmp_block, &proto_bytes, &type_url, nullptr));
+  OplusOliveMetadata meta;
+  ASSERT_TRUE(meta.ParseFromArray(proto_bytes.data(), proto_bytes.size()));
+  EXPECT_EQ(meta.olive_photo_version(), 2);
+  EXPECT_EQ(meta.video_length(), 8192u);
+  EXPECT_EQ(meta.primary_image_timestamp_us(), 500000);
+}
+
+TEST(OplusOliveProviderTest, SmallFooterU32DoesNotUnderflowJsonDirSize) {
+  OplusOliveProvider provider;
+  std::vector<uint8_t> primary_mp4 = BuildFakeMp4Payload();
+
+  // Construct a trailer ending with "jxrs" and a small footer_u32 (< 8)
+  // preceded by '[' to ensure no unsigned underflow occurs when checking
+  // for a JSON directory.
+  RawMetadataBlock block;
+  block.type = "PROPRIETARY";
+  block.format_identifier = "container.trailer";
+  block.bytes = primary_mp4;
+  block.bytes.resize(primary_mp4.size() + 60, '[');
+  AppendStr(&block.bytes, "jxrs");
+  AppendLe32(&block.bytes, 4);
+
+  size_t video_offset = 0;
+  size_t video_len = 0;
+  ASSERT_TRUE(provider.GetVideoInfo(block, &video_offset, &video_len));
+  EXPECT_EQ(video_offset, 0u);
+  EXPECT_EQ(video_len, primary_mp4.size());
+}
+
 TEST(OplusOliveProviderTest, EndToEndOplusJpegExtractsCleanMp4WithoutJxrsTail) {
   std::string xmp =
       R"(<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description xmlns:OpCamera="http://ns.oplus.com/photo/1.0/camera/" OpCamera:OLivePhotoVersion="2"/></rdf:RDF></x:xmpmeta>)";

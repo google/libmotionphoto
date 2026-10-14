@@ -32,28 +32,34 @@ namespace libmotionphoto {
 namespace motion_photo {
 
 bool GoogleMotionPhotoProvider::Identify(const RawMetadataBlock& block) {
+  const uint8_t* data = block.Data();
+  const size_t size = block.BufferedSize();
   if (block.type == "EXIF" && block.format_identifier == "standard.exif") {
-    if (block.bytes.size() < 4) {
+    if (data == nullptr || size < 4) {
       return false;
     }
-    bool is_little_endian = (block.bytes[0] == 0x49 && block.bytes[1] == 0x49 &&
-                             block.bytes[2] == 0x2A && block.bytes[3] == 0x00);
-    bool is_big_endian = (block.bytes[0] == 0x4D && block.bytes[1] == 0x4D &&
-                           block.bytes[2] == 0x00 && block.bytes[3] == 0x2A);
+    bool is_little_endian =
+        (data[0] == 0x49 && data[1] == 0x49 && data[2] == 0x2A &&
+         data[3] == 0x00);
+    bool is_big_endian =
+        (data[0] == 0x4D && data[1] == 0x4D && data[2] == 0x00 &&
+         data[3] == 0x2A);
     return is_little_endian || is_big_endian;
   }
 
   if (block.type == "ICC" && block.format_identifier == "standard.icc") {
-    if (block.bytes.size() < 40) {
+    if (data == nullptr || size < 40) {
       return false;
     }
-    return (block.bytes[36] == 0x61 && block.bytes[37] == 0x63 &&
-            block.bytes[38] == 0x73 && block.bytes[39] == 0x70);
+    return (data[36] == 0x61 && data[37] == 0x63 && data[38] == 0x73 &&
+            data[39] == 0x70);
   }
 
   if (block.type == "XMP" && block.format_identifier == "standard.xmp") {
-    absl::string_view xml(reinterpret_cast<const char*>(block.bytes.data()),
-                          block.bytes.size());
+    if (data == nullptr || size == 0) {
+      return false;
+    }
+    absl::string_view xml(reinterpret_cast<const char*>(data), size);
     return (absl::StrContains(xml, "http://ns.google.com/photos/1.0/camera/") ||
             absl::StrContains(xml,
                               "http://ns.google.com/photos/1.0/container/")) &&
@@ -62,10 +68,10 @@ bool GoogleMotionPhotoProvider::Identify(const RawMetadataBlock& block) {
   }
 
   if (block.type == "JFIF" && block.format_identifier == "standard.jfif") {
-    if (block.bytes.size() < 9) {
+    if (data == nullptr || size < 9) {
       return false;
     }
-    return block.bytes[0] == 1;
+    return data[0] == 1;
   }
 
   return false;
@@ -75,11 +81,12 @@ bool GoogleMotionPhotoProvider::DecodeToSemantic(
     const RawMetadataBlock& block,
     std::vector<uint8_t>* out_proto_bytes, std::string* out_type_url,
     std::string* error_message) {
-  if (block.type != "XMP") {
+  if (block.type != "XMP" || block.Data() == nullptr ||
+      block.BufferedSize() == 0) {
     return false;
   }
-  std::string_view xml(reinterpret_cast<const char*>(block.bytes.data()),
-                       block.bytes.size());
+  std::string_view xml(reinterpret_cast<const char*>(block.Data()),
+                       block.BufferedSize());
 
   MotionPhoto motion_photo;
   image_io::MessageHandler message_handler;

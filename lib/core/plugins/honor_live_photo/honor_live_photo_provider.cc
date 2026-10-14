@@ -53,13 +53,18 @@ absl::string_view TrimPadding(absl::string_view sv) {
   return sv;
 }
 
-bool HasIsoBmffAt(const std::vector<uint8_t>& bytes, size_t offset,
+bool HasIsoBmffAt(const RawMetadataBlock& block, size_t offset,
                   size_t length) {
-  if (length < 8 || offset + length > bytes.size()) {
+  const size_t total_size = block.Size();
+  if (length < 8 || offset > total_size || length > total_size - offset) {
     return false;
   }
-  absl::string_view tag(reinterpret_cast<const char*>(bytes.data() + offset + 4),
-                        4);
+  const uint8_t* hdr = nullptr;
+  std::vector<uint8_t> scratch;
+  if (!block.ReadView(offset, 8, &hdr, &scratch)) {
+    return false;
+  }
+  absl::string_view tag(reinterpret_cast<const char*>(hdr + 4), 4);
   return tag == "ftyp" || tag == "moov" || tag == "mdat" || tag == "free" ||
          tag == "skip" || tag == "wide";
 }
@@ -97,8 +102,8 @@ bool ExtractJsonInt32(absl::string_view json, absl::string_view key,
 bool ParseHonorTrailer(const RawMetadataBlock& block,
                        HonorLivePhotoMetadata* out_meta,
                        std::string* error_message) {
-  const auto& bytes = block.bytes;
-  if (bytes.size() < kTagWidth) {
+  const size_t total_size = block.Size();
+  if (total_size < kTagWidth) {
     if (error_message) {
       *error_message = "Honor/Huawei trailer is shorter than 20 bytes";
     }
@@ -107,9 +112,17 @@ bool ParseHonorTrailer(const RawMetadataBlock& block,
 
   out_meta->set_primary_image_timestamp_us(-1);
 
-  absl::string_view tail_20 = TrimPadding(absl::string_view(
-      reinterpret_cast<const char*>(bytes.data() + bytes.size() - kTagWidth),
-      kTagWidth));
+  const uint8_t* tail_ptr = nullptr;
+  std::vector<uint8_t> tail_scratch;
+  if (!block.ReadView(total_size - kTagWidth, kTagWidth, &tail_ptr,
+                      &tail_scratch)) {
+    if (error_message) {
+      *error_message = "Failed to read Honor/Huawei trailer footer";
+    }
+    return false;
+  }
+  absl::string_view tail_20 = TrimPadding(
+      absl::string_view(reinterpret_cast<const char*>(tail_ptr), kTagWidth));
 
   // Case 1: Classic Huawei/Honor "LIVE_<size>" 20-byte / 40-byte ASCII footer.
   if (absl::StartsWith(tail_20, "LIVE_")) {
@@ -117,7 +130,7 @@ bool ParseHonorTrailer(const RawMetadataBlock& block,
     absl::string_view size_str = tail_20.substr(5);
     uint64_t mp4_size = 0;
     if (!absl::SimpleAtoi(size_str, &mp4_size) || mp4_size == 0 ||
-        mp4_size + kTagWidth > bytes.size()) {
+        mp4_size + kTagWidth > total_size) {
       if (error_message) {
         *error_message = "Invalid MP4 size in LIVE_ footer";
       }
@@ -125,23 +138,26 @@ bool ParseHonorTrailer(const RawMetadataBlock& block,
     }
 
     // Check if there is a 20-byte cover offset immediately before "LIVE_<size>"
-    size_t candidate_offset = bytes.size() - kTagWidth - mp4_size;
-    if (bytes.size() >= 2 * kTagWidth + mp4_size) {
-      size_t alt_offset = bytes.size() - 2 * kTagWidth - mp4_size;
-      if (HasIsoBmffAt(bytes, alt_offset, mp4_size)) {
+    size_t candidate_offset = total_size - kTagWidth - mp4_size;
+    if (total_size >= 2 * kTagWidth + mp4_size) {
+      size_t alt_offset = total_size - 2 * kTagWidth - mp4_size;
+      if (HasIsoBmffAt(block, alt_offset, mp4_size)) {
         candidate_offset = alt_offset;
-        absl::string_view cover_str = TrimPadding(absl::string_view(
-            reinterpret_cast<const char*>(bytes.data() + bytes.size() -
-                                          2 * kTagWidth),
-            kTagWidth));
-        int64_t cover_ms = -1;
-        if (absl::SimpleAtoi(cover_str, &cover_ms) && cover_ms >= 0) {
-          out_meta->set_primary_image_timestamp_us(cover_ms * 1000);
+        const uint8_t* cover_ptr = nullptr;
+        std::vector<uint8_t> cover_scratch;
+        if (block.ReadView(total_size - 2 * kTagWidth, kTagWidth, &cover_ptr,
+                           &cover_scratch)) {
+          absl::string_view cover_str = TrimPadding(absl::string_view(
+              reinterpret_cast<const char*>(cover_ptr), kTagWidth));
+          int64_t cover_ms = -1;
+          if (absl::SimpleAtoi(cover_str, &cover_ms) && cover_ms >= 0) {
+            out_meta->set_primary_image_timestamp_us(cover_ms * 1000);
+          }
         }
       }
     }
 
-    if (!HasIsoBmffAt(bytes, candidate_offset, mp4_size)) {
+    if (!HasIsoBmffAt(block, candidate_offset, mp4_size)) {
       if (error_message) {
         *error_message = "LIVE_ footer does not point to a valid MP4 stream";
       }
@@ -157,7 +173,7 @@ bool ParseHonorTrailer(const RawMetadataBlock& block,
   // Case 2: Backward-linked 20-byte TLV chain ("HiHonor_*" or "LivePhoto_*").
   if (absl::StartsWith(tail_20, "HiHonor_") ||
       absl::StartsWith(tail_20, "LivePhoto_")) {
-    if (bytes.size() < kTlvFooterSize) {
+    if (total_size < kTlvFooterSize) {
       if (error_message) {
         *error_message = "TLV trailer is shorter than 24 bytes";
       }
@@ -168,18 +184,23 @@ bool ParseHonorTrailer(const RawMetadataBlock& block,
                                      ? "hihonor_tlv"
                                      : "livephoto_tlv");
 
-    size_t pos = bytes.size();
+    size_t pos = total_size;
     size_t record_count = 0;
     while (pos >= kTlvFooterSize && record_count < kMaxTlvRecords) {
+      const uint8_t* ftr_ptr = nullptr;
+      std::vector<uint8_t> ftr_scratch;
+      if (!block.ReadView(pos - kTlvFooterSize, kTlvFooterSize, &ftr_ptr,
+                          &ftr_scratch)) {
+        break;
+      }
       absl::string_view tag = TrimPadding(absl::string_view(
-          reinterpret_cast<const char*>(bytes.data() + pos - kTagWidth),
-          kTagWidth));
+          reinterpret_cast<const char*>(ftr_ptr + 4), kTagWidth));
       if (!absl::StartsWith(tag, "HiHonor_") &&
           !absl::StartsWith(tag, "LivePhoto_")) {
         break;
       }
 
-      const uint32_t payload_len = ReadLe32(bytes.data() + pos - kTlvFooterSize);
+      const uint32_t payload_len = ReadLe32(ftr_ptr);
       if (kTlvFooterSize + static_cast<size_t>(payload_len) > pos) {
         if (record_count == 0) {
           if (error_message) {
@@ -194,18 +215,23 @@ bool ParseHonorTrailer(const RawMetadataBlock& block,
       out_meta->add_tlv_tags(std::string(tag));
       ++record_count;
 
-      if (tag == "HiHonor_OfflineData" && payload_len > 4) {
-        absl::string_view json(
-            reinterpret_cast<const char*>(bytes.data() + payload_pos + 4),
-            payload_len - 4);
-        int32_t scene_mode = 0;
-        if (ExtractJsonInt32(json, "sceneMode", &scene_mode)) {
-          out_meta->set_scene_mode(scene_mode);
+      if (tag == "HiHonor_OfflineData" && payload_len > 4 &&
+          payload_len <= 65536) {
+        const uint8_t* json_ptr = nullptr;
+        std::vector<uint8_t> json_scratch;
+        if (block.ReadView(payload_pos + 4, payload_len - 4, &json_ptr,
+                           &json_scratch)) {
+          absl::string_view json(reinterpret_cast<const char*>(json_ptr),
+                                 payload_len - 4);
+          int32_t scene_mode = 0;
+          if (ExtractJsonInt32(json, "sceneMode", &scene_mode)) {
+            out_meta->set_scene_mode(scene_mode);
+          }
         }
       }
 
       if (!out_meta->has_embedded_video() &&
-          HasIsoBmffAt(bytes, payload_pos, payload_len)) {
+          HasIsoBmffAt(block, payload_pos, payload_len)) {
         out_meta->set_has_embedded_video(true);
         out_meta->set_video_offset(payload_pos);
         out_meta->set_video_length(payload_len);
@@ -217,7 +243,7 @@ bool ParseHonorTrailer(const RawMetadataBlock& block,
     // If an MP4 precedes the TLV chain directly after EOI ([0 .. pos)), detect
     // it as well.
     if (!out_meta->has_embedded_video() && pos >= 16 &&
-        HasIsoBmffAt(bytes, 0, pos)) {
+        HasIsoBmffAt(block, 0, pos)) {
       out_meta->set_has_embedded_video(true);
       out_meta->set_video_offset(0);
       out_meta->set_video_length(pos);
@@ -235,14 +261,18 @@ bool ParseHonorTrailer(const RawMetadataBlock& block,
 }  // namespace
 
 bool HonorLivePhotoProvider::Identify(const RawMetadataBlock& block) {
+  const size_t total_size = block.Size();
   if (block.format_identifier != "container.trailer" ||
-      block.bytes.size() < kTagWidth) {
+      total_size < kTagWidth) {
     return false;
   }
-  absl::string_view tail_20 = TrimPadding(absl::string_view(
-      reinterpret_cast<const char*>(block.bytes.data() + block.bytes.size() -
-                                    kTagWidth),
-      kTagWidth));
+  const uint8_t* tail_ptr = nullptr;
+  std::vector<uint8_t> scratch;
+  if (!block.ReadView(total_size - kTagWidth, kTagWidth, &tail_ptr, &scratch)) {
+    return false;
+  }
+  absl::string_view tail_20 = TrimPadding(
+      absl::string_view(reinterpret_cast<const char*>(tail_ptr), kTagWidth));
   return absl::StartsWith(tail_20, "HiHonor_") ||
          absl::StartsWith(tail_20, "LivePhoto_") ||
          absl::StartsWith(tail_20, "LIVE_");

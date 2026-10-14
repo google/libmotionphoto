@@ -100,11 +100,17 @@ int64_t ExtractInt64Attr(absl::string_view xml, absl::string_view attr_name) {
 // bytes before the ISO BMFF `ftyp` box.
 bool FindMp4StartInTrailer(const RawMetadataBlock& block,
                            size_t* out_mp4_offset) {
-  const auto& bytes = block.bytes;
-  if (bytes.size() < 8) {
+  const size_t total_size = block.Size();
+  if (total_size < 8) {
     return false;
   }
-  absl::string_view tag0(reinterpret_cast<const char*>(bytes.data() + 4), 4);
+  const size_t scan_limit = std::min(total_size, kMaxXiaomiFtypScanBytes);
+  const uint8_t* head_ptr = nullptr;
+  std::vector<uint8_t> scratch;
+  if (!block.ReadView(0, scan_limit, &head_ptr, &scratch)) {
+    return false;
+  }
+  absl::string_view tag0(reinterpret_cast<const char*>(head_ptr + 4), 4);
   if (tag0 == "ftyp" || tag0 == "moov" || tag0 == "mdat" || tag0 == "free" ||
       tag0 == "skip" || tag0 == "wide") {
     if (out_mp4_offset) {
@@ -114,15 +120,14 @@ bool FindMp4StartInTrailer(const RawMetadataBlock& block,
   }
 
   // Forward scan for `[u32be box_size]["ftyp"]` (Xiaomi MVIMG offset drift).
-  const size_t scan_limit = std::min(bytes.size(), kMaxXiaomiFtypScanBytes);
   if (scan_limit >= 8) {
-    absl::string_view window(reinterpret_cast<const char*>(bytes.data()),
+    absl::string_view window(reinterpret_cast<const char*>(head_ptr),
                              scan_limit);
     size_t pos = window.find("ftyp", 4);
     while (pos != absl::string_view::npos) {
       if (pos >= 4) {
         size_t box_start = pos - 4;
-        uint32_t box_size = ReadBe32(bytes.data() + box_start);
+        uint32_t box_size = ReadBe32(head_ptr + box_start);
         if (box_size >= 8 && box_size <= 128) {
           if (out_mp4_offset) {
             *out_mp4_offset = box_start;
@@ -140,8 +145,11 @@ bool FindMp4StartInTrailer(const RawMetadataBlock& block,
 
 bool LegacyMicroVideoProvider::Identify(const RawMetadataBlock& block) {
   if (block.type == "XMP" && block.format_identifier == "standard.xmp") {
-    absl::string_view xml(reinterpret_cast<const char*>(block.bytes.data()),
-                          block.bytes.size());
+    if (block.Data() == nullptr || block.BufferedSize() == 0) {
+      return false;
+    }
+    absl::string_view xml(reinterpret_cast<const char*>(block.Data()),
+                          block.BufferedSize());
     return absl::StrContains(xml, "MicroVideo");
   }
   if (block.format_identifier == "container.trailer") {
@@ -153,11 +161,12 @@ bool LegacyMicroVideoProvider::Identify(const RawMetadataBlock& block) {
 bool LegacyMicroVideoProvider::DecodeToSemantic(
     const RawMetadataBlock& block, std::vector<uint8_t>* out_proto_bytes,
     std::string* out_type_url, std::string* error_message) {
-  if (block.type != "XMP") {
+  if (block.type != "XMP" || block.Data() == nullptr ||
+      block.BufferedSize() == 0) {
     return false;
   }
-  absl::string_view xml(reinterpret_cast<const char*>(block.bytes.data()),
-                        block.bytes.size());
+  absl::string_view xml(reinterpret_cast<const char*>(block.Data()),
+                        block.BufferedSize());
 
   LegacyMicroVideoMetadata metadata;
   int64_t micro_video = ExtractInt64Attr(xml, "MicroVideo");
@@ -215,8 +224,11 @@ bool LegacyMicroVideoProvider::GetVideoInfo(const RawMetadataBlock& block,
                                             size_t* out_offset_in_block,
                                             size_t* out_length) const {
   if (block.type == "XMP" && block.format_identifier == "standard.xmp") {
-    absl::string_view xml(reinterpret_cast<const char*>(block.bytes.data()),
-                          block.bytes.size());
+    if (block.Data() == nullptr || block.BufferedSize() == 0) {
+      return false;
+    }
+    absl::string_view xml(reinterpret_cast<const char*>(block.Data()),
+                          block.BufferedSize());
     int64_t offset = ExtractInt64Attr(xml, "MicroVideoOffset");
     if (offset > 0) {
       if (out_offset_in_block) {
@@ -234,8 +246,7 @@ bool LegacyMicroVideoProvider::GetVideoInfo(const RawMetadataBlock& block,
     if (!FindMp4StartInTrailer(block, &mp4_start)) {
       mp4_start = 0;
     }
-    size_t total_len = (block.total_payload_size > 0) ? block.total_payload_size
-                                                      : block.bytes.size();
+    size_t total_len = block.Size();
     if (mp4_start >= total_len) {
       return false;
     }

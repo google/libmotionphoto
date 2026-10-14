@@ -260,8 +260,7 @@ bool ParseOplusBlock(const RawMetadataBlock& block,
             json_pos = min_cand;
             has_json_dir = true;
           }
-          if (has_json_dir &&
-              total_size - kJxrsShortFooterSize >= json_pos) {
+          if (has_json_dir) {
             absl::string_view json_dir(
                 reinterpret_cast<const char*>(tail_buf + (json_pos - min_cand)),
                 total_size - kJxrsShortFooterSize - json_pos);

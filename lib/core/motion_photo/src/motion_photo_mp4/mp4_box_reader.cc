@@ -50,7 +50,9 @@ bool Mp4BoxReader::ParseFromMemory(const uint8_t* data, size_t size,
   if (data == nullptr || size == 0) {
     return false;
   }
-  owned_buffer_.clear();
+  if (data != owned_buffer_.data()) {
+    owned_buffer_.clear();
+  }
   data_ = data;
   data_size_ = size;
   mp4_offset_ = offset;
@@ -148,6 +150,10 @@ bool Mp4BoxReader::ReadSample(uint32_t track_id, uint32_t sample_id,
 
   const Mp4TrackInfo* track = FindTrackById(track_id);
   if (track == nullptr || sample_id < 1 || sample_id > track->sample_count) {
+    return false;
+  }
+  if (track->uniform_sample_size == 0 &&
+      sample_id > track->sample_sizes.size()) {
     return false;
   }
 
@@ -434,10 +440,19 @@ bool Mp4BoxReader::ParseStbl(size_t start, size_t end, Mp4TrackInfo* track) {
         track->sample_entries.push_back(std::move(entry));
         spos += esz;
       }
-    } else if (std::memcmp(data_ + pos + 4, "stts", 4) == 0 && payload_end >= payload_start + 8) {
+    } else if (std::memcmp(data_ + pos + 4, "stts", 4) == 0 &&
+               (payload_start <= payload_end &&
+                8 <= payload_end - payload_start)) {
       uint32_t count = ReadBigEndianUInt32(data_ + payload_start + 4);
+      size_t max_entries = (payload_end - payload_start - 8) / 8;
+      count = static_cast<uint32_t>(std::min<size_t>(count, max_entries));
+      track->stts_entries.reserve(count);
       for (uint32_t i = 0; i < count; ++i) {
-        size_t epos = payload_start + 8 + i * 8;
+        size_t offset_in_table = static_cast<size_t>(i) * 8;
+        if (offset_in_table > SIZE_MAX - 8 - payload_start) {
+          break;
+        }
+        size_t epos = payload_start + 8 + offset_in_table;
         if (epos > payload_end || 8 > payload_end - epos) break;
         uint32_t sc = ReadBigEndianUInt32(data_ + epos);
         uint32_t sd = ReadBigEndianUInt32(data_ + epos + 4);
@@ -449,9 +464,14 @@ bool Mp4BoxReader::ParseStbl(size_t start, size_t end, Mp4TrackInfo* track) {
       track->uniform_sample_size =
           ReadBigEndianUInt32(data_ + payload_start + 4);
       track->sample_count = ReadBigEndianUInt32(data_ + payload_start + 8);
+      track->sample_sizes.clear();
       if (track->uniform_sample_size == 0) {
-        track->sample_sizes.reserve(track->sample_count);
-        for (uint32_t i = 0; i < track->sample_count; ++i) {
+        size_t max_entries =
+            (payload_end - payload_start - 12) / sizeof(uint32_t);
+        uint32_t count = static_cast<uint32_t>(
+            std::min<size_t>(track->sample_count, max_entries));
+        track->sample_sizes.reserve(count);
+        for (uint32_t i = 0; i < count; ++i) {
           size_t offset_in_table = static_cast<size_t>(i) * 4;
           if (offset_in_table >
               SIZE_MAX - 12 - payload_start) {
@@ -461,11 +481,15 @@ bool Mp4BoxReader::ParseStbl(size_t start, size_t end, Mp4TrackInfo* track) {
           if (epos > payload_end || 4 > payload_end - epos) break;
           track->sample_sizes.push_back(ReadBigEndianUInt32(data_ + epos));
         }
+        track->sample_count =
+            static_cast<uint32_t>(track->sample_sizes.size());
       }
     } else if (std::memcmp(data_ + pos + 4, "stsc", 4) == 0 &&
                (payload_start <= payload_end &&
                 8 <= payload_end - payload_start)) {
       uint32_t count = ReadBigEndianUInt32(data_ + payload_start + 4);
+      size_t max_entries = (payload_end - payload_start - 8) / 12;
+      count = static_cast<uint32_t>(std::min<size_t>(count, max_entries));
       track->stsc_entries.reserve(count);
       for (uint32_t i = 0; i < count; ++i) {
         size_t offset_in_table = static_cast<size_t>(i) * 12;
@@ -485,6 +509,9 @@ bool Mp4BoxReader::ParseStbl(size_t start, size_t end, Mp4TrackInfo* track) {
                (payload_start <= payload_end &&
                 8 <= payload_end - payload_start)) {
       uint32_t count = ReadBigEndianUInt32(data_ + payload_start + 4);
+      size_t max_entries =
+          (payload_end - payload_start - 8) / sizeof(uint32_t);
+      count = static_cast<uint32_t>(std::min<size_t>(count, max_entries));
       track->chunk_offsets.reserve(count);
       for (uint32_t i = 0; i < count; ++i) {
         size_t offset_in_table = static_cast<size_t>(i) * 4;
@@ -500,6 +527,9 @@ bool Mp4BoxReader::ParseStbl(size_t start, size_t end, Mp4TrackInfo* track) {
                (payload_start <= payload_end &&
                 8 <= payload_end - payload_start)) {
       uint32_t count = ReadBigEndianUInt32(data_ + payload_start + 4);
+      size_t max_entries =
+          (payload_end - payload_start - 8) / sizeof(uint64_t);
+      count = static_cast<uint32_t>(std::min<size_t>(count, max_entries));
       track->chunk_offsets.reserve(count);
       for (uint32_t i = 0; i < count; ++i) {
         size_t offset_in_table = static_cast<size_t>(i) * 8;

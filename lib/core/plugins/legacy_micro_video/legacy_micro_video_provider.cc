@@ -15,12 +15,13 @@
 #include "plugins/legacy_micro_video/legacy_micro_video_provider.h"
 
 #include <absl/strings/match.h>
+#include <absl/strings/numbers.h>
+#include <absl/strings/string_view.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <regex>
 #include <string>
-#include <string_view>
 #include <vector>
 
 #include "legacy_micro_video_metadata.pb.h"  // NOLINT
@@ -31,22 +32,108 @@ namespace motion_photo {
 
 namespace {
 
-int64_t ExtractInt64Attr(absl::string_view xml, const std::string& attr_name) {
-  std::regex attr_regex(R"((?:GCamera|Camera):)" + attr_name +
-                        R"(\s*=\s*["'](-?\d+)["'])");
-  std::cmatch match;
-  if (std::regex_search(xml.data(), xml.data() + xml.size(), match,
-                        attr_regex)) {
-    return std::stoll(match[1].str());
-  }
-  std::regex elem_regex(R"(<(?:GCamera|Camera):)" + attr_name +
-                        R"(>[\s]*(-?\d+)[\s]*</(?:GCamera|Camera):)" +
-                        attr_name + R"(>)");
-  if (std::regex_search(xml.data(), xml.data() + xml.size(), match,
-                        elem_regex)) {
-    return std::stoll(match[1].str());
+constexpr size_t kMaxXiaomiFtypScanBytes = 4096;
+
+uint32_t ReadBe32(const uint8_t* p) {
+  return (static_cast<uint32_t>(p[0]) << 24) |
+         (static_cast<uint32_t>(p[1]) << 16) |
+         (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
+}
+
+int64_t ExtractInt64Attr(absl::string_view xml, absl::string_view attr_name) {
+  const std::string prefixes[] = {"GCamera:", "Camera:"};
+  for (const auto& prefix : prefixes) {
+    std::string needle = prefix + std::string(attr_name);
+    size_t pos = xml.find(needle);
+    while (pos != absl::string_view::npos) {
+      size_t after = pos + needle.size();
+      while (after < xml.size() &&
+             (xml[after] == ' ' || xml[after] == '\t' || xml[after] == '\r' ||
+              xml[after] == '\n')) {
+        ++after;
+      }
+      if (after < xml.size() && xml[after] == '=') {
+        ++after;
+        while (after < xml.size() &&
+               (xml[after] == ' ' || xml[after] == '\t')) {
+          ++after;
+        }
+        if (after < xml.size() && (xml[after] == '"' || xml[after] == '\'')) {
+          char quote = xml[after++];
+          size_t end_quote = xml.find(quote, after);
+          int64_t val = -1;
+          if (end_quote != absl::string_view::npos &&
+              absl::SimpleAtoi(xml.substr(after, end_quote - after), &val)) {
+            return val;
+          }
+        }
+      } else if (after < xml.size() && xml[after] == '>') {
+        ++after;
+        while (after < xml.size() &&
+               (xml[after] == ' ' || xml[after] == '\t' || xml[after] == '\r' ||
+                xml[after] == '\n')) {
+          ++after;
+        }
+        size_t close_tag = xml.find('<', after);
+        if (close_tag != absl::string_view::npos) {
+          absl::string_view inner = xml.substr(after, close_tag - after);
+          while (!inner.empty() &&
+                 (inner.back() == ' ' || inner.back() == '\t' ||
+                  inner.back() == '\r' || inner.back() == '\n')) {
+            inner.remove_suffix(1);
+          }
+          int64_t val = -1;
+          if (absl::SimpleAtoi(inner, &val)) {
+            return val;
+          }
+        }
+      }
+      pos = xml.find(needle, pos + 1);
+    }
   }
   return -1;
+}
+
+// Finds the start offset of the embedded MP4 stream inside `container.trailer`.
+// Supports standard offset 0 as well as Xiaomi MVIMG files where
+// GCamera:MicroVideoOffset is inaccurate and the trailer starts with padding
+// bytes before the ISO BMFF `ftyp` box.
+bool FindMp4StartInTrailer(const RawMetadataBlock& block,
+                           size_t* out_mp4_offset) {
+  const auto& bytes = block.bytes;
+  if (bytes.size() < 8) {
+    return false;
+  }
+  absl::string_view tag0(reinterpret_cast<const char*>(bytes.data() + 4), 4);
+  if (tag0 == "ftyp" || tag0 == "moov" || tag0 == "mdat" || tag0 == "free" ||
+      tag0 == "skip" || tag0 == "wide") {
+    if (out_mp4_offset) {
+      *out_mp4_offset = 0;
+    }
+    return true;
+  }
+
+  // Forward scan for `[u32be box_size]["ftyp"]` (Xiaomi MVIMG offset drift).
+  const size_t scan_limit = std::min(bytes.size(), kMaxXiaomiFtypScanBytes);
+  if (scan_limit >= 8) {
+    absl::string_view window(reinterpret_cast<const char*>(bytes.data()),
+                             scan_limit);
+    size_t pos = window.find("ftyp", 4);
+    while (pos != absl::string_view::npos) {
+      if (pos >= 4) {
+        size_t box_start = pos - 4;
+        uint32_t box_size = ReadBe32(bytes.data() + box_start);
+        if (box_size >= 8 && box_size <= 128) {
+          if (out_mp4_offset) {
+            *out_mp4_offset = box_start;
+          }
+          return true;
+        }
+      }
+      pos = window.find("ftyp", pos + 1);
+    }
+  }
+  return false;
 }
 
 }  // namespace
@@ -54,18 +141,11 @@ int64_t ExtractInt64Attr(absl::string_view xml, const std::string& attr_name) {
 bool LegacyMicroVideoProvider::Identify(const RawMetadataBlock& block) {
   if (block.type == "XMP" && block.format_identifier == "standard.xmp") {
     absl::string_view xml(reinterpret_cast<const char*>(block.bytes.data()),
-                         block.bytes.size());
+                          block.bytes.size());
     return absl::StrContains(xml, "MicroVideo");
   }
   if (block.format_identifier == "container.trailer") {
-    if (block.bytes.size() >= 8) {
-      absl::string_view tag(
-          reinterpret_cast<const char*>(block.bytes.data() + 4), 4);
-      if (tag == "ftyp" || tag == "moov" || tag == "mdat" || tag == "free" ||
-          tag == "skip" || tag == "wide") {
-        return true;
-      }
-    }
+    return FindMp4StartInTrailer(block, nullptr);
   }
   return false;
 }
@@ -77,7 +157,7 @@ bool LegacyMicroVideoProvider::DecodeToSemantic(
     return false;
   }
   absl::string_view xml(reinterpret_cast<const char*>(block.bytes.data()),
-                       block.bytes.size());
+                        block.bytes.size());
 
   LegacyMicroVideoMetadata metadata;
   int64_t micro_video = ExtractInt64Attr(xml, "MicroVideo");
@@ -136,7 +216,7 @@ bool LegacyMicroVideoProvider::GetVideoInfo(const RawMetadataBlock& block,
                                             size_t* out_length) const {
   if (block.type == "XMP" && block.format_identifier == "standard.xmp") {
     absl::string_view xml(reinterpret_cast<const char*>(block.bytes.data()),
-                         block.bytes.size());
+                          block.bytes.size());
     int64_t offset = ExtractInt64Attr(xml, "MicroVideoOffset");
     if (offset > 0) {
       if (out_offset_in_block) {
@@ -150,12 +230,20 @@ bool LegacyMicroVideoProvider::GetVideoInfo(const RawMetadataBlock& block,
     return false;
   }
   if (block.format_identifier == "container.trailer") {
+    size_t mp4_start = 0;
+    if (!FindMp4StartInTrailer(block, &mp4_start)) {
+      mp4_start = 0;
+    }
+    size_t total_len = (block.total_payload_size > 0) ? block.total_payload_size
+                                                      : block.bytes.size();
+    if (mp4_start >= total_len) {
+      return false;
+    }
     if (out_offset_in_block) {
-      *out_offset_in_block = 0;
+      *out_offset_in_block = mp4_start;
     }
     if (out_length) {
-      *out_length = (block.total_payload_size > 0) ? block.total_payload_size
-                                                   : block.bytes.size();
+      *out_length = total_len - mp4_start;
     }
     return true;
   }

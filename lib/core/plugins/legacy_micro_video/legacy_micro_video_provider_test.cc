@@ -27,6 +27,7 @@
 #include "image_io/base/message_handler.h"
 #include "image_io/base/string_ref_data_source.h"
 #include "legacy_micro_video_metadata.pb.h"  // NOLINT
+#include "libmotionphoto_api.h"
 #include "motion_photo/google_motion_photo_provider.h"
 #include "motion_photo/metadata_block.h"
 #include "motion_photo/metadata_engine.h"
@@ -435,6 +436,94 @@ TEST(LegacyMicroVideoProviderTest,
 
   std::remove(temp_input.c_str());
   std::remove(temp_output.c_str());
+}
+
+TEST(LegacyMicroVideoProviderTest, DecodesXmlElementsAndCameraPrefix) {
+  LegacyMicroVideoProvider provider;
+
+  RawMetadataBlock xmp_block;
+  xmp_block.type = "XMP";
+  xmp_block.format_identifier = "standard.xmp";
+  std::string xmp_data =
+      "<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF>"
+      "<rdf:Description xmlns:Camera='http://ns.google.com/photos/1.0/camera/'>"
+      "<Camera:MicroVideo>1</Camera:MicroVideo>"
+      "<Camera:MicroVideoVersion>1</Camera:MicroVideoVersion>"
+      "<Camera:MicroVideoPresentationTimestampUs>890000"
+      "</Camera:MicroVideoPresentationTimestampUs>"
+      "<Camera:MicroVideoOffset>204800</Camera:MicroVideoOffset>"
+      "</rdf:Description></rdf:RDF></x:xmpmeta>";
+  xmp_block.bytes.assign(xmp_data.begin(), xmp_data.end());
+
+  std::vector<uint8_t> proto_bytes;
+  std::string type_url;
+  std::string error_message;
+  ASSERT_TRUE(provider.DecodeToSemantic(xmp_block, &proto_bytes, &type_url,
+                                        &error_message));
+
+  LegacyMicroVideoMetadata metadata;
+  ASSERT_TRUE(metadata.ParseFromArray(proto_bytes.data(), proto_bytes.size()));
+  EXPECT_EQ(metadata.legacy_micro_video(), 1);
+  EXPECT_EQ(metadata.version(), 1);
+  EXPECT_EQ(metadata.primary_image_timestamp_us(), 890000);
+  EXPECT_EQ(metadata.micro_video_offset(), 204800);
+}
+
+TEST(LegacyMicroVideoProviderTest,
+     XiaomiMvimgInaccurateMicroVideoOffsetFtypFallback) {
+  LegacyMicroVideoProvider provider;
+
+  // Simulate a Xiaomi MVIMG trailer where 16 bytes of padding precede the
+  // actual ISO BMFF `[u32be size=24]["ftypmp42"]` box header.
+  std::vector<uint8_t> mp4 = {
+      0x00, 0x00, 0x00, 0x18, 'f', 't', 'y', 'p', 'm', 'p', '4', '2',
+      0x00, 0x00, 0x00, 0x00, 'm', 'p', '4', '2', 'i', 's', 'o', 'm',
+      0x00, 0x00, 0x00, 0x10, 'm', 'd', 'a', 't', 'X', 'I', 'A', 'O'};
+  std::vector<uint8_t> drifted_trailer(16, 0x00);
+  drifted_trailer.insert(drifted_trailer.end(), mp4.begin(), mp4.end());
+
+  RawMetadataBlock block;
+  block.type = "PROPRIETARY";
+  block.format_identifier = "container.trailer";
+  block.bytes = drifted_trailer;
+
+  EXPECT_TRUE(provider.Identify(block));
+
+  size_t offset_in_block = 0;
+  size_t length = 0;
+  ASSERT_TRUE(provider.GetVideoInfo(block, &offset_in_block, &length));
+  EXPECT_EQ(offset_in_block, 16u);
+  EXPECT_EQ(length, mp4.size());
+
+  // End-to-end extraction on a synthetic Xiaomi MVIMG JPEG with 16-byte drift
+  // before ftyp.
+  std::string xmp_content =
+      "<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF "
+      "xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:"
+      "Description xmlns:GCamera='http://ns.google.com/photos/1.0/camera/' "
+      "GCamera:MicroVideo='1' GCamera:MicroVideoVersion='1' "
+      "GCamera:MicroVideoOffset='999999'/></rdf:RDF></x:xmpmeta>";
+
+  std::vector<uint8_t> full_jpeg = {0xFF, 0xD8, 0xFF, 0xE1};
+  uint16_t app1_len = static_cast<uint16_t>(2 + 29 + xmp_content.size());
+  full_jpeg.push_back(static_cast<uint8_t>(app1_len >> 8));
+  full_jpeg.push_back(static_cast<uint8_t>(app1_len & 0xFF));
+  const char kXmpHdr[] = "http://ns.adobe.com/xap/1.0/\0";
+  full_jpeg.insert(full_jpeg.end(), kXmpHdr, kXmpHdr + 29);
+  full_jpeg.insert(full_jpeg.end(), xmp_content.begin(), xmp_content.end());
+  full_jpeg.push_back(0xFF);
+  full_jpeg.push_back(0xD9);
+  full_jpeg.insert(full_jpeg.end(), drifted_trailer.begin(),
+                   drifted_trailer.end());
+
+  const std::string out_vid = "/tmp/xiaomi_mvimg_drifted_video.mp4";
+  ASSERT_TRUE(libmotionphoto::api::ExtractVideoTrackFromMemory(
+      full_jpeg.data(), full_jpeg.size(), out_vid));
+  std::ifstream vid_in(out_vid, std::ios::binary);
+  std::vector<uint8_t> extracted_vid((std::istreambuf_iterator<char>(vid_in)),
+                                     std::istreambuf_iterator<char>());
+  std::remove(out_vid.c_str());
+  EXPECT_TRUE(extracted_vid == mp4);
 }
 
 }  // namespace motion_photo

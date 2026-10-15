@@ -45,7 +45,8 @@ class MetadataEngine {
 
   // Parses metadata from the data source.
   MetadataCollection Parse(image_io::DataSource* data_source, size_t file_size,
-                           FileType file_type);
+                           FileType file_type,
+                           const HandlerOptions& options = {});
 
   // Extracts AGTM metadata from the video payload at the target presentation
   // timestamp in microseconds.

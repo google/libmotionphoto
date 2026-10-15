@@ -52,16 +52,28 @@ uint32_t ReadBe32(const uint8_t* p) {
 
 bool ParseSefBlock(const RawMetadataBlock& block, SamsungSefMetadata* out_meta,
                    std::string* error_message) {
-  const auto& bytes = block.bytes;
-  if (bytes.size() < 20) {
+  // For "heic.sefd", `block.bytes` holds the SEFD box and `total_payload_size`
+  // holds the associated mpvd box length. For "container.trailer", `Size()`
+  // returns the full trailer length.
+  const size_t total_size = (block.format_identifier == "heic.sefd")
+                                ? block.BufferedSize()
+                                : block.Size();
+  if (total_size < 20) {
     if (error_message) {
       *error_message = "SEF block is too small";
     }
     return false;
   }
 
-  absl::string_view tail_magic(
-      reinterpret_cast<const char*>(bytes.data() + bytes.size() - 4), 4);
+  const uint8_t* tail8 = nullptr;
+  std::vector<uint8_t> tail_scratch;
+  if (!block.ReadView(total_size - 8, 8, &tail8, &tail_scratch)) {
+    if (error_message) {
+      *error_message = "Failed to read SEFT footer";
+    }
+    return false;
+  }
+  absl::string_view tail_magic(reinterpret_cast<const char*>(tail8 + 4), 4);
   if (tail_magic != "SEFT") {
     if (error_message) {
       *error_message = "Missing SEFT footer magic";
@@ -69,17 +81,26 @@ bool ParseSefBlock(const RawMetadataBlock& block, SamsungSefMetadata* out_meta,
     return false;
   }
 
-  const uint32_t sefh_back_offset = ReadLe32(bytes.data() + bytes.size() - 8);
-  if (sefh_back_offset < 12 || sefh_back_offset > bytes.size() - 8) {
+  const uint32_t sefh_back_offset = ReadLe32(tail8);
+  if (sefh_back_offset < 12 || sefh_back_offset > total_size - 8) {
     if (error_message) {
       *error_message = "Invalid SEFH backward offset";
     }
     return false;
   }
 
-  const size_t sefh_pos = bytes.size() - 8 - sefh_back_offset;
-  absl::string_view sefh_magic(
-      reinterpret_cast<const char*>(bytes.data() + sefh_pos), 4);
+  const size_t sefh_pos = total_size - 8 - sefh_back_offset;
+  const size_t sefh_region_len = total_size - sefh_pos;
+  const uint8_t* sefh_buf = nullptr;
+  std::vector<uint8_t> sefh_scratch;
+  if (!block.ReadView(sefh_pos, sefh_region_len, &sefh_buf, &sefh_scratch)) {
+    if (error_message) {
+      *error_message = "Failed to read SEFH directory";
+    }
+    return false;
+  }
+
+  absl::string_view sefh_magic(reinterpret_cast<const char*>(sefh_buf), 4);
   if (sefh_magic != "SEFH") {
     if (error_message) {
       *error_message = "Missing SEFH header magic";
@@ -87,11 +108,11 @@ bool ParseSefBlock(const RawMetadataBlock& block, SamsungSefMetadata* out_meta,
     return false;
   }
 
-  const uint32_t sef_version = ReadLe32(bytes.data() + sefh_pos + 4);
-  const uint32_t entry_count = ReadLe32(bytes.data() + sefh_pos + 8);
+  const uint32_t sef_version = ReadLe32(sefh_buf + 4);
+  const uint32_t entry_count = ReadLe32(sefh_buf + 8);
   if (entry_count > kMaxSefEntries ||
       sefh_pos + 12 + static_cast<size_t>(entry_count) * 12 >
-          bytes.size() - 8) {
+          total_size - 8) {
     if (error_message) {
       *error_message = "SEFH entry count exceeds block bounds";
     }
@@ -103,7 +124,7 @@ bool ParseSefBlock(const RawMetadataBlock& block, SamsungSefMetadata* out_meta,
   out_meta->set_primary_image_timestamp_us(-1);
 
   for (uint32_t i = 0; i < entry_count; ++i) {
-    const uint8_t* entry_ptr = bytes.data() + sefh_pos + 12 + i * 12;
+    const uint8_t* entry_ptr = sefh_buf + 12 + i * 12;
     const uint16_t entry_type = ReadLe16(entry_ptr + 2);
     const uint32_t neg_offset = ReadLe32(entry_ptr + 4);
     const uint32_t rec_length = ReadLe32(entry_ptr + 8);
@@ -115,7 +136,7 @@ bool ParseSefBlock(const RawMetadataBlock& block, SamsungSefMetadata* out_meta,
       // In dual-tagged Samsung Motion Photos (e.g. Galaxy S25/S26 Ultra),
       // XMP Container:Directory Item:Length starts at the MP4 ftyp box inside
       // the 0x0A30 record, so the 24-byte 0x0A30 SEF record header (8B +
-      // "MotionPhoto_Data") sits immediately before block.bytes[0].
+      // "MotionPhoto_Data") sits immediately before block[0].
       const size_t prefix_before_block = neg_offset - sefh_pos;
       if (entry_type == kSefTypeMotionPhotoData && prefix_before_block <= 64 &&
           rec_length > prefix_before_block &&
@@ -124,13 +145,16 @@ bool ParseSefBlock(const RawMetadataBlock& block, SamsungSefMetadata* out_meta,
         out_meta->set_has_motion_photo_data(true);
         const size_t rem_len = rec_length - prefix_before_block;
         if (rem_len > 12) {
-          absl::string_view magic(reinterpret_cast<const char*>(bytes.data()),
-                                  4);
-          if (magic == "mpv2" || magic == "mpv3") {
-            out_meta->set_motion_photo_data_magic(std::string(magic));
-            out_meta->set_video_offset(12);
-            out_meta->set_video_length(rem_len - 12);
-            continue;
+          const uint8_t* head4 = nullptr;
+          std::vector<uint8_t> head_scratch;
+          if (block.ReadView(0, 4, &head4, &head_scratch)) {
+            absl::string_view magic(reinterpret_cast<const char*>(head4), 4);
+            if (magic == "mpv2" || magic == "mpv3") {
+              out_meta->set_motion_photo_data_magic(std::string(magic));
+              out_meta->set_video_offset(12);
+              out_meta->set_video_length(rem_len - 12);
+              continue;
+            }
           }
         }
         out_meta->set_video_offset(0);
@@ -139,17 +163,26 @@ bool ParseSefBlock(const RawMetadataBlock& block, SamsungSefMetadata* out_meta,
       continue;
     }
     const size_t rec_pos = sefh_pos - neg_offset;
-    if (rec_pos + rec_length > bytes.size()) {
+    if (rec_pos + rec_length > total_size) {
       continue;
     }
 
-    const uint32_t key_len = ReadLe32(bytes.data() + rec_pos + 4);
-    if (8 + static_cast<size_t>(key_len) > rec_length) {
+    // Read only the record header + key + up to 12 bytes of payload header
+    // (avoiding reading the multi-MB MP4 payload).
+    const size_t probe_len =
+        std::min<size_t>(rec_length, 8 + 256 + 12);
+    const uint8_t* rec_hdr = nullptr;
+    std::vector<uint8_t> rec_scratch;
+    if (!block.ReadView(rec_pos, probe_len, &rec_hdr, &rec_scratch)) {
       continue;
     }
 
-    std::string key(reinterpret_cast<const char*>(bytes.data() + rec_pos + 8),
-                    key_len);
+    const uint32_t key_len = ReadLe32(rec_hdr + 4);
+    if (key_len > 256 || 8 + static_cast<size_t>(key_len) > rec_length) {
+      continue;
+    }
+
+    std::string key(reinterpret_cast<const char*>(rec_hdr + 8), key_len);
     out_meta->add_sef_keys(key);
 
     if (entry_type == kSefTypeMotionPhotoData || key == "MotionPhoto_Data") {
@@ -158,14 +191,12 @@ bool ParseSefBlock(const RawMetadataBlock& block, SamsungSefMetadata* out_meta,
       const size_t payload_len = rec_length - 8 - key_len;
 
       if (payload_len >= 12) {
-        absl::string_view magic(
-            reinterpret_cast<const char*>(bytes.data() + payload_pos), 4);
+        const uint8_t* payload_hdr = rec_hdr + 8 + key_len;
+        absl::string_view magic(reinterpret_cast<const char*>(payload_hdr), 4);
         if (magic == "mpv2" || magic == "mpv3") {
           out_meta->set_motion_photo_data_magic(std::string(magic));
-          const uint32_t hdr_mp4_offset =
-              ReadBe32(bytes.data() + payload_pos + 4);
-          const uint32_t hdr_mp4_size =
-              ReadBe32(bytes.data() + payload_pos + 8);
+          const uint32_t hdr_mp4_offset = ReadBe32(payload_hdr + 4);
+          const uint32_t hdr_mp4_size = ReadBe32(payload_hdr + 8);
 
           if (payload_len > 12) {
             out_meta->set_video_offset(payload_pos + 12);
@@ -208,13 +239,18 @@ bool SamsungSefProvider::Identify(const RawMetadataBlock& block) {
       block.format_identifier != "heic.sefd") {
     return false;
   }
-  if (block.bytes.size() < 20) {
+  const size_t total_size = (block.format_identifier == "heic.sefd")
+                                ? block.BufferedSize()
+                                : block.Size();
+  if (total_size < 20) {
     return false;
   }
-  absl::string_view tail_magic(
-      reinterpret_cast<const char*>(block.bytes.data() + block.bytes.size() -
-                                    4),
-      4);
+  const uint8_t* tail4 = nullptr;
+  std::vector<uint8_t> scratch;
+  if (!block.ReadView(total_size - 4, 4, &tail4, &scratch)) {
+    return false;
+  }
+  absl::string_view tail_magic(reinterpret_cast<const char*>(tail4), 4);
   return tail_magic == "SEFT";
 }
 

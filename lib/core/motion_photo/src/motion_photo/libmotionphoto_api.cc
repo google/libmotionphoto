@@ -180,12 +180,27 @@ class FdDataSource : public ::photos_editing_formats::image_io::DataSource {
  private:
   std::shared_ptr<::photos_editing_formats::image_io::DataSegment> Read(
       size_t begin, size_t min_size) {
-    if (fd_ < 0 || begin >= static_cast<size_t>(total_length_)) {
+    if (fd_ < 0 || total_length_ <= 0 ||
+        begin >= static_cast<size_t>(total_length_)) {
       return nullptr;
     }
-    size_t chunk_size = std::max(min_size, static_cast<size_t>(64 * 1024));
-    size_t to_read =
-        std::min(chunk_size, static_cast<size_t>(total_length_) - begin);
+    const size_t total = static_cast<size_t>(total_length_);
+    // Use 64 KB chunks for sequential header scanning at the front of the file,
+    // and 4 KB page-sized chunks for random-access trailer head/tail probes.
+    const size_t default_chunk = (begin < 256 * 1024)
+                                     ? static_cast<size_t>(64 * 1024)
+                                     : static_cast<size_t>(4 * 1024);
+    size_t chunk_size = std::max(min_size, default_chunk);
+    size_t read_begin = begin;
+    size_t to_read = std::min(chunk_size, total - begin);
+    // When probing near EOF (e.g. reading the last 4-20 bytes of a trailer),
+    // align the read window back to capture up to 4 KB ending at EOF so all
+    // subsequent tail probes hit the same cached DataSegment without extra
+    // syscalls.
+    if (begin >= 256 * 1024 && total - begin < chunk_size) {
+      read_begin = (total > chunk_size) ? (total - chunk_size) : 0;
+      to_read = total - read_begin;
+    }
     if (to_read == 0) {
       return nullptr;
     }
@@ -197,18 +212,18 @@ class FdDataSource : public ::photos_editing_formats::image_io::DataSource {
     while (total_bytes_read < to_read) {
       ssize_t bytes = pread(fd_, buffer->data() + total_bytes_read,
                             to_read - total_bytes_read,
-                            base_offset_ + begin + total_bytes_read);
+                            base_offset_ + read_begin + total_bytes_read);
       if (bytes <= 0) break;
       total_bytes_read += bytes;
     }
 
-    if (total_bytes_read == 0) {
+    if (total_bytes_read <= (begin - read_begin)) {
       return nullptr;
     }
 
     auto segment = ::photos_editing_formats::image_io::DataSegment::Create(
-        ::photos_editing_formats::image_io::DataRange(begin,
-                                                      begin + total_bytes_read),
+        ::photos_editing_formats::image_io::DataRange(
+            read_begin, read_begin + total_bytes_read),
         buffer->data(),
         ::photos_editing_formats::image_io::DataSegment::
             BufferDispositionPolicy::kDontDelete);
@@ -261,12 +276,11 @@ bool ParseMotionPhotoFromFile(const std::string& filepath,
   int64_t file_size = st.st_size;
 
   FdDataSource data_source(fd, /*base_offset=*/0, file_size, /*owns_fd=*/true);
-  ::libmotionphoto::motion_photo::MetadataCollection collection =
-      engine.Parse(&data_source, file_size, file_type);
-
   ::libmotionphoto::motion_photo::HandlerOptions engine_options;
   engine_options.disable_3p_plugins = options.disable_3p_plugins;
   engine_options.enabled_3p_plugins = options.enabled_3p_plugins;
+  ::libmotionphoto::motion_photo::MetadataCollection collection =
+      engine.Parse(&data_source, file_size, file_type, engine_options);
   bool is_mp = engine.IsMotionPhoto(collection, engine_options);
 
   if (out_metadata != nullptr) {
@@ -377,12 +391,11 @@ bool ParseMotionPhotoFromFd(int fd, int64_t offset, int64_t length,
 
   FdDataSource data_source(fd, offset, length, /*owns_fd=*/false);
 
-  ::libmotionphoto::motion_photo::MetadataCollection collection =
-      engine.Parse(&data_source, length, file_type);
-
   ::libmotionphoto::motion_photo::HandlerOptions engine_options;
   engine_options.disable_3p_plugins = options.disable_3p_plugins;
   engine_options.enabled_3p_plugins = options.enabled_3p_plugins;
+  ::libmotionphoto::motion_photo::MetadataCollection collection =
+      engine.Parse(&data_source, length, file_type, engine_options);
   bool is_mp = engine.IsMotionPhoto(collection, engine_options);
 
   if (out_metadata != nullptr) {
@@ -482,12 +495,11 @@ bool ParseMotionPhotoFromMemory(const uint8_t* data, size_t size,
       ::photos_editing_formats::image_io::DataSegment::BufferDispositionPolicy::kDontDelete);
   ::photos_editing_formats::image_io::DataSegmentDataSource data_source(data_segment);
 
-  ::libmotionphoto::motion_photo::MetadataCollection collection =
-      engine.Parse(&data_source, size, file_type);
-
   ::libmotionphoto::motion_photo::HandlerOptions engine_options;
   engine_options.disable_3p_plugins = options.disable_3p_plugins;
   engine_options.enabled_3p_plugins = options.enabled_3p_plugins;
+  ::libmotionphoto::motion_photo::MetadataCollection collection =
+      engine.Parse(&data_source, size, file_type, engine_options);
   bool is_mp = engine.IsMotionPhoto(collection, engine_options);
 
   if (out_metadata != nullptr) {

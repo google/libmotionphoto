@@ -20,6 +20,7 @@
 #include <fstream>
 #include <ios>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -44,6 +45,89 @@
 namespace libmotionphoto {
 namespace motion_photo {
 
+bool RawMetadataBlock::ReadView(size_t rel_offset, size_t len,
+                                const uint8_t** out_ptr,
+                                std::vector<uint8_t>* scratch) const {
+  if (out_ptr == nullptr) {
+    return false;
+  }
+  const size_t total = Size();
+  if (rel_offset > total || len > total - rel_offset) {
+    return false;
+  }
+  if (len == 0) {
+    *out_ptr = Data();
+    return true;
+  }
+  const size_t buf_size = BufferedSize();
+  const uint8_t* buf_ptr = Data();
+  if (buf_ptr != nullptr && rel_offset <= buf_size &&
+      len <= buf_size - rel_offset) {
+    *out_ptr = buf_ptr + rel_offset;
+    return true;
+  }
+  if (data_source == nullptr) {
+    return false;
+  }
+  const size_t abs_offset = offset + rel_offset;
+  if (pinned_segments_mutex) {
+    std::lock_guard<std::mutex> lock(*pinned_segments_mutex);
+    // Check already-pinned segments first to avoid redundant DataSource calls.
+    for (const auto& seg : pinned_segments) {
+      if (seg && seg->Contains(abs_offset) &&
+          seg->GetEnd() - abs_offset >= len) {
+        const uint8_t* ptr =
+            reinterpret_cast<const uint8_t*>(seg->GetBuffer(abs_offset));
+        if (ptr != nullptr) {
+          *out_ptr = ptr;
+          return true;
+        }
+      }
+    }
+  }
+  auto seg = data_source->GetDataSegment(abs_offset, len);
+  if (seg && seg->Contains(abs_offset) && seg->GetEnd() - abs_offset >= len) {
+    const uint8_t* ptr =
+        reinterpret_cast<const uint8_t*>(seg->GetBuffer(abs_offset));
+    if (ptr != nullptr) {
+      if (pinned_segments_mutex) {
+        std::lock_guard<std::mutex> lock(*pinned_segments_mutex);
+        pinned_segments.push_back(std::move(seg));
+      } else {
+        pinned_segments.push_back(std::move(seg));
+      }
+      *out_ptr = ptr;
+      return true;
+    }
+  }
+  if (scratch == nullptr) {
+    return false;
+  }
+  scratch->resize(len);
+  size_t copied = 0;
+  while (copied < len) {
+    size_t chunk_start = abs_offset + copied;
+    size_t chunk_rem = len - copied;
+    auto chunk_seg = data_source->GetDataSegment(chunk_start, chunk_rem);
+    if (!chunk_seg || !chunk_seg->Contains(chunk_start)) {
+      return false;
+    }
+    const uint8_t* ptr =
+        reinterpret_cast<const uint8_t*>(chunk_seg->GetBuffer(chunk_start));
+    if (ptr == nullptr) {
+      return false;
+    }
+    size_t avail = std::min(chunk_rem, chunk_seg->GetEnd() - chunk_start);
+    if (avail == 0) {
+      return false;
+    }
+    std::copy(ptr, ptr + avail, scratch->begin() + copied);
+    copied += avail;
+  }
+  *out_ptr = scratch->data();
+  return true;
+}
+
 MetadataEngine::MetadataEngine(image_io::MessageHandler* message_handler)
     : message_handler_(message_handler) {
   RegisterProvider(std::make_unique<GoogleMotionPhotoProvider>());
@@ -57,7 +141,8 @@ void MetadataEngine::RegisterProvider(
 }
 
 MetadataCollection MetadataEngine::Parse(image_io::DataSource* data_source,
-                                         size_t file_size, FileType file_type) {
+                                         size_t file_size, FileType file_type,
+                                         const HandlerOptions& options) {
   MetadataCollection collection;
 
   std::unique_ptr<ContainerSplitter> splitter;
@@ -73,24 +158,35 @@ MetadataCollection MetadataEngine::Parse(image_io::DataSource* data_source,
   std::vector<RawMetadataBlock> raw_blocks =
       splitter->Split(data_source, file_size);
 
+  std::vector<IMetadataProvider*> all_providers;
+  const auto& global_3p = MetadataProviderRegistry::Get3pProviders();
+  all_providers.reserve(providers_.size() + global_3p.size());
+  for (const auto& p : providers_) {
+    all_providers.push_back(p.get());
+  }
+  if (!options.disable_3p_plugins) {
+    for (const auto& p : global_3p) {
+      if (options.enabled_3p_plugins.empty() ||
+          std::find(options.enabled_3p_plugins.begin(),
+                    options.enabled_3p_plugins.end(),
+                    p->GetPluginName()) != options.enabled_3p_plugins.end()) {
+        all_providers.push_back(p.get());
+      }
+    }
+  }
+
   for (const auto& raw_block : raw_blocks) {
     MetadataBlock* block = collection.add_blocks();
 
     block->set_format_identifier(raw_block.format_identifier);
-    block->set_raw_bytes(raw_block.bytes.data(), raw_block.bytes.size());
+    if (raw_block.format_identifier != "container.trailer" &&
+        raw_block.Data() != nullptr && raw_block.BufferedSize() > 0) {
+      block->set_raw_bytes(raw_block.Data(), raw_block.BufferedSize());
+    }
     block->set_offset(raw_block.offset);
 
     BlockType block_type = BLOCK_TYPE_UNKNOWN;
     bool decoded = false;
-    std::vector<IMetadataProvider*> all_providers;
-    auto global_3p = MetadataProviderRegistry::Get3pProviders();
-    all_providers.reserve(providers_.size() + global_3p.size());
-    for (const auto& p : providers_) {
-      all_providers.push_back(p.get());
-    }
-    for (const auto& p : global_3p) {
-      all_providers.push_back(p.get());
-    }
 
     for (const auto& provider : all_providers) {
       if (provider->Identify(raw_block)) {
@@ -322,7 +418,7 @@ bool MetadataEngine::ExtractMetadata(const std::string& input_file_path,
 
   image_io::DataSegmentDataSource data_source(data_segment);
   MetadataCollection collection =
-      Parse(&data_source, data_segment->GetLength(), file_type);
+      Parse(&data_source, data_segment->GetLength(), file_type, options);
 
   auto is_plugin_enabled = [&](const std::string& plugin_name) {
     if (options.disable_3p_plugins) {
@@ -337,8 +433,7 @@ bool MetadataEngine::ExtractMetadata(const std::string& input_file_path,
   };
 
   for (const auto& block : collection.blocks()) {
-    if (block.raw_bytes().empty() || !block.has_payload_type_url() ||
-        !block.has_decoded_payload_bytes()) {
+    if (!block.has_payload_type_url() || !block.has_decoded_payload_bytes()) {
       continue;
     }
 
@@ -373,8 +468,17 @@ bool MetadataEngine::ExtractMetadata(const std::string& input_file_path,
         raw_block.type = block.type();
         raw_block.format_identifier = block.format_identifier();
         raw_block.offset = block.offset();
-        raw_block.bytes.assign(block.raw_bytes().begin(),
-                               block.raw_bytes().end());
+        if (!block.raw_bytes().empty()) {
+          raw_block.bytes.assign(block.raw_bytes().begin(),
+                                 block.raw_bytes().end());
+        } else if (block.offset() < data_segment->GetLength()) {
+          const uint8_t* ptr = reinterpret_cast<const uint8_t*>(
+              data_segment->GetBuffer(block.offset()));
+          size_t rem = data_segment->GetLength() - block.offset();
+          if (ptr != nullptr && rem > 0) {
+            raw_block.bytes.assign(ptr, ptr + rem);
+          }
+        }
 
         std::vector<uint8_t> meta_bytes;
         if (matched_provider->ExtractRawMetadata(raw_block, &meta_bytes)) {

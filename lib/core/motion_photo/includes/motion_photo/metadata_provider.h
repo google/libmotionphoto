@@ -64,7 +64,12 @@ class IMetadataProvider {
       const RawMetadataBlock& block,
       std::vector<uint8_t>* out_metadata_bytes) const {
     if (out_metadata_bytes) {
-      *out_metadata_bytes = block.bytes;
+      if (block.Data() != nullptr && block.BufferedSize() > 0) {
+        out_metadata_bytes->assign(block.Data(),
+                                   block.Data() + block.BufferedSize());
+      } else {
+        out_metadata_bytes->clear();
+      }
       return true;
     }
     return false;

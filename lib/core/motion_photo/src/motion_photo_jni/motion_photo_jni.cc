@@ -146,9 +146,17 @@ class FdDataSource : public libmotionphoto::image_io::DataSource {
         begin >= static_cast<size_t>(total_length_)) {
       return nullptr;
     }
-    size_t chunk_size = std::max(min_size, static_cast<size_t>(64 * 1024));
-    size_t to_read =
-        std::min(chunk_size, static_cast<size_t>(total_length_) - begin);
+    const size_t total = static_cast<size_t>(total_length_);
+    const size_t default_chunk = (begin < 256 * 1024)
+                                     ? static_cast<size_t>(64 * 1024)
+                                     : static_cast<size_t>(4 * 1024);
+    size_t chunk_size = std::max(min_size, default_chunk);
+    size_t read_begin = begin;
+    size_t to_read = std::min(chunk_size, total - begin);
+    if (begin >= 256 * 1024 && total - begin < chunk_size) {
+      read_begin = (total > chunk_size) ? (total - chunk_size) : 0;
+      to_read = total - read_begin;
+    }
     if (to_read == 0) {
       return nullptr;
     }
@@ -158,7 +166,7 @@ class FdDataSource : public libmotionphoto::image_io::DataSource {
     while (total_bytes_read < to_read) {
       ssize_t bytes = pread(
           fd_, buffer->data() + total_bytes_read, to_read - total_bytes_read,
-          static_cast<off_t>(base_offset_ + begin + total_bytes_read));
+          static_cast<off_t>(base_offset_ + read_begin + total_bytes_read));
       if (bytes <= 0) {
         if (bytes < 0 && errno == EINTR) continue;
         break;
@@ -166,13 +174,13 @@ class FdDataSource : public libmotionphoto::image_io::DataSource {
       total_bytes_read += static_cast<size_t>(bytes);
     }
 
-    if (total_bytes_read == 0) {
+    if (total_bytes_read <= (begin - read_begin)) {
       return nullptr;
     }
 
     auto segment = ii::DataSegment::Create(
-        ii::DataRange(begin, begin + total_bytes_read), buffer->data(),
-        ii::DataSegment::BufferDispositionPolicy::kDontDelete);
+        ii::DataRange(read_begin, read_begin + total_bytes_read),
+        buffer->data(), ii::DataSegment::BufferDispositionPolicy::kDontDelete);
     return std::shared_ptr<ii::DataSegment>(
         segment.get(), [segment, buffer](ii::DataSegment*) {});
   }

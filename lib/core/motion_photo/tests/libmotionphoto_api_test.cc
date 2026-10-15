@@ -396,5 +396,84 @@ TEST(LibMotionPhotoApiTest, ParseMotionPhoto3pPluginOptions) {
   EXPECT_EQ(meta_unmatched.video_length, 0);
 }
 
+TEST(LibMotionPhotoApiTest, LargeTrailerZeroCopyDetectionFromFdAndMemory) {
+  // Construct a synthetic Motion Photo with a 2 MB video trailer to verify
+  // that zero-copy trailer inspection accurately detects and extracts video
+  // length across both Memory and FD paths without copying the trailer into
+  // MetadataBlock.raw_bytes.
+  constexpr size_t kLargeTrailerSize = 2 * 1024 * 1024;
+  std::string xmp_content =
+      "<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF "
+      "xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:"
+      "Description xmlns:Camera='http://ns.google.com/photos/1.0/camera/' "
+      "xmlns:Container='http://ns.google.com/photos/1.0/container/' "
+      "xmlns:Item='http://ns.google.com/photos/1.0/container/item/' "
+      "Camera:MotionPhoto='1' Camera:MotionPhotoVersion='1' "
+      "Camera:MotionPhotoPresentationTimestampUs='333333'>"
+      "<Container:Directory><rdf:Seq>"
+      "<rdf:li rdf:parseType='Resource'><Container:Item "
+      "Item:Semantic='Primary' Item:Mime='image/jpeg'/></rdf:li>"
+      "<rdf:li rdf:parseType='Resource'><Container:Item "
+      "Item:Semantic='MotionPhoto' Item:Mime='video/mp4' "
+      "Item:Length='2097152'/></rdf:li>"
+      "</rdf:Seq></Container:Directory></rdf:Description></rdf:RDF></x:xmpmeta>";
+
+  std::vector<uint8_t> file_bytes;
+  file_bytes.push_back(0xFF);
+  file_bytes.push_back(0xD8);  // SOI
+  file_bytes.push_back(0xFF);
+  file_bytes.push_back(0xE1);  // APP1
+  uint16_t app1_len = static_cast<uint16_t>(2 + 29 + xmp_content.size());
+  file_bytes.push_back(static_cast<uint8_t>(app1_len >> 8));
+  file_bytes.push_back(static_cast<uint8_t>(app1_len & 0xFF));
+  file_bytes.insert(file_bytes.end(), "http://ns.adobe.com/xap/1.0/\0",
+                    "http://ns.adobe.com/xap/1.0/\0" + 29);
+  file_bytes.insert(file_bytes.end(), xmp_content.begin(), xmp_content.end());
+  file_bytes.push_back(0xFF);
+  file_bytes.push_back(0xD9);  // EOI
+
+  const size_t trailer_start = file_bytes.size();
+  file_bytes.resize(trailer_start + kLargeTrailerSize, 0);
+  // Write MP4 ftyp header at start of trailer.
+  file_bytes[trailer_start + 0] = 0x00;
+  file_bytes[trailer_start + 1] = 0x00;
+  file_bytes[trailer_start + 2] = 0x00;
+  file_bytes[trailer_start + 3] = 0x18;
+  file_bytes[trailer_start + 4] = 'f';
+  file_bytes[trailer_start + 5] = 't';
+  file_bytes[trailer_start + 6] = 'y';
+  file_bytes[trailer_start + 7] = 'p';
+
+  MotionPhotoMetadata mem_meta;
+  EXPECT_TRUE(ParseMotionPhotoFromMemory(file_bytes.data(), file_bytes.size(),
+                                         &mem_meta));
+  EXPECT_TRUE(mem_meta.is_motion_photo);
+  EXPECT_EQ(mem_meta.video_length, static_cast<int64_t>(kLargeTrailerSize));
+
+  const std::string tmp_path = "/tmp/libmotionphoto_zero_copy_2mb_test.jpg";
+  {
+    std::ofstream out(tmp_path, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(file_bytes.data()),
+              file_bytes.size());
+  }
+  int fd = open(tmp_path.c_str(), O_RDONLY);
+  ASSERT_TRUE(fd >= 0);
+  MotionPhotoMetadata fd_meta;
+  EXPECT_TRUE(ParseMotionPhotoFromFd(
+      fd, 0, static_cast<int64_t>(file_bytes.size()), &fd_meta));
+  // Passing a length larger than the actual file size causes a short pread
+  // near the aligned tail window where total_bytes_read <= (begin - read_begin);
+  // FdDataSource must safely return nullptr (and ParseMotionPhotoFromFd returns
+  // false) without creating an out-of-range DataSegment or crashing.
+  MotionPhotoMetadata inflated_fd_meta;
+  EXPECT_FALSE(ParseMotionPhotoFromFd(
+      fd, 0, static_cast<int64_t>(file_bytes.size() + 2048),
+      &inflated_fd_meta));
+  close(fd);
+  std::remove(tmp_path.c_str());
+  EXPECT_TRUE(fd_meta.is_motion_photo);
+  EXPECT_EQ(fd_meta.video_length, static_cast<int64_t>(kLargeTrailerSize));
+}
+
 }  // namespace api
 }  // namespace libmotionphoto

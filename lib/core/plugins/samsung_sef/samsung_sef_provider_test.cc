@@ -430,6 +430,19 @@ TEST(SamsungSefProviderTest, RejectsMalformedAndCorruptedSefBlocksSafely) {
   huge_count_block.format_identifier = "container.trailer";
   huge_count_block.bytes = huge_count;
   EXPECT_FALSE(provider.DecodeToSemantic(huge_count_block, &proto, &url, &err));
+
+  // SEF record with oversized key_len (> 256 and 0xFFFFFFF8) is safely skipped.
+  std::vector<uint8_t> oversized_key_trailer =
+      BuildSefTrailer(107, {{0x0A30, std::string(300, 'A'), {1, 2, 3, 4}}});
+  RawMetadataBlock oversized_key_block;
+  oversized_key_block.format_identifier = "container.trailer";
+  oversized_key_block.bytes = oversized_key_trailer;
+  ASSERT_TRUE(
+      provider.DecodeToSemantic(oversized_key_block, &proto, &url, &err));
+  SamsungSefMetadata oversized_meta;
+  ASSERT_TRUE(oversized_meta.ParseFromArray(proto.data(), proto.size()));
+  EXPECT_EQ(oversized_meta.sef_keys_size(), 0);
+  EXPECT_FALSE(oversized_meta.has_motion_photo_data());
 }
 
 }  // namespace

@@ -15,21 +15,73 @@
 #ifndef MOTION_PHOTO_METADATA_BLOCK_H_
 #define MOTION_PHOTO_METADATA_BLOCK_H_
 
+#include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
+
+#include "motion_photo/common.h"
 
 namespace libmotionphoto {
 namespace motion_photo {
 
+// Note: RawMetadataBlock is not thread-safe when backed by a lazy `data_source`
+// (since `image_io::DataSource` itself is not thread-safe), though access to
+// `pinned_segments` in `ReadView` is synchronized via `pinned_segments_mutex`.
 struct RawMetadataBlock {
   std::string type;  // "EXIF", "XMP", "ICC", "PROPRIETARY", etc.
   std::string format_identifier;
   std::vector<uint8_t> bytes;
+  // Optional zero-copy view over a pinned DataSegment buffer (avoids copying
+  // into `bytes` when `bytes` is empty).
+  const uint8_t* data_view = nullptr;
+  size_t data_view_size = 0;
   size_t offset = 0;
   // If non-zero, represents the full size of the underlying payload block
-  // in cases where `bytes` only buffers a prefix (e.g. for container trailers).
+  // in cases where `bytes` only buffers a prefix or `data_source` provides
+  // lazy random-access reads (e.g. for container trailers).
   size_t total_payload_size = 0;
+  // Optional backing DataSource for zero-copy / lazy random-access reads
+  // without copying the entire payload into `bytes`.
+  image_io::DataSource* data_source = nullptr;
+  mutable std::vector<std::shared_ptr<image_io::DataSegment>> pinned_segments;
+  mutable std::shared_ptr<std::mutex> pinned_segments_mutex =
+      std::make_shared<std::mutex>();
+
+  // Returns a pointer to the buffered bytes (from `bytes` if non-empty, or
+  // `data_view` if set).
+  const uint8_t* Data() const {
+    return !bytes.empty() ? bytes.data() : data_view;
+  }
+
+  // Returns the number of bytes currently buffered in memory (`bytes.size()`
+  // or `data_view_size`).
+  size_t BufferedSize() const {
+    return !bytes.empty() ? bytes.size() : data_view_size;
+  }
+
+  // Returns the logical size of the block (`total_payload_size` if larger than
+  // `BufferedSize()`, otherwise `BufferedSize()`).
+  size_t Size() const {
+    const size_t buf_size = BufferedSize();
+    return total_payload_size > buf_size ? total_payload_size : buf_size;
+  }
+
+  // Obtains a pointer to `len` contiguous bytes starting at `rel_offset`
+  // relative to the start of this block.
+  // - If the requested range lies within the already-buffered prefix
+  //   (`Data()[0 .. BufferedSize())`), sets `*out_ptr` directly with zero
+  //   copy and zero allocation.
+  // - Otherwise, if `data_source` is available, fetches the DataSegment
+  //   covering `[offset + rel_offset, offset + rel_offset + len)`. If a single
+  //   DataSegment covers the entire range, pins the segment in
+  //   `pinned_segments` and sets `*out_ptr` directly into the segment buffer
+  //   (zero copy). If the range spans multiple segments and `scratch` is
+  //   non-null, copies the requested slice into `*scratch`.
+  bool ReadView(size_t rel_offset, size_t len, const uint8_t** out_ptr,
+                std::vector<uint8_t>* scratch = nullptr) const;
 };
 
 }  // namespace motion_photo

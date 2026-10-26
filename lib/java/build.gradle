@@ -29,7 +29,10 @@ sourceSets {
         }
         proto {
             srcDir file('../core/motion_photo/proto')
+            srcDir file('../core/plugins/honor_live_photo')
             srcDir file('../core/plugins/legacy_micro_video')
+            srcDir file('../core/plugins/oplus_olive')
+            srcDir file('../core/plugins/samsung_sef')
         }
     }
 }

@@ -75,3 +75,15 @@ jobs:
       - name: Run Unit Tests
         run: |
           ./test.sh
+
+      - name: Build and Test without libheif (Android / libheif-free mode)
+        if: runner.os == 'Linux' && matrix.deps_mode == 'system'
+        run: |
+          rm -rf build
+          ./build.sh -DLIBMOTIONPHOTO_USE_SYSTEM_DEPS=ON -DLIBMOTIONPHOTO_ENABLE_LIBHEIF=OFF
+          ./test.sh
+
+      - name: Run Android Gradle Unit Tests (Robolectric SDK 34 + AIDL Services + JNI)
+        if: runner.os == 'Linux' && matrix.deps_mode == 'system'
+        run: |
+          gradle -p samples/android :libmotionphoto:testDebugUnitTest :app:testDebugUnitTest --info

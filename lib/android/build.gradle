@@ -82,9 +82,37 @@ android {
             useLegacyPackaging = true
         }
     }
+
+    testOptions {
+        unitTests {
+            includeAndroidResources = true
+            all {
+                jvmArgs '--add-opens=java.base/java.io=ALL-UNNAMED',
+                        '--add-opens=java.base/java.lang=ALL-UNNAMED',
+                        '--add-opens=java.base/java.util=ALL-UNNAMED',
+                        '--add-opens=java.base/java.net=ALL-UNNAMED'
+                def jniBuildDir = new File(rootDir, "../../build/lib/core").absolutePath
+                def rootBuildDir = new File(rootDir, "../../build").absolutePath
+                systemProperty "java.library.path",
+                    jniBuildDir + File.pathSeparator +
+                    rootBuildDir + File.pathSeparator +
+                    System.getProperty("java.library.path", "")
+            }
+        }
+    }
 }
 
 dependencies {
     api project(':lib:java')
+    api 'com.google.protobuf:protobuf-javalite:3.25.1'
     implementation 'androidx.annotation:annotation:1.7.1'
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.robolectric:robolectric:4.12.2'
+    testImplementation 'org.ow2.asm:asm:9.8'
+    testImplementation 'org.ow2.asm:asm-commons:9.8'
+    testImplementation 'org.ow2.asm:asm-tree:9.8'
+    testImplementation 'org.ow2.asm:asm-util:9.8'
+    testImplementation 'org.ow2.asm:asm-analysis:9.8'
+    testImplementation 'androidx.test:core:1.5.0'
+    testImplementation 'androidx.test.ext:junit:1.1.5'
 }

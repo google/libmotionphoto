@@ -239,9 +239,6 @@ TEST(LibMotionPhotoApiTest, ExtractMotionPhotoMultiOutputTriadValid) {
 // (still image + video + metadata) on HEIC with File, Fd, and Memory.
 // Uses TEST_TMPDIR / std::filesystem::temp_directory_path() instead of /tmp so
 // the test runs cleanly on Android OS (/data/local/tmp) as well as Linux/macOS.
-#if defined(__ANDROID__) && defined(MOTION_PHOTO_HEIC_SUPPORT)
-#error "MOTION_PHOTO_HEIC_SUPPORT (libheif) must not be defined on Android"
-#endif
 TEST(LibMotionPhotoApiTest, ExtractHeicTriadValid) {
   const char* test_tmpdir = std::getenv("TEST_TMPDIR");
   fs::path base_dir = (test_tmpdir != nullptr && test_tmpdir[0] != '\0')

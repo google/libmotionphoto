@@ -41,7 +41,7 @@ jobs:
         if: runner.os == 'Linux' && matrix.deps_mode == 'system'
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake build-essential libprotobuf-dev protobuf-compiler libabsl-dev libheif-dev pkg-config
+          sudo apt-get install -y cmake build-essential libprotobuf-dev protobuf-compiler libabsl-dev pkg-config
 
       - name: Install dependencies (Ubuntu - fetchcontent mode)
         if: runner.os == 'Linux' && matrix.deps_mode == 'fetchcontent'
@@ -53,7 +53,7 @@ jobs:
         if: runner.os == 'macOS' && matrix.deps_mode == 'system'
         run: |
           brew update
-          brew install cmake protobuf abseil libheif pkg-config
+          brew install cmake protobuf abseil pkg-config
 
       - name: Install dependencies (macOS - fetchcontent mode)
         if: runner.os == 'macOS' && matrix.deps_mode == 'fetchcontent'
@@ -75,3 +75,17 @@ jobs:
       - name: Run Unit Tests
         run: |
           ./test.sh
+
+      - name: Run Android Gradle Unit Tests (Robolectric SDK 34 + AIDL Services + JNI)
+        if: runner.os == 'Linux' && matrix.deps_mode == 'system'
+        env:
+          # The runner's preinstalled Gradle (9.x) is incompatible with AGP 8.2
+          # and rejects the implicit ':lib' parent of ':lib:java'; pin 8.14.4.
+          GRADLE_VERSION: 8.14.4
+          GRADLE_SHA256: f1771298a70f6db5a29daf62378c4e18a17fc33c9ba6b14362e0cdf40610380d
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/gradle.zip" "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip"
+          echo "${GRADLE_SHA256}  $RUNNER_TEMP/gradle.zip" | sha256sum -c -
+          unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP"
+          JAVA_HOME="$JAVA_HOME_21_X64" "$RUNNER_TEMP/gradle-${GRADLE_VERSION}/bin/gradle" \
+            -p samples/android :libmotionphoto:testDebugUnitTest :app:testDebugUnitTest

@@ -39,7 +39,7 @@ if (NOT TARGET absl::strings)
   FetchContent_Declare(
     abseil_cpp
     GIT_REPOSITORY https://github.com/abseil/abseil-cpp.git
-    GIT_TAG 20240116.2
+    GIT_TAG 20250512.1
     GIT_SHALLOW TRUE
   )
   set(ABSL_PROPAGATE_CXX_STANDARD ON CACHE BOOL "" FORCE)
@@ -61,10 +61,6 @@ if (NOT TARGET protobuf::protoc AND PROTOC_BINARY)
   set_target_properties(protobuf::protoc PROPERTIES
     IMPORTED_LOCATION "${PROTOC_BINARY}"
   )
-endif()
-
-if (LIBHEIF_FOUND)
-  add_compile_definitions(MOTION_PHOTO_HEIC_SUPPORT=1)
 endif()
 
 include_directories(. third_party/image_io/includes ${PROTOBUF_INCLUDE_DIRS} ${CMAKE_CURRENT_BINARY_DIR})
@@ -138,12 +134,12 @@ target_link_libraries(motion_photo_jpeg PUBLIC motion_photo image_io_base image_
 
 file(GLOB MOTION_PHOTO_HEIF_SOURCES "motion_photo/src/motion_photo_heif/*.cc")
 add_library(motion_photo_heif ${MOTION_PHOTO_HEIF_SOURCES})
-target_include_directories(motion_photo_heif PUBLIC . third_party/image_io/includes motion_photo/includes ${LIBHEIF_INCLUDE_DIRS})
-target_link_libraries(motion_photo_heif PUBLIC motion_photo image_io_base image_io_iso image_io_utils PRIVATE heif)
+target_include_directories(motion_photo_heif PUBLIC . third_party/image_io/includes motion_photo/includes)
+target_link_libraries(motion_photo_heif PUBLIC motion_photo image_io_base image_io_iso image_io_utils)
 
 file(GLOB MOTION_PHOTO_COMMON_SOURCES "motion_photo/src/motion_photo_checker_extractor_common/*.cc")
 add_library(motion_photo_checker_extractor_common ${MOTION_PHOTO_COMMON_SOURCES})
-target_include_directories(motion_photo_checker_extractor_common PUBLIC . motion_photo/src third_party/image_io/includes motion_photo/includes ${LIBHEIF_INCLUDE_DIRS} ${MP4V2_INCLUDE_DIRS})
+target_include_directories(motion_photo_checker_extractor_common PUBLIC . motion_photo/src third_party/image_io/includes motion_photo/includes ${MP4V2_INCLUDE_DIRS})
 target_link_libraries(motion_photo_checker_extractor_common PUBLIC motion_photo motion_photo_jpeg motion_photo_heif motion_photo_mp4 image_io_base image_io_utils)
 
 # Builder Library
@@ -175,7 +171,6 @@ target_include_directories(motion_photo_api
         includes
         motion_photo/includes
         third_party/image_io/includes
-        ${LIBHEIF_INCLUDE_DIRS}
         ${MP4V2_INCLUDE_DIRS}
 )
 target_link_libraries(motion_photo_api
@@ -215,6 +210,7 @@ if (NOT ANDROID)
     motion_photo/tests/motion_photo_extractor_test.cc
     motion_photo/tests/mp4_box_reader_test.cc
     motion_photo/tests/heif_container_splitter_test.cc
+    motion_photo/tests/heif_iso_meta_editor_test.cc
     motion_photo/tests/libmotionphoto_api_test.cc
   )
   target_include_directories(motion_photo_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/.. motion_photo/includes ${CMAKE_CURRENT_BINARY_DIR})

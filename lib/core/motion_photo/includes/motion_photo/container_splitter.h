@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 
+#include "image_io/base/data_range.h"
 #include "motion_photo/metadata_block.h"
 #include "motion_photo/motion_photo.h"
 
@@ -46,6 +47,13 @@ std::unique_ptr<ContainerSplitter> CreateJpegContainerSplitter(
 // libheif. It emits the primary image's XMP item as a "standard.xmp" block, and
 // only when the file also has a top-level 'mpvd' (motion photo video) box.
 std::unique_ptr<ContainerSplitter> CreateHeifContainerSplitter();
+
+// Locates the primary image's XMP DataRange in a HEIF (HEIC/AVIF) container
+// directly from ISO BMFF 'meta' ('pitm', 'iinf', 'iref', 'iloc', 'idat') boxes
+// without requiring libheif. Returns an invalid DataRange if no primary XMP
+// item is found.
+image_io::DataRange FindHeifPrimaryXmpRange(image_io::DataSource* data_source,
+                                            size_t file_size);
 
 }  // namespace motion_photo
 }  // namespace libmotionphoto

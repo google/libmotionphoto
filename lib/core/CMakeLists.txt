@@ -139,7 +139,10 @@ target_link_libraries(motion_photo_jpeg PUBLIC motion_photo image_io_base image_
 file(GLOB MOTION_PHOTO_HEIF_SOURCES "motion_photo/src/motion_photo_heif/*.cc")
 add_library(motion_photo_heif ${MOTION_PHOTO_HEIF_SOURCES})
 target_include_directories(motion_photo_heif PUBLIC . third_party/image_io/includes motion_photo/includes ${LIBHEIF_INCLUDE_DIRS})
-target_link_libraries(motion_photo_heif PUBLIC motion_photo image_io_base image_io_iso image_io_utils PRIVATE heif)
+target_link_libraries(motion_photo_heif PUBLIC motion_photo image_io_base image_io_iso image_io_utils)
+if (LIBHEIF_FOUND)
+  target_link_libraries(motion_photo_heif PRIVATE heif)
+endif()
 
 file(GLOB MOTION_PHOTO_COMMON_SOURCES "motion_photo/src/motion_photo_checker_extractor_common/*.cc")
 add_library(motion_photo_checker_extractor_common ${MOTION_PHOTO_COMMON_SOURCES})

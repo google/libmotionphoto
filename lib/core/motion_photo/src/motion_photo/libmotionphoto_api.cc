@@ -42,10 +42,12 @@
 #include "image_io/utils/string_outputter.h"
 #include "image_io/utils/string_outputter_message_writer.h"
 #include "motion_photo/camera_metadata.h"
+#include "motion_photo/container_splitter.h"
 #include "motion_photo/metadata_engine.h"
 #include "motion_photo/motion_photo.h"
 #include "motion_photo/motion_photo_parser.h"
 #include "motion_photo/motion_photo_utils.h"
+#include "motion_photo/mpvd_box.h"
 #include "motion_photo_builder/function.h"
 #include "motion_photo_checker/function.h"
 #include "motion_photo_extractor/function.h"
@@ -620,18 +622,40 @@ bool ExtractPrimaryImageFromFile(const std::string& input_filepath,
 bool ExtractPrimaryImageFromFd(int fd, int64_t offset, int64_t length,
                                const std::string& output_image_path,
                                MessageCallback callback) {
-  if (fd < 0 || length <= 0 || output_image_path.empty()) return false;
+  if (fd < 0 || offset < 0 || length <= 0 || output_image_path.empty()) {
+    return false;
+  }
   MotionPhotoMetadata metadata;
   if (!ParseMotionPhotoFromFd(fd, offset, length, &metadata, callback) ||
       !metadata.is_motion_photo) {
     return false;
   }
   int64_t image_length = length - metadata.video_length;
+  char header_buf[12];
+  ssize_t header_read = pread(fd, header_buf, sizeof(header_buf), offset);
+  if (header_read >= 12 && header_buf[4] == 'f' && header_buf[5] == 't' &&
+      header_buf[6] == 'y' && header_buf[7] == 'p') {
+    FdDataSource data_source(fd, offset, length, /*owns_fd=*/false);
+    ::libmotionphoto::motion_photo::MpvdBox mpvd_box;
+    ::libmotionphoto::motion_photo::MpvdBoxScanReceiver receiver(mpvd_box);
+    ::libmotionphoto::motion_photo::MpvdBox::Scan(&data_source, 0, receiver);
+    if (!mpvd_box.IsValid() || mpvd_box.GetStartIndex() == 0) {
+      return false;
+    }
+    image_length = static_cast<int64_t>(mpvd_box.GetStartIndex());
+  }
   if (image_length <= 0 || image_length > length) return false;
   std::vector<uint8_t> buffer(image_length);
-  if (lseek(fd, offset, SEEK_SET) < 0) return false;
-  ssize_t bytes_read = read(fd, buffer.data(), image_length);
-  if (bytes_read != static_cast<ssize_t>(image_length)) return false;
+  size_t total_read = 0;
+  while (total_read < static_cast<size_t>(image_length)) {
+    ssize_t bytes =
+        pread(fd, buffer.data() + total_read,
+              static_cast<size_t>(image_length) - total_read,
+              offset + static_cast<int64_t>(total_read));
+    if (bytes <= 0) break;
+    total_read += static_cast<size_t>(bytes);
+  }
+  if (total_read != static_cast<size_t>(image_length)) return false;
   return WriteBufferToFile(output_image_path, buffer.data(), image_length);
 }
 
@@ -645,6 +669,22 @@ bool ExtractPrimaryImageFromMemory(const uint8_t* data, size_t size,
     return false;
   }
   size_t image_length = size - metadata.video_length;
+  if (size >= 12 && data[4] == 'f' && data[5] == 't' && data[6] == 'y' &&
+      data[7] == 'p') {
+    auto data_segment = ::photos_editing_formats::image_io::DataSegment::Create(
+        ::photos_editing_formats::image_io::DataRange(0, size), data,
+        ::photos_editing_formats::image_io::DataSegment::
+            BufferDispositionPolicy::kDontDelete);
+    ::photos_editing_formats::image_io::DataSegmentDataSource data_source(
+        data_segment);
+    ::libmotionphoto::motion_photo::MpvdBox mpvd_box;
+    ::libmotionphoto::motion_photo::MpvdBoxScanReceiver receiver(mpvd_box);
+    ::libmotionphoto::motion_photo::MpvdBox::Scan(&data_source, 0, receiver);
+    if (!mpvd_box.IsValid() || mpvd_box.GetStartIndex() == 0) {
+      return false;
+    }
+    image_length = mpvd_box.GetStartIndex();
+  }
   if (image_length == 0 || image_length > size) return false;
   return WriteBufferToFile(output_image_path, data, image_length);
 }
@@ -668,19 +708,47 @@ bool ExtractVideoTrackFromFile(const std::string& input_filepath,
 bool ExtractVideoTrackFromFd(int fd, int64_t offset, int64_t length,
                              const std::string& output_video_path,
                              MessageCallback callback) {
-  if (fd < 0 || length <= 0 || output_video_path.empty()) return false;
+  if (fd < 0 || offset < 0 || length <= 0 || output_video_path.empty()) {
+    return false;
+  }
   MotionPhotoMetadata metadata;
   if (!ParseMotionPhotoFromFd(fd, offset, length, &metadata, callback) ||
       !metadata.is_motion_photo || metadata.video_length <= 0) {
     return false;
   }
   int64_t video_offset = length - metadata.video_length;
-  if (video_offset < 0 || video_offset + metadata.video_length > length) return false;
-  std::vector<uint8_t> buffer(metadata.video_length);
-  if (lseek(fd, offset + video_offset, SEEK_SET) < 0) return false;
-  ssize_t bytes_read = read(fd, buffer.data(), metadata.video_length);
-  if (bytes_read != static_cast<ssize_t>(metadata.video_length)) return false;
-  if (!WriteBufferToFile(output_video_path, buffer.data(), metadata.video_length)) {
+  int64_t video_length = metadata.video_length;
+  char header_buf[12];
+  ssize_t header_read = pread(fd, header_buf, sizeof(header_buf), offset);
+  if (header_read >= 12 && header_buf[4] == 'f' && header_buf[5] == 't' &&
+      header_buf[6] == 'y' && header_buf[7] == 'p') {
+    FdDataSource data_source(fd, offset, length, /*owns_fd=*/false);
+    ::libmotionphoto::motion_photo::MpvdBox mpvd_box;
+    ::libmotionphoto::motion_photo::MpvdBoxScanReceiver receiver(mpvd_box);
+    ::libmotionphoto::motion_photo::MpvdBox::Scan(&data_source, 0, receiver);
+    if (!mpvd_box.IsValid() || mpvd_box.GetVideoLength() == 0) {
+      return false;
+    }
+    video_offset = static_cast<int64_t>(mpvd_box.GetStartIndex() +
+                                        mpvd_box.GetHeaderLength());
+    video_length = static_cast<int64_t>(mpvd_box.GetVideoLength());
+  }
+  if (video_offset < 0 || video_length <= 0 ||
+      video_offset + video_length > length) {
+    return false;
+  }
+  std::vector<uint8_t> buffer(video_length);
+  size_t total_read = 0;
+  while (total_read < static_cast<size_t>(video_length)) {
+    ssize_t bytes =
+        pread(fd, buffer.data() + total_read,
+              static_cast<size_t>(video_length) - total_read,
+              offset + video_offset + static_cast<int64_t>(total_read));
+    if (bytes <= 0) break;
+    total_read += static_cast<size_t>(bytes);
+  }
+  if (total_read != static_cast<size_t>(video_length)) return false;
+  if (!WriteBufferToFile(output_video_path, buffer.data(), video_length)) {
     return false;
   }
   ::photos_editing_formats::image_io::MessageHandler message_handler;
@@ -699,8 +767,30 @@ bool ExtractVideoTrackFromMemory(const uint8_t* data, size_t size,
     return false;
   }
   size_t video_offset = size - metadata.video_length;
-  if (video_offset >= size) return false;
-  if (!WriteBufferToFile(output_video_path, data + video_offset, metadata.video_length)) {
+  size_t video_length = static_cast<size_t>(metadata.video_length);
+  if (size >= 12 && data[4] == 'f' && data[5] == 't' && data[6] == 'y' &&
+      data[7] == 'p') {
+    auto data_segment = ::photos_editing_formats::image_io::DataSegment::Create(
+        ::photos_editing_formats::image_io::DataRange(0, size), data,
+        ::photos_editing_formats::image_io::DataSegment::
+            BufferDispositionPolicy::kDontDelete);
+    ::photos_editing_formats::image_io::DataSegmentDataSource data_source(
+        data_segment);
+    ::libmotionphoto::motion_photo::MpvdBox mpvd_box;
+    ::libmotionphoto::motion_photo::MpvdBoxScanReceiver receiver(mpvd_box);
+    ::libmotionphoto::motion_photo::MpvdBox::Scan(&data_source, 0, receiver);
+    if (!mpvd_box.IsValid() || mpvd_box.GetVideoLength() == 0) {
+      return false;
+    }
+    video_offset = mpvd_box.GetStartIndex() + mpvd_box.GetHeaderLength();
+    video_length = mpvd_box.GetVideoLength();
+  }
+  if (video_offset >= size || video_length == 0 ||
+      video_length > size - video_offset) {
+    return false;
+  }
+  if (!WriteBufferToFile(output_video_path, data + video_offset,
+                         video_length)) {
     return false;
   }
   ::photos_editing_formats::image_io::MessageHandler message_handler;
@@ -726,12 +816,51 @@ bool ExtractMotionPhotoFromFile(const ExtractorParams& params,
 bool ExtractMotionPhotoFromFd(int fd, int64_t offset, int64_t length,
                               const ExtractorParams& params,
                               MessageCallback callback) {
+  if (fd < 0 || offset < 0 || length <= 0) {
+    return false;
+  }
+  if (params.primary_image_output_path.empty() &&
+      params.video_output_path.empty() &&
+      params.metadata_output_path.empty()) {
+    return false;
+  }
   bool success = true;
   if (!params.primary_image_output_path.empty()) {
-    success = success && ExtractPrimaryImageFromFd(fd, offset, length, params.primary_image_output_path, callback);
+    success = success &&
+              ExtractPrimaryImageFromFd(
+                  fd, offset, length, params.primary_image_output_path, callback);
   }
   if (!params.video_output_path.empty()) {
-    success = success && ExtractVideoTrackFromFd(fd, offset, length, params.video_output_path, callback);
+    success = success &&
+              ExtractVideoTrackFromFd(fd, offset, length,
+                                      params.video_output_path, callback);
+  }
+  if (success && !params.metadata_output_path.empty()) {
+    ::photos_editing_formats::image_io::MessageHandler message_handler;
+    ::libmotionphoto::motion_photo::MetadataEngine engine(&message_handler);
+    ::libmotionphoto::motion_photo::FileType file_type =
+        ::libmotionphoto::motion_photo::FileType::kJpeg;
+    char header_buf[12];
+    ssize_t header_read = pread(fd, header_buf, sizeof(header_buf), offset);
+    if (header_read >= 12 && header_buf[4] == 'f' && header_buf[5] == 't' &&
+        header_buf[6] == 'y' && header_buf[7] == 'p') {
+      file_type = ::libmotionphoto::motion_photo::FileType::kHeic;
+    }
+    FdDataSource data_source(fd, offset, length, /*owns_fd=*/false);
+    ::libmotionphoto::motion_photo::MetadataCollection collection =
+        engine.Parse(&data_source, length, file_type);
+    bool wrote_meta = false;
+    for (const auto& block : collection.blocks()) {
+      if (block.type() == ::libmotionphoto::motion_photo::BLOCK_TYPE_XMP &&
+          !block.raw_bytes().empty()) {
+        wrote_meta = WriteBufferToFile(
+            params.metadata_output_path,
+            reinterpret_cast<const uint8_t*>(block.raw_bytes().data()),
+            block.raw_bytes().size());
+        break;
+      }
+    }
+    success = success && wrote_meta;
   }
   return success;
 }
@@ -739,12 +868,53 @@ bool ExtractMotionPhotoFromFd(int fd, int64_t offset, int64_t length,
 bool ExtractMotionPhotoFromMemory(const uint8_t* data, size_t size,
                                   const ExtractorParams& params,
                                   MessageCallback callback) {
+  if (data == nullptr || size == 0) {
+    return false;
+  }
+  if (params.primary_image_output_path.empty() &&
+      params.video_output_path.empty() &&
+      params.metadata_output_path.empty()) {
+    return false;
+  }
   bool success = true;
   if (!params.primary_image_output_path.empty()) {
-    success = success && ExtractPrimaryImageFromMemory(data, size, params.primary_image_output_path, callback);
+    success =
+        success && ExtractPrimaryImageFromMemory(
+                       data, size, params.primary_image_output_path, callback);
   }
   if (!params.video_output_path.empty()) {
-    success = success && ExtractVideoTrackFromMemory(data, size, params.video_output_path, callback);
+    success = success && ExtractVideoTrackFromMemory(
+                             data, size, params.video_output_path, callback);
+  }
+  if (success && !params.metadata_output_path.empty()) {
+    ::photos_editing_formats::image_io::MessageHandler message_handler;
+    ::libmotionphoto::motion_photo::MetadataEngine engine(&message_handler);
+    ::libmotionphoto::motion_photo::FileType file_type =
+        ::libmotionphoto::motion_photo::FileType::kJpeg;
+    if (size >= 12 && data[4] == 'f' && data[5] == 't' && data[6] == 'y' &&
+        data[7] == 'p') {
+      file_type = ::libmotionphoto::motion_photo::FileType::kHeic;
+    }
+    auto data_segment = ::photos_editing_formats::image_io::DataSegment::Create(
+        ::photos_editing_formats::image_io::DataRange(0, size), data,
+        ::photos_editing_formats::image_io::DataSegment::
+            BufferDispositionPolicy::kDontDelete);
+    ::photos_editing_formats::image_io::DataSegmentDataSource data_source(
+        data_segment);
+    ::libmotionphoto::motion_photo::MetadataCollection collection =
+        engine.Parse(&data_source, size, file_type);
+    bool wrote_meta = false;
+    for (const auto& block : collection.blocks()) {
+      if (block.type() == ::libmotionphoto::motion_photo::BLOCK_TYPE_XMP &&
+          !block.raw_bytes().empty()) {
+        wrote_meta = WriteBufferToFile(
+            params.metadata_output_path,
+            reinterpret_cast<const uint8_t*>(block.raw_bytes().data()),
+            block.raw_bytes().size());
+        break;
+      }
+    }
+    success = success && wrote_meta;
   }
   return success;
 }

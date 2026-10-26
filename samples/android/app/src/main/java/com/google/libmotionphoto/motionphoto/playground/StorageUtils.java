@@ -50,6 +50,17 @@ public class StorageUtils {
       String ext = MimeTypeMap.getSingleton().getExtensionFromMimeType(mimeType);
       if (ext != null) {
         suffix = "." + ext;
+      } else if (mimeType.equalsIgnoreCase("image/heic")
+          || mimeType.equalsIgnoreCase("image/heif")) {
+        suffix = ".heic";
+      } else if (mimeType.equalsIgnoreCase("image/avif")) {
+        suffix = ".avif";
+      }
+    } else {
+      String fileName = getFileNameFromUri(context, uri);
+      int lastDot = fileName != null ? fileName.lastIndexOf('.') : -1;
+      if (lastDot != -1 && lastDot < fileName.length() - 1) {
+        suffix = fileName.substring(lastDot).toLowerCase(Locale.US);
       }
     }
     File tempFile = File.createTempFile(prefix, suffix, context.getCacheDir());

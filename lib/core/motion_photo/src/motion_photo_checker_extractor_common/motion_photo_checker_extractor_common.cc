@@ -206,8 +206,7 @@ tuple<size_t, DataRange, MpvdBox> GetImageSizeAndXmpRange(
     if (!info_builder.Build(data_source, data_source_length)) {
       return error_value;
     }
-    MpvdBoxScanReceiver receiver(mpvd_box);
-    MpvdBox::Scan(data_source, 0, receiver);
+    mpvd_box = info_builder.GetMpvdBox();
     primary_xmp_range = info_builder.GetXmpStringRange();
     image_size = mpvd_box.GetStartIndex();
     valid_mpvd_box = mpvd_box.IsValid();
@@ -217,23 +216,13 @@ tuple<size_t, DataRange, MpvdBox> GetImageSizeAndXmpRange(
                                        "No MpvdBox found in input");
       }
     } else if (!primary_image_file_name_output.empty()) {
-      MotionPhotoHeifImageBuilder heif_builder(primary_image_file_name_output,
-                                               message_handler);
-      std::shared_ptr<DataSegment> xmp_segment = data_source->GetDataSegment(
-          primary_xmp_range.GetBegin(), primary_xmp_range.GetLength());
-      if (!xmp_segment) {
-        message_handler->ReportMessage(Message::kValueError,
-                                       "Failed to read XMP metadata segment.");
-        return error_value;
-      }
-      std::string xmp_metadata(
-          reinterpret_cast<const char*>(
-              xmp_segment->GetBuffer(primary_xmp_range.GetBegin())),
-          primary_xmp_range.GetLength());
-      if (!heif_builder.AddImageFileAndMetadata(motion_photo_file_name,
-                                                xmp_metadata)) {
-        message_handler->ReportMessage(Message::kValueError,
-                                       "Failure in writing HEIF image output.");
+      if (!WriteToOutput(motion_photo_file_name,
+                         primary_image_file_name_output, 0,
+                         mpvd_box.GetStartIndex())) {
+        if (message_handler) {
+          message_handler->ReportMessage(Message::kValueError,
+                                         "Failure in writing HEIF image output.");
+        }
       }
     }
   }

@@ -22,6 +22,14 @@ option(LIBMOTIONPHOTO_USE_SYSTEM_DEPS
 option(LIBMOTIONPHOTO_DOWNLOAD_DEPS
     "Automatically download dependencies via FetchContent if not found on system" ON)
 
+if(ANDROID)
+  set(LIBMOTIONPHOTO_ENABLE_LIBHEIF_DEFAULT OFF)
+else()
+  set(LIBMOTIONPHOTO_ENABLE_LIBHEIF_DEFAULT ON)
+endif()
+option(LIBMOTIONPHOTO_ENABLE_LIBHEIF
+    "Enable libheif dependency for HEIF image transcoding"
+    ${LIBMOTIONPHOTO_ENABLE_LIBHEIF_DEFAULT})
 option(USE_SYSTEM_LIBHEIF
     "Use system-installed libheif library if available" ${LIBMOTIONPHOTO_USE_SYSTEM_DEPS})
 option(USE_SYSTEM_MP4V2
@@ -35,6 +43,7 @@ option(USE_SYSTEM_MODP_B64
 set(LIBHEIF_FOUND FALSE)
 set(LIBHEIF_INCLUDE_DIRS "")
 
+if(LIBMOTIONPHOTO_ENABLE_LIBHEIF)
 if(USE_SYSTEM_LIBHEIF)
   # 1. Try CMake config package
   find_package(libheif QUIET CONFIG)
@@ -125,6 +134,7 @@ if(NOT LIBHEIF_FOUND)
   else()
     message(FATAL_ERROR "libheif dependency could not be resolved. Please install libheif-dev or enable LIBMOTIONPHOTO_DOWNLOAD_DEPS.")
   endif()
+endif()
 endif()
 
 # ---------------------------------------------------------------------------

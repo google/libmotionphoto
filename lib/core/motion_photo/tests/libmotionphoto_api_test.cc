@@ -235,6 +235,156 @@ TEST(LibMotionPhotoApiTest, ExtractMotionPhotoMultiOutputTriadValid) {
   fs::remove(params.video_output_path);
 }
 
+// 6b. Test ExtractPrimaryImage, ExtractVideoTrack, and ExtractMotionPhoto
+// (still image + video + metadata) on HEIC with File, Fd, and Memory.
+TEST(LibMotionPhotoApiTest, ExtractHeicTriadValid) {
+  std::string input_path =
+      "lib/core/motion_photo/testdata/motion_photo_single_video_track.MP.heic";
+  size_t file_size = fs::file_size(input_path);
+  std::ifstream infile(input_path, std::ios::binary);
+  std::vector<uint8_t> buffer(file_size);
+  ASSERT_TRUE(infile.read(reinterpret_cast<char*>(buffer.data()), file_size));
+
+  // 1. ExtractPrimaryImage (File / Fd / Memory)
+  std::string img_file = "/tmp/extracted_heic_primary_file.heic";
+  std::string img_fd = "/tmp/extracted_heic_primary_fd.heic";
+  std::string img_mem = "/tmp/extracted_heic_primary_mem.heic";
+  if (fs::exists(img_file)) fs::remove(img_file);
+  if (fs::exists(img_fd)) fs::remove(img_fd);
+  if (fs::exists(img_mem)) fs::remove(img_mem);
+
+  EXPECT_TRUE(ExtractPrimaryImageFromFile(input_path, img_file));
+  int fd = open(input_path.c_str(), O_RDONLY);
+  ASSERT_TRUE(fd >= 0);
+  EXPECT_TRUE(ExtractPrimaryImageFromFd(fd, 0, file_size, img_fd));
+  close(fd);
+  EXPECT_TRUE(ExtractPrimaryImageFromMemory(buffer.data(), buffer.size(), img_mem));
+
+  ASSERT_TRUE(fs::exists(img_file));
+  ASSERT_TRUE(fs::exists(img_fd));
+  ASSERT_TRUE(fs::exists(img_mem));
+  // All three paths must produce the exact same primary .heic byte size
+  // (without leaving the 8-byte 'mpvd' box header attached).
+  EXPECT_TRUE(fs::file_size(img_file) > 0u);
+  EXPECT_EQ(fs::file_size(img_file), fs::file_size(img_fd));
+  EXPECT_EQ(fs::file_size(img_file), fs::file_size(img_mem));
+  // Extracted still image from File has MotionPhoto XMP stripped and no mpvd box.
+  EXPECT_FALSE(ParseMotionPhotoFromFile(img_file, nullptr));
+  EXPECT_FALSE(ParseMotionPhotoFromFile(img_fd, nullptr));
+  EXPECT_FALSE(ParseMotionPhotoFromFile(img_mem, nullptr));
+  fs::remove(img_file);
+  fs::remove(img_fd);
+  fs::remove(img_mem);
+
+  // 2. ExtractVideoTrack (File / Fd / Memory)
+  std::string vid_file = "/tmp/extracted_heic_video_file.mp4";
+  std::string vid_fd = "/tmp/extracted_heic_video_fd.mp4";
+  std::string vid_mem = "/tmp/extracted_heic_video_mem.mp4";
+  if (fs::exists(vid_file)) fs::remove(vid_file);
+  if (fs::exists(vid_fd)) fs::remove(vid_fd);
+  if (fs::exists(vid_mem)) fs::remove(vid_mem);
+
+  EXPECT_TRUE(ExtractVideoTrackFromFile(input_path, vid_file));
+  fd = open(input_path.c_str(), O_RDONLY);
+  ASSERT_TRUE(fd >= 0);
+  EXPECT_TRUE(ExtractVideoTrackFromFd(fd, 0, file_size, vid_fd));
+  close(fd);
+  EXPECT_TRUE(ExtractVideoTrackFromMemory(buffer.data(), buffer.size(), vid_mem));
+
+  ASSERT_TRUE(fs::exists(vid_file));
+  ASSERT_TRUE(fs::exists(vid_fd));
+  ASSERT_TRUE(fs::exists(vid_mem));
+  EXPECT_TRUE(fs::file_size(vid_file) > 0u);
+  EXPECT_TRUE(fs::file_size(vid_fd) > 0u);
+  EXPECT_EQ(fs::file_size(vid_fd), fs::file_size(vid_mem));
+  fs::remove(vid_file);
+  fs::remove(vid_fd);
+  fs::remove(vid_mem);
+
+  // 3. ExtractMotionPhoto (still image + video + metadata) from File / Fd / Memory
+  ExtractorParams params;
+  params.motion_photo_filepath = input_path;
+  params.primary_image_output_path = "/tmp/extracted_heic_multi_img.heic";
+  params.video_output_path = "/tmp/extracted_heic_multi_vid.mp4";
+  params.metadata_output_path = "/tmp/extracted_heic_multi_meta.xml";
+
+  EXPECT_TRUE(ExtractMotionPhotoFromFile(params));
+  EXPECT_TRUE(fs::exists(params.primary_image_output_path));
+  EXPECT_TRUE(fs::exists(params.video_output_path));
+  EXPECT_TRUE(fs::exists(params.metadata_output_path));
+  EXPECT_TRUE(fs::file_size(params.metadata_output_path) > 0u);
+  fs::remove(params.primary_image_output_path);
+  fs::remove(params.video_output_path);
+  fs::remove(params.metadata_output_path);
+
+  fd = open(input_path.c_str(), O_RDONLY);
+  ASSERT_TRUE(fd >= 0);
+  EXPECT_TRUE(ExtractMotionPhotoFromFd(fd, 0, file_size, params));
+  close(fd);
+  EXPECT_TRUE(fs::exists(params.primary_image_output_path));
+  EXPECT_TRUE(fs::exists(params.video_output_path));
+  EXPECT_TRUE(fs::exists(params.metadata_output_path));
+  EXPECT_TRUE(fs::file_size(params.metadata_output_path) > 0u);
+  fs::remove(params.primary_image_output_path);
+  fs::remove(params.video_output_path);
+  fs::remove(params.metadata_output_path);
+
+  EXPECT_TRUE(ExtractMotionPhotoFromMemory(buffer.data(), buffer.size(), params));
+  EXPECT_TRUE(fs::exists(params.primary_image_output_path));
+  EXPECT_TRUE(fs::exists(params.video_output_path));
+  EXPECT_TRUE(fs::exists(params.metadata_output_path));
+  EXPECT_TRUE(fs::file_size(params.metadata_output_path) > 0u);
+  fs::remove(params.primary_image_output_path);
+  fs::remove(params.video_output_path);
+  fs::remove(params.metadata_output_path);
+
+  // 4. Verify HEIC with a trailing vendor box (e.g. 'sefd') after 'mpvd' slices
+  // out the exact primary .heic image and exact .mp4 video without the trailing
+  // box.
+  std::vector<uint8_t> heic_with_trailing = buffer;
+  const uint8_t trailing_sefd_box[16] = {
+      0x00, 0x00, 0x00, 0x10, 's', 'e', 'f', 'd',
+      0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};
+  heic_with_trailing.insert(heic_with_trailing.end(),
+                            std::begin(trailing_sefd_box),
+                            std::end(trailing_sefd_box));
+  std::string trailing_heic_path = "/tmp/heic_with_trailing_box.MP.heic";
+  {
+    std::ofstream out(trailing_heic_path, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(heic_with_trailing.data()),
+              heic_with_trailing.size());
+  }
+  ExtractorParams trailing_params;
+  trailing_params.motion_photo_filepath = trailing_heic_path;
+  trailing_params.primary_image_output_path =
+      "/tmp/extracted_trailing_heic_img.heic";
+  trailing_params.video_output_path = "/tmp/extracted_trailing_heic_vid.mp4";
+  trailing_params.metadata_output_path =
+      "/tmp/extracted_trailing_heic_meta.xml";
+
+  EXPECT_TRUE(ExtractMotionPhotoFromFile(trailing_params));
+  EXPECT_TRUE(fs::exists(trailing_params.primary_image_output_path));
+  EXPECT_TRUE(fs::exists(trailing_params.video_output_path));
+  EXPECT_TRUE(fs::exists(trailing_params.metadata_output_path));
+  // Primary image size must equal the original mpvd start offset (28727 bytes).
+  EXPECT_EQ(fs::file_size(trailing_params.primary_image_output_path), 28727u);
+
+  std::string trailing_mem_vid = "/tmp/extracted_trailing_heic_mem_vid.mp4";
+  EXPECT_TRUE(ExtractVideoTrackFromMemory(heic_with_trailing.data(),
+                                          heic_with_trailing.size(),
+                                          trailing_mem_vid));
+  // Video track from memory must match the extracted video from file
+  // (excluding the 16-byte trailing 'sefd' box and with metadata track stripped).
+  EXPECT_EQ(fs::file_size(trailing_mem_vid),
+            fs::file_size(trailing_params.video_output_path));
+
+  fs::remove(trailing_heic_path);
+  fs::remove(trailing_params.primary_image_output_path);
+  fs::remove(trailing_params.video_output_path);
+  fs::remove(trailing_params.metadata_output_path);
+  fs::remove(trailing_mem_vid);
+}
+
 // 7. Test ExtractAgtm with File, Fd, and Memory
 TEST(LibMotionPhotoApiTest, ExtractAgtmFromFileAndFdValid) {
   std::string file_path = "lib/core/motion_photo/testdata/motion_photo_agtm.MP.jpg";

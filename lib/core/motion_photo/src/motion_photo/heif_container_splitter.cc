@@ -629,5 +629,19 @@ std::unique_ptr<ContainerSplitter> CreateHeifContainerSplitter() {
   return std::make_unique<HeifContainerSplitter>();
 }
 
+image_io::DataRange FindHeifPrimaryXmpRange(image_io::DataSource* data_source,
+                                            size_t file_size) {
+  if (data_source == nullptr || file_size == 0) {
+    return image_io::DataRange();
+  }
+  std::optional<RawMetadataBlock> xmp_block =
+      ExtractPrimaryXmp(data_source, file_size);
+  if (!xmp_block.has_value() || xmp_block->bytes.empty()) {
+    return image_io::DataRange();
+  }
+  return image_io::DataRange(xmp_block->offset,
+                             xmp_block->offset + xmp_block->bytes.size());
+}
+
 }  // namespace motion_photo
 }  // namespace libmotionphoto

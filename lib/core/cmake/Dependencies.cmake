@@ -22,123 +22,13 @@ option(LIBMOTIONPHOTO_USE_SYSTEM_DEPS
 option(LIBMOTIONPHOTO_DOWNLOAD_DEPS
     "Automatically download dependencies via FetchContent if not found on system" ON)
 
-if(ANDROID)
-  set(LIBMOTIONPHOTO_ENABLE_LIBHEIF_DEFAULT OFF)
-else()
-  set(LIBMOTIONPHOTO_ENABLE_LIBHEIF_DEFAULT ON)
-endif()
-option(LIBMOTIONPHOTO_ENABLE_LIBHEIF
-    "Enable libheif dependency for HEIF image transcoding"
-    ${LIBMOTIONPHOTO_ENABLE_LIBHEIF_DEFAULT})
-option(USE_SYSTEM_LIBHEIF
-    "Use system-installed libheif library if available" ${LIBMOTIONPHOTO_USE_SYSTEM_DEPS})
 option(USE_SYSTEM_MP4V2
     "Use system-installed mp4v2 library if available" ${LIBMOTIONPHOTO_USE_SYSTEM_DEPS})
 option(USE_SYSTEM_MODP_B64
     "Use system-installed modp_b64 library if available" ${LIBMOTIONPHOTO_USE_SYSTEM_DEPS})
 
 # ---------------------------------------------------------------------------
-# 1. libheif Dependency Resolution
-# ---------------------------------------------------------------------------
-set(LIBHEIF_FOUND FALSE)
-set(LIBHEIF_INCLUDE_DIRS "")
-
-if(LIBMOTIONPHOTO_ENABLE_LIBHEIF)
-if(USE_SYSTEM_LIBHEIF)
-  # 1. Try CMake config package
-  find_package(libheif QUIET CONFIG)
-  if(libheif_FOUND)
-    message(STATUS "Found system libheif via CMake config: ${libheif_DIR}")
-    set(LIBHEIF_FOUND TRUE)
-    if(NOT TARGET heif)
-      if(TARGET libheif::heif)
-        add_library(heif ALIAS libheif::heif)
-      elseif(TARGET libheif::libheif)
-        add_library(heif ALIAS libheif::libheif)
-      endif()
-    endif()
-  endif()
-
-  # 2. Try PkgConfig
-  if(NOT LIBHEIF_FOUND)
-    find_package(PkgConfig QUIET)
-    if(PKG_CONFIG_FOUND)
-      pkg_check_modules(PC_LIBHEIF QUIET IMPORTED_TARGET libheif)
-      if(PC_LIBHEIF_FOUND)
-        message(STATUS "Found system libheif via pkg-config (${PC_LIBHEIF_VERSION})")
-        set(LIBHEIF_FOUND TRUE)
-        if(NOT TARGET heif)
-          add_library(heif INTERFACE)
-          target_link_libraries(heif INTERFACE PkgConfig::PC_LIBHEIF)
-        endif()
-        set(LIBHEIF_INCLUDE_DIRS ${PC_LIBHEIF_INCLUDE_DIRS})
-      endif()
-    endif()
-  endif()
-
-  # 3. Try standard find_path and find_library
-  if(NOT LIBHEIF_FOUND)
-    find_path(LIBHEIF_SYSTEM_INCLUDE_DIR NAMES libheif/heif.h)
-    find_library(LIBHEIF_SYSTEM_LIBRARY NAMES heif libheif)
-    if(LIBHEIF_SYSTEM_INCLUDE_DIR AND LIBHEIF_SYSTEM_LIBRARY)
-      message(STATUS "Found system libheif library: ${LIBHEIF_SYSTEM_LIBRARY}")
-      set(LIBHEIF_FOUND TRUE)
-      if(NOT TARGET heif)
-        add_library(heif UNKNOWN IMPORTED)
-        set_target_properties(heif PROPERTIES
-          IMPORTED_LOCATION "${LIBHEIF_SYSTEM_LIBRARY}"
-          INTERFACE_INCLUDE_DIRECTORIES "${LIBHEIF_SYSTEM_INCLUDE_DIR}"
-        )
-      endif()
-      set(LIBHEIF_INCLUDE_DIRS ${LIBHEIF_SYSTEM_INCLUDE_DIR})
-    endif()
-  endif()
-endif()
-
-if(NOT LIBHEIF_FOUND)
-  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libheif/CMakeLists.txt")
-    message(STATUS "Using local vendored libheif in third_party/libheif")
-    set(WITH_EXAMPLES OFF CACHE BOOL "Build examples" FORCE)
-    set(BUILD_TESTING OFF CACHE BOOL "Build testing" FORCE)
-    set(WITH_GDK_PIXBUF OFF CACHE BOOL "Build gdk-pixbuf plugin" FORCE)
-    set(BUILD_DOCUMENTATION OFF CACHE BOOL "Build doxygen documentation" FORCE)
-    set(WITH_FUZZERS OFF CACHE BOOL "Build fuzzers" FORCE)
-    add_subdirectory(third_party/libheif)
-    set(LIBHEIF_INCLUDE_DIRS
-        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/libheif/libheif/api
-        ${CMAKE_CURRENT_BINARY_DIR}/third_party/libheif
-        ${CMAKE_CURRENT_BINARY_DIR}/third_party/libheif/libheif
-    )
-  elseif(LIBMOTIONPHOTO_DOWNLOAD_DEPS)
-    message(STATUS "Fetching libheif from upstream (https://github.com/strukturag/libheif.git)...")
-    set(WITH_EXAMPLES OFF CACHE BOOL "Build examples" FORCE)
-    set(BUILD_TESTING OFF CACHE BOOL "Build testing" FORCE)
-    set(WITH_GDK_PIXBUF OFF CACHE BOOL "Build gdk-pixbuf plugin" FORCE)
-    set(BUILD_DOCUMENTATION OFF CACHE BOOL "Build doxygen documentation" FORCE)
-    set(WITH_FUZZERS OFF CACHE BOOL "Build fuzzers" FORCE)
-    FetchContent_Declare(
-      libheif
-      GIT_REPOSITORY https://github.com/strukturag/libheif.git
-      GIT_TAG v1.17.6
-      GIT_SHALLOW TRUE
-    )
-    FetchContent_MakeAvailable(libheif)
-    set(LIBHEIF_FOUND TRUE)
-    set(LIBHEIF_INCLUDE_DIRS
-        ${libheif_SOURCE_DIR}
-        ${libheif_SOURCE_DIR}/libheif
-        ${libheif_SOURCE_DIR}/libheif/api
-        ${libheif_BINARY_DIR}
-        ${libheif_BINARY_DIR}/libheif
-    )
-  else()
-    message(FATAL_ERROR "libheif dependency could not be resolved. Please install libheif-dev or enable LIBMOTIONPHOTO_DOWNLOAD_DEPS.")
-  endif()
-endif()
-endif()
-
-# ---------------------------------------------------------------------------
-# 2. mp4v2 Dependency Resolution
+# 1. mp4v2 Dependency Resolution
 # ---------------------------------------------------------------------------
 set(MP4V2_FOUND FALSE)
 set(MP4V2_INCLUDE_DIRS "")
@@ -308,7 +198,7 @@ with open(src_dir + '/src/rtphint.cpp', 'r+') as f:
 endif()
 
 # ---------------------------------------------------------------------------
-# 3. modp_b64 Dependency Resolution
+# 2. modp_b64 Dependency Resolution
 # ---------------------------------------------------------------------------
 set(MODP_B64_FOUND FALSE)
 set(MODP_B64_INCLUDE_DIRS "")

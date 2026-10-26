@@ -58,6 +58,11 @@ android {
                 srcDirs = ['src/main/aidl']
             }
         }
+        androidTest {
+            assets {
+                srcDirs = ['../core/motion_photo/testdata']
+            }
+        }
     }
 
     externalNativeBuild {
@@ -115,4 +120,8 @@ dependencies {
     testImplementation 'org.ow2.asm:asm-analysis:9.8'
     testImplementation 'androidx.test:core:1.5.0'
     testImplementation 'androidx.test.ext:junit:1.1.5'
+    androidTestImplementation 'junit:junit:4.13.2'
+    androidTestImplementation 'androidx.test:core:1.5.0'
+    androidTestImplementation 'androidx.test:runner:1.5.2'
+    androidTestImplementation 'androidx.test.ext:junit:1.1.5'
 }

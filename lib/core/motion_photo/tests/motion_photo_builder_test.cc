@@ -14,16 +14,8 @@
 
 #include <absl/strings/match.h>
 #include <absl/strings/string_view.h>
-#if defined(MOTION_PHOTO_HEIC_SUPPORT)
-#include <libheif/heif.h>  // IWYU pragma: keep
-#if __has_include(<libheif/heif_decoding.h>)
-#include <libheif/heif_decoding.h>
-#endif
-#if __has_include(<libheif/heif_encoding.h>)
-#include <libheif/heif_encoding.h>
-#endif
-#endif  // defined(MOTION_PHOTO_HEIC_SUPPORT)
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -50,15 +42,6 @@ namespace fs = std::filesystem;
 using std::string;
 
 namespace {
-
-bool HasHevcSupport() {
-#if defined(MOTION_PHOTO_HEIC_SUPPORT)
-  return heif_have_decoder_for_format(heif_compression_HEVC) &&
-         heif_have_encoder_for_format(heif_compression_HEVC);
-#else
-  return false;
-#endif  // defined(MOTION_PHOTO_HEIC_SUPPORT)
-}
 
 string CreateTestDir(const std::string& subdir_name) {
   const char* test_tmpdir = std::getenv("TEST_TMPDIR");
@@ -278,10 +261,6 @@ TEST(MotionPhotoBuilderTest, CLI_HighResMultiTrackBuild) {
 // 5. CLI HEIC Motion Photo Build
 // -----------------------------------------------------------------------------
 TEST(MotionPhotoBuilderTest, CLI_HeicBuild) {
-  if (!HasHevcSupport()) {
-    std::cout << "Skipping CLI_HeicBuild test because HEVC codec is not supported" << std::endl;
-    return;
-  }
   const string kTestDir = CreateTestDir("CLI_HeicBuild");
   const string kPrimaryImageFile = "lib/core/motion_photo/testdata/motion_photo_photo_only.heic";
   const string kPrimaryVideoFile = "lib/core/motion_photo/testdata/motion_photo_video_only.mp4";
@@ -306,6 +285,27 @@ TEST(MotionPhotoBuilderTest, CLI_HeicBuild) {
   EXPECT_EQ(status, 0);
   EXPECT_TRUE(has_zero_errors);
   EXPECT_TRUE(fs::exists(kOutputFile));
+
+  // The HEIF build is lossless: the coded HEVC image item (9304 bytes at
+  // offset 518) and the Exif item (4572 bytes at offset 9822) of the input are
+  // carried over bit-exactly instead of being decoded and re-encoded.
+  auto read_all = [](const string& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::vector<char>(std::istreambuf_iterator<char>(in),
+                             std::istreambuf_iterator<char>());
+  };
+  const std::vector<char> input = read_all(kPrimaryImageFile);
+  const std::vector<char> output = read_all(kOutputFile);
+  ASSERT_TRUE(input.size() == 15399u);
+  for (auto [offset, length] : {std::pair<size_t, size_t>{518, 9304},
+                                std::pair<size_t, size_t>{9822, 4572}}) {
+    auto begin = input.begin() + offset;
+    EXPECT_TRUE(std::search(output.begin(), output.end(), begin,
+                            begin + length) != output.end());
+  }
+  // The result is recognized as a HEIC motion photo and round-trips through
+  // the extractor.
+  EXPECT_EQ(CheckMotionPhoto(kOutputFile, [](absl::string_view) {}), 0);
 
   fs::remove_all(kTestDir);
 }

@@ -39,7 +39,7 @@ if (NOT TARGET absl::strings)
   FetchContent_Declare(
     abseil_cpp
     GIT_REPOSITORY https://github.com/abseil/abseil-cpp.git
-    GIT_TAG 20240116.2
+    GIT_TAG 20250512.1
     GIT_SHALLOW TRUE
   )
   set(ABSL_PROPAGATE_CXX_STANDARD ON CACHE BOOL "" FORCE)
@@ -78,6 +78,7 @@ protobuf_generate(
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/../../samples/android/external/install_arm64-v8a/include
     PROTOS
+        plugins/apple_live_photo/apple_live_photo_metadata.proto
         plugins/honor_live_photo/honor_live_photo_metadata.proto
         plugins/legacy_micro_video/legacy_micro_video_metadata.proto
         plugins/oplus_olive/oplus_olive_metadata.proto
@@ -206,6 +207,7 @@ if (NOT ANDROID)
   # Tests
   add_executable(motion_photo_tests
     motion_photo/tests/test_main.cc
+    plugins/apple_live_photo/apple_live_photo_provider_test.cc
     plugins/honor_live_photo/honor_live_photo_provider_test.cc
     plugins/legacy_micro_video/legacy_micro_video_provider_test.cc
     plugins/oplus_olive/oplus_olive_provider_test.cc

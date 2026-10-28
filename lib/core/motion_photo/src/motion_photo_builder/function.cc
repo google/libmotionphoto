@@ -53,6 +53,7 @@
 #include "motion_photo_jpeg/motion_photo_jpeg_image_builder.h"
 #include "motion_photo_jpeg/motion_photo_jpeg_info_builder.h"
 #include "motion_photo_mp4/motion_photo_mp4_file_builder.h"
+#include "plugins/apple_live_photo/apple_live_photo_provider.h"
 
 namespace libmotionphoto {
 namespace motion_photo {
@@ -533,6 +534,23 @@ int BuildMotionPhotoDirect(const MotionPhotoStreamParams& params,
     }
   }
 
+  // Check if input video is from Apple live photo, which has timestamp
+  if (target_timestamp < 0 && params.primary_video != nullptr) {
+    if (params.primary_video->GetData() != nullptr) {
+      target_timestamp = AppleLivePhotoProvider::ExtractStillImageTimestampUs(
+          params.primary_video->GetData(), params.primary_video->GetSize());
+    } else if (params.primary_video->GetSize() > 0) {
+      std::vector<uint8_t> video_buf(params.primary_video->GetSize());
+      if (params.primary_video->ReadAt(0, video_buf.size(), video_buf.data())) {
+        target_timestamp = AppleLivePhotoProvider::ExtractStillImageTimestampUs(
+            video_buf.data(), video_buf.size());
+      }
+    }
+    if (target_timestamp >= 0) {
+      motion_photo.SetImageTimestamp(target_timestamp);
+    }
+  }
+
   size_t video_size = params.primary_video->GetSize();
   motion_photo.SetVideoLength(video_size);
 
@@ -682,7 +700,7 @@ int BuildMotionPhoto(const MotionPhotoBuilderParams& params,
   }
 
   MessageHandler message_handler;
-  int64_t target_timestamp = -1;
+  int64_t target_timestamp = local_params.presentation_timestamp_us;
   unique_ptr<image_io::MessageWriter> message_writer(
       new StringOutputterMessageWriter(outputter));
   message_handler.SetMessageWriter(std::move(message_writer));
@@ -743,6 +761,15 @@ int BuildMotionPhoto(const MotionPhotoBuilderParams& params,
       stringstream ss;
       GetSummary(motion_photo.GetVideoMetadata(), &ss);
       outputter(ss.str());
+    }
+  }
+
+  if (target_timestamp < 0 && !local_params.primary_video_file_name.empty()) {
+    target_timestamp =
+        AppleLivePhotoProvider::ExtractStillImageTimestampUsFromFile(
+            local_params.primary_video_file_name);
+    if (target_timestamp >= 0) {
+      motion_photo.SetImageTimestamp(target_timestamp);
     }
   }
 

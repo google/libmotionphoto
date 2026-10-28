@@ -475,5 +475,168 @@ TEST(LibMotionPhotoApiTest, LargeTrailerZeroCopyDetectionFromFdAndMemory) {
   EXPECT_EQ(fd_meta.video_length, static_cast<int64_t>(kLargeTrailerSize));
 }
 
+TEST(LibMotionPhotoApiTest, BuildMotionPhotoFromAppleLivePhotoMovExtractsTimestamp) {
+  auto make_box = [](const std::string& type,
+                     const std::vector<uint8_t>& payload) {
+    std::vector<uint8_t> box;
+    uint32_t size = static_cast<uint32_t>(8 + payload.size());
+    box.push_back((size >> 24) & 0xFF);
+    box.push_back((size >> 16) & 0xFF);
+    box.push_back((size >> 8) & 0xFF);
+    box.push_back(size & 0xFF);
+    box.insert(box.end(), type.begin(), type.end());
+    box.insert(box.end(), payload.begin(), payload.end());
+    return box;
+  };
+  auto push_u32 = [](std::vector<uint8_t>* v, uint32_t val) {
+    v->push_back((val >> 24) & 0xFF);
+    v->push_back((val >> 16) & 0xFF);
+    v->push_back((val >> 8) & 0xFF);
+    v->push_back(val & 0xFF);
+  };
+
+  // Construct an Apple Live Photo .mov with still-image-time = 1,400,000 us
+  // (840 ticks @ 600 Hz in edts/elst).
+  std::vector<uint8_t> ftyp_payload = {'q', 't', ' ', ' ', 0,   0,   0,   0,
+                                       'q', 't', ' ', ' ', 0,   0,   0,   0};
+  auto ftyp = make_box("ftyp", ftyp_payload);
+
+  std::vector<uint8_t> mvhd_payload(100, 0);
+  mvhd_payload[14] = 0x02;
+  mvhd_payload[15] = 0x58;  // timescale = 600
+  mvhd_payload[18] = 0x07;
+  mvhd_payload[19] = 0x08;  // duration = 1800
+  mvhd_payload[20] = 0x00;
+  mvhd_payload[21] = 0x01;  // rate = 1.0
+  mvhd_payload[24] = 0x01;  // volume = 1.0
+  mvhd_payload[60] = 0x00;
+  mvhd_payload[61] = 0x01;  // matrix
+  mvhd_payload[76] = 0x00;
+  mvhd_payload[77] = 0x01;
+  mvhd_payload[92] = 0x40;
+  mvhd_payload[99] = 2;     // next_track_ID = 2
+  auto mvhd = make_box("mvhd", mvhd_payload);
+
+  std::vector<uint8_t> elst_payload(8, 0);
+  elst_payload[7] = 2;
+  push_u32(&elst_payload, 840);
+  push_u32(&elst_payload, 0xFFFFFFFF);
+  push_u32(&elst_payload, 0x00010000);
+  push_u32(&elst_payload, 1);
+  push_u32(&elst_payload, 0);
+  push_u32(&elst_payload, 0x00010000);
+  auto edts = make_box("edts", make_box("elst", elst_payload));
+
+  std::string key = "mdta.com.apple.quicktime.still-image-time";
+  std::vector<uint8_t> mebx_payload(8, 0);
+  mebx_payload.insert(mebx_payload.end(), key.begin(), key.end());
+  std::vector<uint8_t> stsd_payload(8, 0);
+  stsd_payload[7] = 1;
+  auto mebx = make_box("mebx", mebx_payload);
+  stsd_payload.insert(stsd_payload.end(), mebx.begin(), mebx.end());
+  auto stsd = make_box("stsd", stsd_payload);
+
+  std::vector<uint8_t> hdlr_payload(24, 0);
+  hdlr_payload[8] = 'm';
+  hdlr_payload[9] = 'e';
+  hdlr_payload[10] = 't';
+  hdlr_payload[11] = 'a';
+  auto hdlr = make_box("hdlr", hdlr_payload);
+
+  std::vector<uint8_t> mdhd_payload(24, 0);
+  mdhd_payload[14] = 0x02;
+  mdhd_payload[15] = 0x58;
+  mdhd_payload[19] = 1;
+  auto mdhd = make_box("mdhd", mdhd_payload);
+
+  auto stbl = make_box("stbl", stsd);
+  auto minf = make_box("minf", stbl);
+  std::vector<uint8_t> mdia_payload;
+  mdia_payload.insert(mdia_payload.end(), mdhd.begin(), mdhd.end());
+  mdia_payload.insert(mdia_payload.end(), hdlr.begin(), hdlr.end());
+  mdia_payload.insert(mdia_payload.end(), minf.begin(), minf.end());
+  auto mdia = make_box("mdia", mdia_payload);
+
+  std::vector<uint8_t> tkhd_payload(84, 0);
+  tkhd_payload[3] = 7;
+  tkhd_payload[15] = 1;
+  tkhd_payload[22] = 0x03;
+  tkhd_payload[23] = 0x49;  // 841
+  auto tkhd = make_box("tkhd", tkhd_payload);
+
+  std::vector<uint8_t> trak_payload;
+  trak_payload.insert(trak_payload.end(), tkhd.begin(), tkhd.end());
+  trak_payload.insert(trak_payload.end(), edts.begin(), edts.end());
+  trak_payload.insert(trak_payload.end(), mdia.begin(), mdia.end());
+  auto trak = make_box("trak", trak_payload);
+
+  std::vector<uint8_t> moov_payload = mvhd;
+  moov_payload.insert(moov_payload.end(), trak.begin(), trak.end());
+  auto moov = make_box("moov", moov_payload);
+
+  std::vector<uint8_t> mov_bytes = ftyp;
+  mov_bytes.insert(mov_bytes.end(), moov.begin(), moov.end());
+
+  std::string image_path =
+      "lib/core/motion_photo/testdata/motion_photo_photo_only.jpg";
+  std::ifstream img_f(image_path, std::ios::binary);
+  std::vector<uint8_t> image_bytes((std::istreambuf_iterator<char>(img_f)),
+                                   std::istreambuf_iterator<char>());
+  ASSERT_FALSE(image_bytes.empty());
+
+  const std::string out_mem_path = "/tmp/apple_live_photo_transcoded_mem.MP.jpg";
+  if (fs::exists(out_mem_path)) fs::remove(out_mem_path);
+  EXPECT_EQ(BuildMotionPhotoFromMemory(
+                image_bytes.data(), image_bytes.size(), mov_bytes.data(),
+                mov_bytes.size(), out_mem_path, /*presentation_timestamp_us=*/-1),
+            0);
+  MotionPhotoMetadata meta_mem;
+  EXPECT_TRUE(ParseMotionPhotoFromFile(out_mem_path, &meta_mem));
+  EXPECT_TRUE(meta_mem.is_motion_photo);
+  EXPECT_EQ(meta_mem.presentation_timestamp_us, 1400000);
+  fs::remove(out_mem_path);
+
+  const std::string in_mov_path = "/tmp/apple_live_photo_input.mov";
+  const std::string out_file_path =
+      "/tmp/apple_live_photo_transcoded_file.MP.jpg";
+  {
+    std::ofstream mov_out(in_mov_path, std::ios::binary);
+    mov_out.write(reinterpret_cast<const char*>(mov_bytes.data()),
+                  mov_bytes.size());
+  }
+  if (fs::exists(out_file_path)) fs::remove(out_file_path);
+  EXPECT_EQ(BuildMotionPhotoFromFile(image_path, in_mov_path, out_file_path,
+                                     /*presentation_timestamp_us=*/-1),
+            0);
+  MotionPhotoMetadata meta_file;
+  EXPECT_TRUE(ParseMotionPhotoFromFile(out_file_path, &meta_file));
+  EXPECT_TRUE(meta_file.is_motion_photo);
+  EXPECT_EQ(meta_file.presentation_timestamp_us, 1400000);
+  fs::remove(in_mov_path);
+  fs::remove(out_file_path);
+
+  // Also verify 3P plugin detection ("apple_live_photo") on a raw JPEG + Apple
+  // .mov trailer without standard Google Motion Photo XMP.
+  std::vector<uint8_t> raw_concat = image_bytes;
+  raw_concat.insert(raw_concat.end(), mov_bytes.begin(), mov_bytes.end());
+  HandlerOptions apple_plugin_opts;
+  apple_plugin_opts.disable_3p_plugins = false;
+  apple_plugin_opts.enabled_3p_plugins = {"apple_live_photo"};
+  MotionPhotoMetadata plugin_meta;
+  EXPECT_TRUE(ParseMotionPhotoFromMemory(
+      raw_concat.data(), raw_concat.size(), &plugin_meta, nullptr,
+      apple_plugin_opts));
+  EXPECT_TRUE(plugin_meta.is_motion_photo);
+  EXPECT_EQ(plugin_meta.video_length, static_cast<int64_t>(mov_bytes.size()));
+
+  HandlerOptions disabled_opts;
+  disabled_opts.disable_3p_plugins = true;
+  MotionPhotoMetadata disabled_meta;
+  EXPECT_FALSE(ParseMotionPhotoFromMemory(
+      raw_concat.data(), raw_concat.size(), &disabled_meta, nullptr,
+      disabled_opts));
+  EXPECT_FALSE(disabled_meta.is_motion_photo);
+}
+
 }  // namespace api
 }  // namespace libmotionphoto

@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "motion_photo/metadata_provider.h"
+#include "plugins/apple_live_photo/apple_live_photo_provider.h"
 #include "plugins/honor_live_photo/honor_live_photo_provider.h"
 #include "plugins/legacy_micro_video/legacy_micro_video_provider.h"
 #include "plugins/oplus_olive/oplus_olive_provider.h"
@@ -52,6 +53,7 @@ MetadataProviderRegistry::Registry() {
           std::make_shared<SamsungSefProvider>(),
           std::make_shared<OplusOliveProvider>(),
           std::make_shared<HonorLivePhotoProvider>(),
+          std::make_shared<AppleLivePhotoProvider>(),
           std::make_shared<LegacyMicroVideoProvider>(),
       };
   return *registry;

@@ -534,6 +534,7 @@ int BuildMotionPhotoDirect(const MotionPhotoStreamParams& params,
     }
   }
 
+  // Check if input video is from Apple live photo, which has timestamp
   if (target_timestamp < 0 && params.primary_video != nullptr) {
     if (params.primary_video->GetData() != nullptr) {
       target_timestamp = AppleLivePhotoProvider::ExtractStillImageTimestampUs(

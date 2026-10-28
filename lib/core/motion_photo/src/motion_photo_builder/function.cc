@@ -827,7 +827,7 @@ int BuildMotionPhoto(const MotionPhotoBuilderParams& params,
   }
 
   MessageHandler message_handler;
-  int64_t target_timestamp = -1;
+  int64_t target_timestamp = local_params.presentation_timestamp_us;
   unique_ptr<image_io::MessageWriter> message_writer(
       new StringOutputterMessageWriter(outputter));
   message_handler.SetMessageWriter(std::move(message_writer));

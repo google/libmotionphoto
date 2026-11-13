@@ -721,7 +721,6 @@ TEST(LibMotionPhotoApiTest, LargeTrailerZeroCopyDetectionFromFdAndMemory) {
   EXPECT_EQ(fd_meta.video_length, static_cast<int64_t>(kLargeTrailerSize));
 }
 
-<<<<<<< HEAD
 TEST(LibMotionPhotoApiTest,
      ExtractPrimaryImageHeic_SingleTrackAndMpvdBeforeMeta) {
   const char* test_tmpdir = std::getenv("TEST_TMPDIR");
@@ -1394,7 +1393,8 @@ TEST(LibMotionPhotoApiTest, LargeFdOverreadXmlLangAndParityRegression) {
   fs::remove_all(test_dir);
 }
 
-TEST(LibMotionPhotoApiTest, BuildMotionPhotoFromAppleLivePhotoMovExtractsTimestamp) {
+TEST(LibMotionPhotoApiTest,
+     BuildMotionPhotoFromAppleLivePhotoMovExtractsTimestamp) {
   auto make_box = [](const std::string& type,
                      const std::vector<uint8_t>& payload) {
     std::vector<uint8_t> box;
@@ -1416,8 +1416,8 @@ TEST(LibMotionPhotoApiTest, BuildMotionPhotoFromAppleLivePhotoMovExtractsTimesta
 
   // Construct an Apple Live Photo .mov with still-image-time = 1,400,000 us
   // (840 ticks @ 600 Hz in edts/elst).
-  std::vector<uint8_t> ftyp_payload = {'q', 't', ' ', ' ', 0,   0,   0,   0,
-                                       'q', 't', ' ', ' ', 0,   0,   0,   0};
+  std::vector<uint8_t> ftyp_payload = {'q', 't', ' ', ' ', 0, 0, 0, 0,
+                                       'q', 't', ' ', ' ', 0, 0, 0, 0};
   auto ftyp = make_box("ftyp", ftyp_payload);
 
   std::vector<uint8_t> mvhd_payload(100, 0);
@@ -1433,7 +1433,7 @@ TEST(LibMotionPhotoApiTest, BuildMotionPhotoFromAppleLivePhotoMovExtractsTimesta
   mvhd_payload[76] = 0x00;
   mvhd_payload[77] = 0x01;
   mvhd_payload[92] = 0x40;
-  mvhd_payload[99] = 2;     // next_track_ID = 2
+  mvhd_payload[99] = 2;  // next_track_ID = 2
   auto mvhd = make_box("mvhd", mvhd_payload);
 
   std::vector<uint8_t> elst_payload(8, 0);
@@ -1503,21 +1503,66 @@ TEST(LibMotionPhotoApiTest, BuildMotionPhotoFromAppleLivePhotoMovExtractsTimesta
                                    std::istreambuf_iterator<char>());
   ASSERT_FALSE(image_bytes.empty());
 
-  const std::string out_mem_path = "/tmp/apple_live_photo_transcoded_mem.MP.jpg";
+  const char* test_tmpdir = std::getenv("TEST_TMPDIR");
+  fs::path base_dir = (test_tmpdir != nullptr && test_tmpdir[0] != '\0')
+                          ? fs::path(test_tmpdir)
+                          : fs::temp_directory_path();
+  fs::path test_dir = base_dir / "AppleLivePhotoApiTest";
+  fs::create_directories(test_dir);
+
+  const std::string out_mem_path =
+      (test_dir / "apple_live_photo_transcoded_mem.MP.jpg").string();
   if (fs::exists(out_mem_path)) fs::remove(out_mem_path);
-  EXPECT_EQ(BuildMotionPhotoFromMemory(
-                image_bytes.data(), image_bytes.size(), mov_bytes.data(),
-                mov_bytes.size(), out_mem_path, /*presentation_timestamp_us=*/-1),
+  EXPECT_EQ(BuildMotionPhotoFromMemory(image_bytes.data(), image_bytes.size(),
+                                       mov_bytes.data(), mov_bytes.size(),
+                                       out_mem_path,
+                                       /*presentation_timestamp_us=*/-1),
             0);
   MotionPhotoMetadata meta_mem;
   EXPECT_TRUE(ParseMotionPhotoFromFile(out_mem_path, &meta_mem));
   EXPECT_TRUE(meta_mem.is_motion_photo);
   EXPECT_EQ(meta_mem.presentation_timestamp_us, 1400000);
+  EXPECT_TRUE(CheckMotionPhotoFile(out_mem_path));
+
+  // Verify existing still-JPEG XMP presentation timestamp (500000) is
+  // preserved rather than overwritten by the Apple .mov timestamp (1400000).
+  const std::string out_preset_xmp_jpg =
+      (test_dir / "built_with_xmp_ts_500000.MP.jpg").string();
+  const std::string still_with_500k_path =
+      (test_dir / "still_with_xmp_ts_500000.jpg").string();
+  const std::string out_preserved_path =
+      (test_dir / "apple_live_photo_preserved_500000.MP.jpg").string();
+  EXPECT_EQ(BuildMotionPhotoFromMemory(image_bytes.data(), image_bytes.size(),
+                                       mov_bytes.data(), mov_bytes.size(),
+                                       out_preset_xmp_jpg,
+                                       /*presentation_timestamp_us=*/500000),
+            0);
+  ASSERT_TRUE(
+      ExtractPrimaryImageFromFile(out_preset_xmp_jpg, still_with_500k_path));
+  std::vector<uint8_t> still_with_500k;
+  {
+    std::ifstream in(still_with_500k_path, std::ios::binary);
+    still_with_500k.assign((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+  }
+  ASSERT_FALSE(still_with_500k.empty());
+  EXPECT_EQ(BuildMotionPhotoFromMemory(still_with_500k.data(),
+                                       still_with_500k.size(), mov_bytes.data(),
+                                       mov_bytes.size(), out_preserved_path,
+                                       /*presentation_timestamp_us=*/-1),
+            0);
+  MotionPhotoMetadata preserved_meta;
+  EXPECT_TRUE(ParseMotionPhotoFromFile(out_preserved_path, &preserved_meta));
+  EXPECT_EQ(preserved_meta.presentation_timestamp_us, 500000);
+  fs::remove(out_preset_xmp_jpg);
+  fs::remove(still_with_500k_path);
+  fs::remove(out_preserved_path);
   fs::remove(out_mem_path);
 
-  const std::string in_mov_path = "/tmp/apple_live_photo_input.mov";
+  const std::string in_mov_path =
+      (test_dir / "apple_live_photo_input.mov").string();
   const std::string out_file_path =
-      "/tmp/apple_live_photo_transcoded_file.MP.jpg";
+      (test_dir / "apple_live_photo_transcoded_file.MP.jpg").string();
   {
     std::ofstream mov_out(in_mov_path, std::ios::binary);
     mov_out.write(reinterpret_cast<const char*>(mov_bytes.data()),
@@ -1531,8 +1576,7 @@ TEST(LibMotionPhotoApiTest, BuildMotionPhotoFromAppleLivePhotoMovExtractsTimesta
   EXPECT_TRUE(ParseMotionPhotoFromFile(out_file_path, &meta_file));
   EXPECT_TRUE(meta_file.is_motion_photo);
   EXPECT_EQ(meta_file.presentation_timestamp_us, 1400000);
-  fs::remove(in_mov_path);
-  fs::remove(out_file_path);
+  fs::remove_all(test_dir);
 
   // Also verify 3P plugin detection ("apple_live_photo") on a raw JPEG + Apple
   // .mov trailer without standard Google Motion Photo XMP.
@@ -1542,18 +1586,18 @@ TEST(LibMotionPhotoApiTest, BuildMotionPhotoFromAppleLivePhotoMovExtractsTimesta
   apple_plugin_opts.disable_3p_plugins = false;
   apple_plugin_opts.enabled_3p_plugins = {"apple_live_photo"};
   MotionPhotoMetadata plugin_meta;
-  EXPECT_TRUE(ParseMotionPhotoFromMemory(
-      raw_concat.data(), raw_concat.size(), &plugin_meta, nullptr,
-      apple_plugin_opts));
+  EXPECT_TRUE(ParseMotionPhotoFromMemory(raw_concat.data(), raw_concat.size(),
+                                         &plugin_meta, nullptr,
+                                         apple_plugin_opts));
   EXPECT_TRUE(plugin_meta.is_motion_photo);
   EXPECT_EQ(plugin_meta.video_length, static_cast<int64_t>(mov_bytes.size()));
 
   HandlerOptions disabled_opts;
   disabled_opts.disable_3p_plugins = true;
   MotionPhotoMetadata disabled_meta;
-  EXPECT_FALSE(ParseMotionPhotoFromMemory(
-      raw_concat.data(), raw_concat.size(), &disabled_meta, nullptr,
-      disabled_opts));
+  EXPECT_FALSE(ParseMotionPhotoFromMemory(raw_concat.data(), raw_concat.size(),
+                                          &disabled_meta, nullptr,
+                                          disabled_opts));
   EXPECT_FALSE(disabled_meta.is_motion_photo);
 }
 

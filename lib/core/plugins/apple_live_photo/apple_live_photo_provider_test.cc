@@ -16,6 +16,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -153,8 +154,7 @@ TEST(AppleLivePhotoProviderTest, IdentifiesAndDecodesEdtsElstAndHeaderlessMov) {
   std::vector<uint8_t> proto_bytes;
   std::string type_url;
   std::string err;
-  EXPECT_TRUE(
-      provider.DecodeToSemantic(block, &proto_bytes, &type_url, &err));
+  EXPECT_TRUE(provider.DecodeToSemantic(block, &proto_bytes, &type_url, &err));
   EXPECT_EQ(
       type_url,
       "type.googleapis.com/libmotionphoto.motion_photo.AppleLivePhotoMetadata");
@@ -183,7 +183,14 @@ TEST(AppleLivePhotoProviderTest, IdentifiesAndDecodesEdtsElstAndHeaderlessMov) {
                 mov_headerless.data(), mov_headerless.size()),
             1333333);
 
-  const std::string tmp_mov = "/tmp/apple_live_photo_provider_test.mov";
+  const char* test_tmpdir = std::getenv("TEST_TMPDIR");
+  fs::path base_dir = (test_tmpdir != nullptr && test_tmpdir[0] != '\0')
+                          ? fs::path(test_tmpdir)
+                          : fs::temp_directory_path();
+  fs::path test_dir = base_dir / "AppleLivePhotoProviderTest";
+  fs::create_directories(test_dir);
+  const std::string tmp_mov =
+      (test_dir / "apple_live_photo_provider_test.mov").string();
   {
     std::ofstream out(tmp_mov, std::ios::binary);
     out.write(reinterpret_cast<const char*>(mov_headerless.data()),
@@ -192,7 +199,7 @@ TEST(AppleLivePhotoProviderTest, IdentifiesAndDecodesEdtsElstAndHeaderlessMov) {
   EXPECT_EQ(
       AppleLivePhotoProvider::ExtractStillImageTimestampUsFromFile(tmp_mov),
       1333333);
-  fs::remove(tmp_mov);
+  fs::remove_all(test_dir);
 }
 
 TEST(AppleLivePhotoProviderTest, RejectsNonAppleMp4AndTruncatedStreams) {
@@ -209,6 +216,341 @@ TEST(AppleLivePhotoProviderTest, RejectsNonAppleMp4AndTruncatedStreams) {
   block.data_view_size = short_buf.size();
   block.total_payload_size = short_buf.size();
   EXPECT_FALSE(provider.Identify(block));
+}
+
+TEST(AppleLivePhotoProviderTest, GuardsLarge64BitDurationOverflow) {
+  // Construct an elst v1 box with a huge empty duration that would overflow
+  // uint64_t * 1000000ULL if not guarded.
+  std::vector<uint8_t> mvhd_payload(24, 0);
+  mvhd_payload[14] = 0x02;
+  mvhd_payload[15] = 0x58;  // timescale = 600
+  auto mvhd = MakeBox("mvhd", mvhd_payload);
+
+  std::string key = "mdta.com.apple.quicktime.still-image-time";
+  std::vector<uint8_t> mebx_payload(8, 0);
+  mebx_payload.insert(mebx_payload.end(), key.begin(), key.end());
+  auto mebx = MakeBox("mebx", mebx_payload);
+  std::vector<uint8_t> stsd_payload(8, 0);
+  stsd_payload[7] = 1;
+  stsd_payload.insert(stsd_payload.end(), mebx.begin(), mebx.end());
+  auto stsd = MakeBox("stsd", stsd_payload);
+
+  std::vector<uint8_t> hdlr_payload(12, 0);
+  hdlr_payload[8] = 'm';
+  hdlr_payload[9] = 'e';
+  hdlr_payload[10] = 't';
+  hdlr_payload[11] = 'a';
+  auto hdlr = MakeBox("hdlr", hdlr_payload);
+
+  std::vector<uint8_t> mdhd_payload(24, 0);
+  mdhd_payload[14] = 0x02;
+  mdhd_payload[15] = 0x58;
+  auto mdhd = MakeBox("mdhd", mdhd_payload);
+
+  std::vector<uint8_t> elst_payload(8, 0);
+  elst_payload[0] = 1;  // version 1
+  elst_payload[7] = 1;  // entry_count = 1
+  // segment_duration = 0xFFFFFFFFFFFFFFFF (would overflow uint64_t * 1e6)
+  PushU32(&elst_payload, 0xFFFFFFFF);
+  PushU32(&elst_payload, 0xFFFFFFFF);
+  // media_time = -1 (64-bit)
+  PushU32(&elst_payload, 0xFFFFFFFF);
+  PushU32(&elst_payload, 0xFFFFFFFF);
+  PushU32(&elst_payload, 0x00010000);
+  auto edts = MakeBox("edts", MakeBox("elst", elst_payload));
+
+  auto stbl = MakeBox("stbl", stsd);
+  auto minf = MakeBox("minf", stbl);
+  std::vector<uint8_t> mdia_payload;
+  mdia_payload.insert(mdia_payload.end(), mdhd.begin(), mdhd.end());
+  mdia_payload.insert(mdia_payload.end(), hdlr.begin(), hdlr.end());
+  mdia_payload.insert(mdia_payload.end(), minf.begin(), minf.end());
+  auto mdia = MakeBox("mdia", mdia_payload);
+
+  std::vector<uint8_t> trak_payload;
+  trak_payload.insert(trak_payload.end(), edts.begin(), edts.end());
+  trak_payload.insert(trak_payload.end(), mdia.begin(), mdia.end());
+  auto trak = MakeBox("trak", trak_payload);
+
+  std::vector<uint8_t> moov_payload = mvhd;
+  moov_payload.insert(moov_payload.end(), trak.begin(), trak.end());
+  auto mov = MakeBox("moov", moov_payload);
+
+  EXPECT_EQ(AppleLivePhotoProvider::ExtractStillImageTimestampUs(mov.data(),
+                                                                 mov.size()),
+            -1);
+}
+
+TEST(AppleLivePhotoProviderTest, GuardsElstUint64AccumulationOverflow) {
+  std::vector<uint8_t> mvhd_payload(24, 0);
+  mvhd_payload[14] = 0x02;
+  mvhd_payload[15] = 0x58;  // timescale = 600
+  auto mvhd = MakeBox("mvhd", mvhd_payload);
+
+  std::string key = "mdta.com.apple.quicktime.still-image-time";
+  std::vector<uint8_t> mebx_payload(8, 0);
+  mebx_payload.insert(mebx_payload.end(), key.begin(), key.end());
+  auto mebx = MakeBox("mebx", mebx_payload);
+  std::vector<uint8_t> stsd_payload(8, 0);
+  stsd_payload[7] = 1;
+  stsd_payload.insert(stsd_payload.end(), mebx.begin(), mebx.end());
+  auto stsd = MakeBox("stsd", stsd_payload);
+
+  std::vector<uint8_t> hdlr_payload(12, 0);
+  hdlr_payload[8] = 'm';
+  hdlr_payload[9] = 'e';
+  hdlr_payload[10] = 't';
+  hdlr_payload[11] = 'a';
+  auto hdlr = MakeBox("hdlr", hdlr_payload);
+
+  std::vector<uint8_t> mdhd_payload(24, 0);
+  mdhd_payload[14] = 0x02;
+  mdhd_payload[15] = 0x58;
+  auto mdhd = MakeBox("mdhd", mdhd_payload);
+
+  std::vector<uint8_t> elst_payload(8, 0);
+  elst_payload[0] = 1;  // version 1
+  elst_payload[7] = 2;  // entry_count = 2
+  // Entry 1: seg_dur = 0xFFFFFFFFFFFFFFFF, media_time = -1
+  PushU32(&elst_payload, 0xFFFFFFFF);
+  PushU32(&elst_payload, 0xFFFFFFFF);
+  PushU32(&elst_payload, 0xFFFFFFFF);
+  PushU32(&elst_payload, 0xFFFFFFFF);
+  PushU32(&elst_payload, 0x00010000);
+  // Entry 2: seg_dur = 841, media_time = -1 (would wraparound if unguarded)
+  PushU32(&elst_payload, 0);
+  PushU32(&elst_payload, 841);
+  PushU32(&elst_payload, 0xFFFFFFFF);
+  PushU32(&elst_payload, 0xFFFFFFFF);
+  PushU32(&elst_payload, 0x00010000);
+  auto edts = MakeBox("edts", MakeBox("elst", elst_payload));
+
+  auto stbl = MakeBox("stbl", stsd);
+  auto minf = MakeBox("minf", stbl);
+  std::vector<uint8_t> mdia_payload;
+  mdia_payload.insert(mdia_payload.end(), mdhd.begin(), mdhd.end());
+  mdia_payload.insert(mdia_payload.end(), hdlr.begin(), hdlr.end());
+  mdia_payload.insert(mdia_payload.end(), minf.begin(), minf.end());
+  auto mdia = MakeBox("mdia", mdia_payload);
+
+  std::vector<uint8_t> trak_payload;
+  trak_payload.insert(trak_payload.end(), edts.begin(), edts.end());
+  trak_payload.insert(trak_payload.end(), mdia.begin(), mdia.end());
+  auto trak = MakeBox("trak", trak_payload);
+
+  std::vector<uint8_t> moov_payload = mvhd;
+  moov_payload.insert(moov_payload.end(), trak.begin(), trak.end());
+  auto mov = MakeBox("moov", moov_payload);
+
+  EXPECT_EQ(AppleLivePhotoProvider::ExtractStillImageTimestampUs(mov.data(),
+                                                                 mov.size()),
+            -1);
+}
+
+TEST(AppleLivePhotoProviderTest, RejectsUnsupportedFullBoxVersion2) {
+  auto build_mov = [](uint8_t mvhd_ver, uint8_t tkhd_ver, uint8_t mdhd_ver,
+                      uint8_t elst_ver) {
+    std::vector<uint8_t> mvhd_payload(28, 0);
+    mvhd_payload[0] = mvhd_ver;
+    mvhd_payload[14] = 0x02;
+    mvhd_payload[15] = 0x58;
+    auto mvhd = MakeBox("mvhd", mvhd_payload);
+
+    std::string key = "mdta.com.apple.quicktime.still-image-time";
+    std::vector<uint8_t> mebx_payload(8, 0);
+    mebx_payload.insert(mebx_payload.end(), key.begin(), key.end());
+    auto mebx = MakeBox("mebx", mebx_payload);
+    std::vector<uint8_t> stsd_payload(8, 0);
+    stsd_payload[7] = 1;
+    stsd_payload.insert(stsd_payload.end(), mebx.begin(), mebx.end());
+    auto stsd = MakeBox("stsd", stsd_payload);
+
+    std::vector<uint8_t> hdlr_payload(12, 0);
+    hdlr_payload[8] = 'm';
+    hdlr_payload[9] = 'e';
+    hdlr_payload[10] = 't';
+    hdlr_payload[11] = 'a';
+    auto hdlr = MakeBox("hdlr", hdlr_payload);
+
+    std::vector<uint8_t> mdhd_payload(28, 0);
+    mdhd_payload[0] = mdhd_ver;
+    mdhd_payload[14] = 0x02;
+    mdhd_payload[15] = 0x58;
+    auto mdhd = MakeBox("mdhd", mdhd_payload);
+
+    std::vector<uint8_t> tkhd_payload(36, 0);
+    tkhd_payload[0] = tkhd_ver;
+    tkhd_payload[22] = 0x03;
+    tkhd_payload[23] = 0x49;  // 841
+    auto tkhd = MakeBox("tkhd", tkhd_payload);
+
+    std::vector<uint8_t> elst_payload(8, 0);
+    elst_payload[0] = elst_ver;
+    elst_payload[7] = 1;
+    PushU32(&elst_payload, 840);
+    PushU32(&elst_payload, 0xFFFFFFFFU);
+    PushU32(&elst_payload, 0x00010000);
+    auto edts = MakeBox("edts", MakeBox("elst", elst_payload));
+
+    auto stbl = MakeBox("stbl", stsd);
+    auto minf = MakeBox("minf", stbl);
+    std::vector<uint8_t> mdia_payload;
+    mdia_payload.insert(mdia_payload.end(), mdhd.begin(), mdhd.end());
+    mdia_payload.insert(mdia_payload.end(), hdlr.begin(), hdlr.end());
+    mdia_payload.insert(mdia_payload.end(), minf.begin(), minf.end());
+    auto mdia = MakeBox("mdia", mdia_payload);
+
+    std::vector<uint8_t> trak_payload;
+    trak_payload.insert(trak_payload.end(), tkhd.begin(), tkhd.end());
+    trak_payload.insert(trak_payload.end(), edts.begin(), edts.end());
+    trak_payload.insert(trak_payload.end(), mdia.begin(), mdia.end());
+    auto trak = MakeBox("trak", trak_payload);
+
+    std::vector<uint8_t> moov_payload = mvhd;
+    moov_payload.insert(moov_payload.end(), trak.begin(), trak.end());
+    return MakeBox("moov", moov_payload);
+  };
+
+  auto bad_mvhd = build_mov(2, 0, 0, 0);
+  EXPECT_EQ(AppleLivePhotoProvider::ExtractStillImageTimestampUs(
+                bad_mvhd.data(), bad_mvhd.size()),
+            -1);
+
+  auto bad_elst_and_tkhd = build_mov(0, 2, 2, 2);
+  EXPECT_EQ(AppleLivePhotoProvider::ExtractStillImageTimestampUs(
+                bad_elst_and_tkhd.data(), bad_elst_and_tkhd.size()),
+            -1);
+}
+
+TEST(AppleLivePhotoProviderTest,
+     RejectsTruncatedSttsAndZeroSampleCountWithoutMaskingTkhd) {
+  std::vector<uint8_t> mvhd_payload(24, 0);
+  mvhd_payload[14] = 0x02;
+  mvhd_payload[15] = 0x58;  // 600
+  auto mvhd = MakeBox("mvhd", mvhd_payload);
+
+  std::string key = "mdta.com.apple.quicktime.still-image-time";
+  std::vector<uint8_t> mebx_payload(8, 0);
+  mebx_payload.insert(mebx_payload.end(), key.begin(), key.end());
+  auto mebx = MakeBox("mebx", mebx_payload);
+  std::vector<uint8_t> stsd_payload(8, 0);
+  stsd_payload[7] = 1;
+  stsd_payload.insert(stsd_payload.end(), mebx.begin(), mebx.end());
+  auto stsd = MakeBox("stsd", stsd_payload);
+
+  std::vector<uint8_t> hdlr_payload(12, 0);
+  hdlr_payload[8] = 'm';
+  hdlr_payload[9] = 'e';
+  hdlr_payload[10] = 't';
+  hdlr_payload[11] = 'a';
+  auto hdlr = MakeBox("hdlr", hdlr_payload);
+
+  std::vector<uint8_t> mdhd_payload(24, 0);
+  mdhd_payload[14] = 0x02;
+  mdhd_payload[15] = 0x58;
+  auto mdhd = MakeBox("mdhd", mdhd_payload);
+
+  // 1. Truncated stts (claims entry_count = 10, only 1 entry present) with no
+  // tkhd
+  {
+    std::vector<uint8_t> stts_payload(8, 0);
+    stts_payload[7] = 10;
+    PushU32(&stts_payload, 1);
+    PushU32(&stts_payload, 420);
+    std::vector<uint8_t> stbl_payload = stsd;
+    auto stts = MakeBox("stts", stts_payload);
+    stbl_payload.insert(stbl_payload.end(), stts.begin(), stts.end());
+    auto stbl = MakeBox("stbl", stbl_payload);
+    auto minf = MakeBox("minf", stbl);
+    std::vector<uint8_t> mdia_payload = mdhd;
+    mdia_payload.insert(mdia_payload.end(), hdlr.begin(), hdlr.end());
+    mdia_payload.insert(mdia_payload.end(), minf.begin(), minf.end());
+    auto trak = MakeBox("trak", MakeBox("mdia", mdia_payload));
+    std::vector<uint8_t> moov_payload = mvhd;
+    moov_payload.insert(moov_payload.end(), trak.begin(), trak.end());
+    auto mov = MakeBox("moov", moov_payload);
+    EXPECT_EQ(AppleLivePhotoProvider::ExtractStillImageTimestampUs(mov.data(),
+                                                                   mov.size()),
+              -1);
+  }
+
+  // 2. stts with sc == 0 alongside valid tkhd_duration == 841 -> falls back to
+  // tkhd (1400000)
+  {
+    std::vector<uint8_t> stts_payload(8, 0);
+    stts_payload[7] = 2;
+    PushU32(&stts_payload, 0);    // sc == 0
+    PushU32(&stts_payload, 420);  // sd
+    PushU32(&stts_payload, 1);
+    PushU32(&stts_payload, 100);
+    std::vector<uint8_t> stbl_payload = stsd;
+    auto stts = MakeBox("stts", stts_payload);
+    stbl_payload.insert(stbl_payload.end(), stts.begin(), stts.end());
+    auto stbl = MakeBox("stbl", stbl_payload);
+    auto minf = MakeBox("minf", stbl);
+    std::vector<uint8_t> mdia_payload = mdhd;
+    mdia_payload.insert(mdia_payload.end(), hdlr.begin(), hdlr.end());
+    mdia_payload.insert(mdia_payload.end(), minf.begin(), minf.end());
+    auto mdia = MakeBox("mdia", mdia_payload);
+
+    std::vector<uint8_t> tkhd_payload(24, 0);
+    tkhd_payload[22] = 0x03;
+    tkhd_payload[23] = 0x49;  // 841 -> (841 - 1) * 1e6 / 600 = 1400000
+    auto tkhd = MakeBox("tkhd", tkhd_payload);
+
+    std::vector<uint8_t> trak_payload = tkhd;
+    trak_payload.insert(trak_payload.end(), mdia.begin(), mdia.end());
+    auto trak = MakeBox("trak", trak_payload);
+    std::vector<uint8_t> moov_payload = mvhd;
+    moov_payload.insert(moov_payload.end(), trak.begin(), trak.end());
+    auto mov = MakeBox("moov", moov_payload);
+    EXPECT_EQ(AppleLivePhotoProvider::ExtractStillImageTimestampUs(mov.data(),
+                                                                   mov.size()),
+              1400000);
+  }
+}
+
+TEST(AppleLivePhotoProviderTest, SupportsTkhdDurationOneAsZeroUs) {
+  std::vector<uint8_t> mvhd_payload(24, 0);
+  mvhd_payload[14] = 0x02;
+  mvhd_payload[15] = 0x58;
+  auto mvhd = MakeBox("mvhd", mvhd_payload);
+
+  std::string key = "mdta.com.apple.quicktime.still-image-time";
+  std::vector<uint8_t> mebx_payload(8, 0);
+  mebx_payload.insert(mebx_payload.end(), key.begin(), key.end());
+  auto mebx = MakeBox("mebx", mebx_payload);
+  std::vector<uint8_t> stsd_payload(8, 0);
+  stsd_payload[7] = 1;
+  stsd_payload.insert(stsd_payload.end(), mebx.begin(), mebx.end());
+  auto stsd = MakeBox("stsd", stsd_payload);
+
+  std::vector<uint8_t> hdlr_payload(12, 0);
+  hdlr_payload[8] = 'm';
+  hdlr_payload[9] = 'e';
+  hdlr_payload[10] = 't';
+  hdlr_payload[11] = 'a';
+  auto hdlr = MakeBox("hdlr", hdlr_payload);
+
+  std::vector<uint8_t> tkhd_payload(24, 0);
+  tkhd_payload[23] = 1;  // duration == 1 -> 0 us
+  auto tkhd = MakeBox("tkhd", tkhd_payload);
+
+  std::vector<uint8_t> mdia_payload = hdlr;
+  auto minf = MakeBox("minf", MakeBox("stbl", stsd));
+  mdia_payload.insert(mdia_payload.end(), minf.begin(), minf.end());
+  std::vector<uint8_t> trak_payload = tkhd;
+  auto mdia = MakeBox("mdia", mdia_payload);
+  trak_payload.insert(trak_payload.end(), mdia.begin(), mdia.end());
+
+  std::vector<uint8_t> moov_payload = mvhd;
+  auto trak = MakeBox("trak", trak_payload);
+  moov_payload.insert(moov_payload.end(), trak.begin(), trak.end());
+  auto mov = MakeBox("moov", moov_payload);
+
+  EXPECT_EQ(AppleLivePhotoProvider::ExtractStillImageTimestampUs(mov.data(),
+                                                                 mov.size()),
+            0);
 }
 
 }  // namespace

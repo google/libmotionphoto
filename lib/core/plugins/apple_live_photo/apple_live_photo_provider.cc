@@ -14,17 +14,22 @@
 
 #include "plugins/apple_live_photo/apple_live_photo_provider.h"
 
-#include <absl/strings/match.h>
-#include <absl/strings/string_view.h>
-
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
+#include "absl/strings/match.h"
+#include "absl/strings/string_view.h"
 #include "apple_live_photo_metadata.pb.h"  // NOLINT
+#include "image_io/base/data_destination.h"
+#include "image_io/base/data_range.h"
+#include "image_io/base/data_segment.h"
+#include "image_io/base/data_source.h"
 #include "motion_photo/metadata_block.h"
 
 namespace libmotionphoto {
@@ -48,7 +53,27 @@ uint64_t ReadBe64(const uint8_t* p) {
 
 bool IsTopLevelIsoBmffTag(absl::string_view tag) {
   return tag == "ftyp" || tag == "wide" || tag == "mdat" || tag == "moov" ||
-         tag == "free" || tag == "skip";
+         tag == "free" || tag == "skip" || tag == "pnot" || tag == "uuid";
+}
+
+int64_t SafeScaleTicksToUs(uint64_t ticks, uint32_t timescale) {
+  if (timescale == 0) {
+    return -1;
+  }
+  const uint64_t whole_seconds = ticks / timescale;
+  const uint64_t max_seconds =
+      static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) / 1000000ULL;
+  if (whole_seconds > max_seconds) {
+    return -1;
+  }
+  const uint64_t rem_ticks = ticks % timescale;
+  const uint64_t rem_us = (rem_ticks * 1000000ULL) / timescale;
+  const uint64_t base_us = whole_seconds * 1000000ULL;
+  if (rem_us >
+      static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) - base_us) {
+    return -1;
+  }
+  return static_cast<int64_t>(base_us + rem_us);
 }
 
 bool NextBox(const uint8_t* data, size_t end, size_t* pos,
@@ -109,7 +134,7 @@ bool ParseMoovPayload(const uint8_t* data, size_t moov_size,
       uint8_t version = data[p_start];
       if (version == 0) {
         movie_timescale = ReadBe32(data + p_start + 12);
-      } else if (p_len >= 24) {
+      } else if (version == 1 && p_len >= 24) {
         movie_timescale = ReadBe32(data + p_start + 20);
       }
     } else if (type == "trak") {
@@ -124,7 +149,7 @@ bool ParseMoovPayload(const uint8_t* data, size_t moov_size,
           uint8_t version = data[tp_start];
           if (version == 0) {
             trk.tkhd_duration = ReadBe32(data + tp_start + 20);
-          } else if (tp_len >= 36) {
+          } else if (version == 1 && tp_len >= 36) {
             trk.tkhd_duration = ReadBe64(data + tp_start + 28);
           }
         } else if (ttype == "edts") {
@@ -135,9 +160,14 @@ bool ParseMoovPayload(const uint8_t* data, size_t moov_size,
           while (NextBox(data, tp_end, &epos, &etype, &ep_start, &ep_end)) {
             if (etype == "elst" && ep_end - ep_start >= 8) {
               uint8_t version = data[ep_start];
+              if (version != 0 && version != 1) {
+                continue;
+              }
               uint32_t count = ReadBe32(data + ep_start + 4);
               size_t entry_size = (version == 1) ? 20 : 12;
               size_t cur = ep_start + 8;
+              bool elst_valid = true;
+              uint64_t empty_dur = 0;
               for (uint32_t i = 0;
                    i < count && cur <= ep_end && entry_size <= ep_end - cur;
                    ++i, cur += entry_size) {
@@ -149,10 +179,18 @@ bool ParseMoovPayload(const uint8_t* data, size_t moov_size,
                         : static_cast<int64_t>(
                               static_cast<int32_t>(ReadBe32(data + cur + 4)));
                 if (media_time == -1) {
-                  trk.elst_empty_duration += seg_dur;
+                  if (seg_dur >
+                      std::numeric_limits<uint64_t>::max() - empty_dur) {
+                    elst_valid = false;
+                    break;
+                  }
+                  empty_dur += seg_dur;
                 } else {
                   break;
                 }
+              }
+              if (elst_valid) {
+                trk.elst_empty_duration = empty_dur;
               }
             }
           }
@@ -167,7 +205,7 @@ bool ParseMoovPayload(const uint8_t* data, size_t moov_size,
               uint8_t version = data[mp_start];
               if (version == 0) {
                 trk.track_timescale = ReadBe32(data + mp_start + 12);
-              } else if (mp_len >= 24) {
+              } else if (version == 1 && mp_len >= 24) {
                 trk.track_timescale = ReadBe32(data + mp_start + 20);
               }
             } else if (mtype == "hdlr" && mp_len >= 12) {
@@ -210,12 +248,16 @@ bool ParseMoovPayload(const uint8_t* data, size_t moov_size,
                           }
                         }
                       }
-                    } else if (stype == "stts" && sp_end - sp_start >= 16) {
-                      trk.stts_entry_count = ReadBe32(data + sp_start + 4);
-                      if (trk.stts_entry_count > 0) {
+                    } else if (stype == "stts" && sp_end - sp_start >= 8) {
+                      uint32_t entry_count = ReadBe32(data + sp_start + 4);
+                      if ((sp_end - sp_start - 8) / 8 >= entry_count &&
+                          entry_count > 0) {
                         uint32_t sc = ReadBe32(data + sp_start + 8);
                         uint32_t sd = ReadBe32(data + sp_start + 12);
-                        trk.first_stts_ticks = static_cast<uint64_t>(sc) * sd;
+                        if (sc > 0 && sd > 0) {
+                          trk.stts_entry_count = entry_count;
+                          trk.first_stts_ticks = static_cast<uint64_t>(sc) * sd;
+                        }
                       }
                     }
                   }
@@ -235,14 +277,12 @@ bool ParseMoovPayload(const uint8_t* data, size_t moov_size,
     }
     int64_t ts_us = -1;
     if (trk.elst_empty_duration > 0 && movie_timescale > 0) {
-      ts_us = static_cast<int64_t>((trk.elst_empty_duration * 1000000ULL) /
-                                   movie_timescale);
-    } else if (trk.stts_entry_count > 1 && trk.track_timescale > 0) {
-      ts_us = static_cast<int64_t>((trk.first_stts_ticks * 1000000ULL) /
-                                   trk.track_timescale);
-    } else if (trk.tkhd_duration > 1 && movie_timescale > 0) {
-      ts_us = static_cast<int64_t>(((trk.tkhd_duration - 1) * 1000000ULL) /
-                                   movie_timescale);
+      ts_us = SafeScaleTicksToUs(trk.elst_empty_duration, movie_timescale);
+    } else if (trk.stts_entry_count > 1 && trk.first_stts_ticks > 0 &&
+               trk.track_timescale > 0) {
+      ts_us = SafeScaleTicksToUs(trk.first_stts_ticks, trk.track_timescale);
+    } else if (trk.tkhd_duration >= 1 && movie_timescale > 0) {
+      ts_us = SafeScaleTicksToUs(trk.tkhd_duration - 1, movie_timescale);
     }
     if (ts_us >= 0) {
       out_meta->set_has_still_image_time_track(true);
@@ -422,76 +462,71 @@ int64_t AppleLivePhotoProvider::ExtractStillImageTimestampUs(
   return ExtractStillImageTimestampUs(block);
 }
 
+class IfstreamDataSource
+    : public ::photos_editing_formats::image_io::DataSource {
+ public:
+  IfstreamDataSource(std::ifstream* stream, size_t file_size)
+      : stream_(stream), file_size_(file_size) {}
+
+  std::shared_ptr<::photos_editing_formats::image_io::DataSegment>
+  GetDataSegment(size_t begin, size_t min_size) override {
+    if (stream_ == nullptr || begin >= file_size_ || min_size == 0) {
+      return nullptr;
+    }
+    const size_t avail = file_size_ - begin;
+    const size_t to_read = std::min(avail, min_size);
+    auto* buf = new ::photos_editing_formats::image_io::Byte[to_read];
+    stream_->clear();
+    stream_->seekg(static_cast<std::streamoff>(begin), std::ios::beg);
+    if (!stream_->read(reinterpret_cast<char*>(buf),
+                       static_cast<std::streamsize>(to_read))) {
+      delete[] buf;
+      return nullptr;
+    }
+    return ::photos_editing_formats::image_io::DataSegment::Create(
+        ::photos_editing_formats::image_io::DataRange(begin, begin + to_read),
+        buf,
+        ::photos_editing_formats::image_io::DataSegment::
+            BufferDispositionPolicy::kDelete);
+  }
+
+  void Reset() override {
+    if (stream_) {
+      stream_->clear();
+      stream_->seekg(0, std::ios::beg);
+    }
+  }
+
+  TransferDataResult TransferData(
+      const ::photos_editing_formats::image_io::DataRange&, size_t,
+      ::photos_editing_formats::image_io::DataDestination*) override {
+    return kTransferDataNone;
+  }
+
+ private:
+  std::ifstream* stream_;
+  size_t file_size_;
+};
+
 // static
 int64_t AppleLivePhotoProvider::ExtractStillImageTimestampUsFromFile(
     const std::string& file_path) {
-  FILE* fp = std::fopen(file_path.c_str(), "rb");
-  if (!fp) {
+  std::ifstream stream(file_path, std::ios::binary | std::ios::ate);
+  if (!stream.is_open()) {
     return -1;
   }
-  if (std::fseek(fp, 0, SEEK_END) != 0) {
-    std::fclose(fp);
+  const std::streamoff end_pos = stream.tellg();
+  if (end_pos < 16) {
     return -1;
   }
-  long signed_size = std::ftell(fp);
-  if (signed_size < 16) {
-    std::fclose(fp);
-    return -1;
-  }
-  const size_t total_size = static_cast<size_t>(signed_size);
-  size_t pos = 0;
-  while (pos <= total_size && total_size - pos >= 8) {
-    if (std::fseek(fp, static_cast<long>(pos), SEEK_SET) != 0) {
-      break;
-    }
-    uint8_t hdr[16] = {0};
-    if (std::fread(hdr, 1, 8, fp) != 8) {
-      break;
-    }
-    absl::string_view tag(reinterpret_cast<const char*>(hdr + 4), 4);
-    if (pos == 0 && !IsTopLevelIsoBmffTag(tag)) {
-      std::fclose(fp);
-      return -1;
-    }
-    uint64_t box_size = ReadBe32(hdr);
-    size_t header_size = 8;
-    if (box_size == 1) {
-      if (total_size - pos < 16 || std::fread(hdr + 8, 1, 8, fp) != 8) {
-        break;
-      }
-      box_size = ReadBe64(hdr + 8);
-      header_size = 16;
-    } else if (box_size == 0) {
-      box_size = total_size - pos;
-    }
-    if (box_size < header_size || box_size > total_size - pos) {
-      break;
-    }
-    if (tag == "moov") {
-      size_t moov_payload_size = static_cast<size_t>(box_size) - header_size;
-      if (moov_payload_size > kMaxMoovSize) {
-        std::fclose(fp);
-        return -1;
-      }
-      std::vector<uint8_t> moov_buf(moov_payload_size);
-      if (std::fread(moov_buf.data(), 1, moov_payload_size, fp) !=
-          moov_payload_size) {
-        std::fclose(fp);
-        return -1;
-      }
-      std::fclose(fp);
-      AppleLivePhotoMetadata metadata;
-      if (!ParseMoovPayload(moov_buf.data(), moov_buf.size(), total_size,
-                            &metadata, nullptr) ||
-          !metadata.has_still_image_time_track()) {
-        return -1;
-      }
-      return metadata.primary_image_timestamp_us();
-    }
-    pos += static_cast<size_t>(box_size);
-  }
-  std::fclose(fp);
-  return -1;
+  const size_t total_size = static_cast<size_t>(end_pos);
+  IfstreamDataSource data_source(&stream, total_size);
+  RawMetadataBlock block;
+  block.type = "PROPRIETARY";
+  block.format_identifier = "video.mov";
+  block.total_payload_size = total_size;
+  block.data_source = &data_source;
+  return ExtractStillImageTimestampUs(block);
 }
 
 }  // namespace motion_photo

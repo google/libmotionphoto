@@ -127,7 +127,7 @@ list(FILTER MOTION_PHOTO_SOURCES EXCLUDE REGEX ".*libmotionphoto_api\\.cc$")
 file(GLOB PLUGINS_SOURCES "plugins/*/*.cc")
 list(FILTER PLUGINS_SOURCES EXCLUDE REGEX ".*_test\\.cc$")
 add_library(motion_photo ${MOTION_PHOTO_SOURCES} ${PLUGINS_SOURCES})
-target_link_libraries(motion_photo PUBLIC image_io_base image_io_iso image_io_xml image_io_xmp image_io_jpeg image_io_utils motion_photo_protos motion_photo_mp4 absl::status absl::span)
+target_link_libraries(motion_photo PUBLIC image_io_base image_io_iso image_io_xml image_io_xmp image_io_jpeg image_io_utils motion_photo_protos motion_photo_mp4 absl::status absl::span absl::strings)
 
 file(GLOB MOTION_PHOTO_JPEG_SOURCES "motion_photo/src/motion_photo_jpeg/*.cc")
 add_library(motion_photo_jpeg ${MOTION_PHOTO_JPEG_SOURCES})

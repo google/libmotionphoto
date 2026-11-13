@@ -46,6 +46,8 @@
 #include "image_io/xmp/xmp_container_metadata.h"
 #include "motion_photo/camera_metadata.h"
 #include "motion_photo/container_splitter.h"
+#include "motion_photo/metadata_block.h"
+#include "motion_photo/metadata_provider_registry.h"
 #include "motion_photo/motion_photo.h"
 #include "motion_photo/motion_photo_reader.h"
 #include "motion_photo/motion_photo_source.h"
@@ -88,37 +90,150 @@ const char kBuilderVersion[] = " V1.0";
 const char kWorkVideoFileName[] = "/tmp/motion_photo_working_trailer.mp4";
 const char kOptVideoFileName[] = "/tmp/motion_photo_optimized_trailer.mp4";
 
+class MediaSourceDataSource : public image_io::DataSource {
+ public:
+  explicit MediaSourceDataSource(const MediaSource* source) : source_(source) {}
+
+  std::shared_ptr<DataSegment> GetDataSegment(size_t begin,
+                                              size_t min_size) override {
+    if (source_ == nullptr || begin >= source_->GetSize() || min_size == 0) {
+      return nullptr;
+    }
+    const size_t avail = source_->GetSize() - begin;
+    const size_t to_read = std::min(avail, min_size);
+    auto* buf = new Byte[to_read];
+    if (!source_->ReadAt(begin, to_read, buf)) {
+      delete[] buf;
+      return nullptr;
+    }
+    return DataSegment::Create(DataRange(begin, begin + to_read), buf,
+                               DataSegment::BufferDispositionPolicy::kDelete);
+  }
+
+  void Reset() override {}
+
+  TransferDataResult TransferData(const DataRange&, size_t,
+                                  image_io::DataDestination*) override {
+    return kTransferDataNone;
+  }
+
+ private:
+  const MediaSource* source_;
+};
+
+int64_t ExtractPresentationTimestampFromProviders(
+    const RawMetadataBlock& block, const HandlerOptions& options) {
+  if (options.disable_3p_plugins) {
+    return -1;
+  }
+  for (const auto& provider : MetadataProviderRegistry::Get3pProviders()) {
+    if (!provider) continue;
+    if (!options.enabled_3p_plugins.empty() &&
+        std::find(options.enabled_3p_plugins.begin(),
+                  options.enabled_3p_plugins.end(),
+                  provider->GetPluginName()) ==
+            options.enabled_3p_plugins.end()) {
+      continue;
+    }
+    int64_t ts = provider->GetPresentationTimestampUs(block);
+    if (ts >= 0) {
+      return ts;
+    }
+  }
+  return -1;
+}
+
+int64_t ExtractPresentationTimestampFromVideoSource(
+    const MediaSource* video_source, const HandlerOptions& options) {
+  if (video_source == nullptr || video_source->GetSize() == 0) {
+    return -1;
+  }
+  RawMetadataBlock block;
+  block.type = "PROPRIETARY";
+  block.format_identifier = "video.mov";
+  block.total_payload_size = video_source->GetSize();
+  MediaSourceDataSource lazy_source(video_source);
+  if (video_source->GetData() != nullptr) {
+    block.data_view = video_source->GetData();
+    block.data_view_size = video_source->GetSize();
+  } else {
+    block.data_source = &lazy_source;
+  }
+  return ExtractPresentationTimestampFromProviders(block, options);
+}
+
+int64_t ExtractPresentationTimestampFromVideoFile(
+    const std::string& file_path, const HandlerOptions& options) {
+  if (file_path.empty() || options.disable_3p_plugins) {
+    return -1;
+  }
+  auto file_source = MediaSource::FromFile(file_path, nullptr);
+  return ExtractPresentationTimestampFromVideoSource(file_source.get(),
+                                                     options);
+}
+
+template <typename FallbackFn>
+void ResolvePresentationTimestamp(int64_t explicit_timestamp_us,
+                                  bool has_video_xmp,
+                                  const FallbackFn& fallback_3p_extractor,
+                                  MotionPhoto* motion_photo) {
+  if (explicit_timestamp_us >= 0) {
+    motion_photo->SetImageTimestamp(explicit_timestamp_us);
+    return;
+  }
+  if (has_video_xmp) {
+    int64_t video_xmp_timestamp = motion_photo->GetVideoMetadata()
+                                      .GetScoreDescriptor()
+                                      .GetPrimaryImageFrameScoreDescriptor()
+                                      .GetPresentationTimestampUs();
+    if (video_xmp_timestamp >= 0) {
+      motion_photo->SetImageTimestamp(video_xmp_timestamp);
+      return;
+    }
+  }
+  const auto& image_ts =
+      motion_photo->GetCameraMetadata().motion_photo_presentation_timestamp_us;
+  if (image_ts.WasAssigned() && image_ts.GetValue() >= 0) {
+    return;
+  }
+  int64_t extracted_ts = fallback_3p_extractor();
+  if (extracted_ts >= 0) {
+    motion_photo->SetImageTimestamp(extracted_ts);
+  }
+}
+
 string GetDefaultXmpData(int model_version = 1) {
   return string(
-      "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" "
-      "x:xmptk=\"Adobe XMP Core 5.1.0-jc003\">\n"
-      "  <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n"
-      "    <rdf:Description rdf:about=\"\"\n"
-      "      xmlns:Metadata="
-      "\"http://ns.google.com/1.0/motion_photo_video_metadata/\">\n"
-      "      <Metadata:Flags>\n"
-      "        <Metadata:LowRes Metadata:Stabilized=\"0\"/>\n"
-      "        <Metadata:HighRes Metadata:Stabilized=\"0\" />\n"
-      "      </Metadata:Flags>\n"
-      "      <Metadata:Scores Metadata:ModelVersion=\"") +
-      std::to_string(model_version) +
-      "\">\n"
-      "        <Metadata:PrimaryImage>\n"
-      "          <Metadata:Frame Metadata:Score=\"1.0\" "
-      "Metadata:Time=\"0\" />\n"
-      "        </Metadata:PrimaryImage>\n"
-      "        <Metadata:HighResTrack>\n"
-      "          <rdf:Seq>\n"
-      "            <rdf:li>\n"
-      "              <Metadata:Frame Metadata:Score=\"1.0\" "
-      "Metadata:Time=\"0\" />\n"
-      "            </rdf:li>\n"
-      "          </rdf:Seq>\n"
-      "        </Metadata:HighResTrack>\n"
-      "      </Metadata:Scores>\n"
-      "    </rdf:Description>\n"
-      "  </rdf:RDF>\n"
-      "</x:xmpmeta>\n";
+             "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" "
+             "x:xmptk=\"Adobe XMP Core 5.1.0-jc003\">\n"
+             "  <rdf:RDF "
+             "xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n"
+             "    <rdf:Description rdf:about=\"\"\n"
+             "      xmlns:Metadata="
+             "\"http://ns.google.com/1.0/motion_photo_video_metadata/\">\n"
+             "      <Metadata:Flags>\n"
+             "        <Metadata:LowRes Metadata:Stabilized=\"0\"/>\n"
+             "        <Metadata:HighRes Metadata:Stabilized=\"0\" />\n"
+             "      </Metadata:Flags>\n"
+             "      <Metadata:Scores Metadata:ModelVersion=\"") +
+         std::to_string(model_version) +
+         "\">\n"
+         "        <Metadata:PrimaryImage>\n"
+         "          <Metadata:Frame Metadata:Score=\"1.0\" "
+         "Metadata:Time=\"0\" />\n"
+         "        </Metadata:PrimaryImage>\n"
+         "        <Metadata:HighResTrack>\n"
+         "          <rdf:Seq>\n"
+         "            <rdf:li>\n"
+         "              <Metadata:Frame Metadata:Score=\"1.0\" "
+         "Metadata:Time=\"0\" />\n"
+         "            </rdf:li>\n"
+         "          </rdf:Seq>\n"
+         "        </Metadata:HighResTrack>\n"
+         "      </Metadata:Scores>\n"
+         "    </rdf:Description>\n"
+         "  </rdf:RDF>\n"
+         "</x:xmpmeta>\n";
 }
 
 struct Params {
@@ -155,7 +270,8 @@ Params PrintUsage(std::string_view arg0, const StringOutputter& outputter,
           "     if this file name is not specified, the program just checks\n"
           "     the input files and outputs a summary of their contents.\n"
           " -pi primary_image_file_name\n"
-          "     specifies the name of the primary jpeg or heif (heic/avif) image file\n"
+          "     specifies the name of the primary jpeg or heif (heic/avif) "
+          "image file\n"
           " -pv primary_video_file_name\n"
           "     specifies the name of the primary video file\n"
           " -mv moments_video_file_name (OPTIONAL)\n"
@@ -437,10 +553,6 @@ void InspectPrimaryImage(
           items.erase(it);
           break;
         }
-      }
-    }
-    motion_photo->SetContainerMetadata(std::move(container));
-    *out_jpeg_info_builder = std::move(jpeg_info_builder);
   } else if (IsHeif(file_type)) {
     MediaSourceDataSource heif_source(image_source);
     std::vector<DataRange> xmp_ranges =
@@ -715,17 +827,13 @@ int BuildMotionPhotoDirect(const MotionPhotoStreamParams& params,
     has_video_xmp = video_reader.ReadVideoMetadata(params.moments_xmp, &count);
   }
 
-  if (params.presentation_timestamp_us >= 0) {
-    motion_photo.SetImageTimestamp(params.presentation_timestamp_us);
-  } else if (has_video_xmp) {
-    int64_t video_xmp_timestamp = motion_photo.GetVideoMetadata()
-                                      .GetScoreDescriptor()
-                                      .GetPrimaryImageFrameScoreDescriptor()
-                                      .GetPresentationTimestampUs();
-    if (video_xmp_timestamp >= 0) {
-      motion_photo.SetImageTimestamp(video_xmp_timestamp);
-    }
-  }
+  ResolvePresentationTimestamp(
+      params.presentation_timestamp_us, has_video_xmp,
+      [&]() {
+        return ExtractPresentationTimestampFromVideoSource(
+            params.primary_video.get(), params.handler_options);
+      },
+      &motion_photo);
   motion_photo.EnforceConsistentValues();
 
   vector<uint8_t> video_metadata;
@@ -827,7 +935,6 @@ int BuildMotionPhoto(const MotionPhotoBuilderParams& params,
   }
 
   MessageHandler message_handler;
-  int64_t target_timestamp = local_params.presentation_timestamp_us;
   unique_ptr<image_io::MessageWriter> message_writer(
       new StringOutputterMessageWriter(outputter));
   message_handler.SetMessageWriter(std::move(message_writer));
@@ -891,17 +998,13 @@ int BuildMotionPhoto(const MotionPhotoBuilderParams& params,
         motion_photo_reader.ReadVideoMetadata(xmpss.str(), &count);
   }
 
-  if (local_params.presentation_timestamp_us >= 0) {
-    motion_photo.SetImageTimestamp(local_params.presentation_timestamp_us);
-  } else if (has_valid_video_xmp) {
-    target_timestamp = motion_photo.GetVideoMetadata()
-                           .GetScoreDescriptor()
-                           .GetPrimaryImageFrameScoreDescriptor()
-                           .GetPresentationTimestampUs();
-    if (target_timestamp >= 0) {
-      motion_photo.SetImageTimestamp(target_timestamp);
-    }
-  }
+  ResolvePresentationTimestamp(
+      local_params.presentation_timestamp_us, has_valid_video_xmp,
+      [&]() {
+        return ExtractPresentationTimestampFromVideoFile(
+            local_params.primary_video_file_name, local_params.handler_options);
+      },
+      &motion_photo);
   motion_photo.EnforceConsistentValues();
 
   if (has_valid_video_xmp) {

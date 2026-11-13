@@ -74,6 +74,13 @@ class IMetadataProvider {
     }
     return false;
   }
+
+  // Returns the still-image presentation timestamp in microseconds from a raw
+  // metadata/trailer block (e.g. a QuickTime .mov stream), or -1 if unsupported.
+  virtual int64_t GetPresentationTimestampUs(
+      const RawMetadataBlock& block) const {
+    return -1;
+  }
 };
 
 }  // namespace motion_photo

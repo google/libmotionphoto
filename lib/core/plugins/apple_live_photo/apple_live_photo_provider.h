@@ -48,6 +48,11 @@ class AppleLivePhotoProvider : public IMetadataProvider {
   bool GetVideoInfo(const RawMetadataBlock& block, size_t* out_offset_in_block,
                     size_t* out_length) const override;
 
+  int64_t GetPresentationTimestampUs(
+      const RawMetadataBlock& block) const override {
+    return ExtractStillImageTimestampUs(block);
+  }
+
   // Extracts the still-image presentation timestamp in microseconds from an
   // Apple Live Photo .mov block, memory buffer, or file, or returns -1 if not
   // present.

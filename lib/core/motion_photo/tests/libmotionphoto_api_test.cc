@@ -584,7 +584,15 @@ TEST(LibMotionPhotoApiTest, BuildMotionPhotoFromAppleLivePhotoMovExtractsTimesta
                                    std::istreambuf_iterator<char>());
   ASSERT_FALSE(image_bytes.empty());
 
-  const std::string out_mem_path = "/tmp/apple_live_photo_transcoded_mem.MP.jpg";
+  const char* test_tmpdir = std::getenv("TEST_TMPDIR");
+  fs::path base_dir = (test_tmpdir != nullptr && test_tmpdir[0] != '\0')
+                          ? fs::path(test_tmpdir)
+                          : fs::temp_directory_path();
+  fs::path test_dir = base_dir / "AppleLivePhotoApiTest";
+  fs::create_directories(test_dir);
+
+  const std::string out_mem_path =
+      (test_dir / "apple_live_photo_transcoded_mem.MP.jpg").string();
   if (fs::exists(out_mem_path)) fs::remove(out_mem_path);
   EXPECT_EQ(BuildMotionPhotoFromMemory(
                 image_bytes.data(), image_bytes.size(), mov_bytes.data(),
@@ -596,9 +604,10 @@ TEST(LibMotionPhotoApiTest, BuildMotionPhotoFromAppleLivePhotoMovExtractsTimesta
   EXPECT_EQ(meta_mem.presentation_timestamp_us, 1400000);
   fs::remove(out_mem_path);
 
-  const std::string in_mov_path = "/tmp/apple_live_photo_input.mov";
+  const std::string in_mov_path =
+      (test_dir / "apple_live_photo_input.mov").string();
   const std::string out_file_path =
-      "/tmp/apple_live_photo_transcoded_file.MP.jpg";
+      (test_dir / "apple_live_photo_transcoded_file.MP.jpg").string();
   {
     std::ofstream mov_out(in_mov_path, std::ios::binary);
     mov_out.write(reinterpret_cast<const char*>(mov_bytes.data()),
@@ -612,8 +621,7 @@ TEST(LibMotionPhotoApiTest, BuildMotionPhotoFromAppleLivePhotoMovExtractsTimesta
   EXPECT_TRUE(ParseMotionPhotoFromFile(out_file_path, &meta_file));
   EXPECT_TRUE(meta_file.is_motion_photo);
   EXPECT_EQ(meta_file.presentation_timestamp_us, 1400000);
-  fs::remove(in_mov_path);
-  fs::remove(out_file_path);
+  fs::remove_all(test_dir);
 
   // Also verify 3P plugin detection ("apple_live_photo") on a raw JPEG + Apple
   // .mov trailer without standard Google Motion Photo XMP.

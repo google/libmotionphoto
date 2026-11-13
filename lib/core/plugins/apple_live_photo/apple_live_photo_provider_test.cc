@@ -16,6 +16,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -183,7 +184,14 @@ TEST(AppleLivePhotoProviderTest, IdentifiesAndDecodesEdtsElstAndHeaderlessMov) {
                 mov_headerless.data(), mov_headerless.size()),
             1333333);
 
-  const std::string tmp_mov = "/tmp/apple_live_photo_provider_test.mov";
+  const char* test_tmpdir = std::getenv("TEST_TMPDIR");
+  fs::path base_dir = (test_tmpdir != nullptr && test_tmpdir[0] != '\0')
+                          ? fs::path(test_tmpdir)
+                          : fs::temp_directory_path();
+  fs::path test_dir = base_dir / "AppleLivePhotoProviderTest";
+  fs::create_directories(test_dir);
+  const std::string tmp_mov =
+      (test_dir / "apple_live_photo_provider_test.mov").string();
   {
     std::ofstream out(tmp_mov, std::ios::binary);
     out.write(reinterpret_cast<const char*>(mov_headerless.data()),
@@ -192,7 +200,7 @@ TEST(AppleLivePhotoProviderTest, IdentifiesAndDecodesEdtsElstAndHeaderlessMov) {
   EXPECT_EQ(
       AppleLivePhotoProvider::ExtractStillImageTimestampUsFromFile(tmp_mov),
       1333333);
-  fs::remove(tmp_mov);
+  fs::remove_all(test_dir);
 }
 
 TEST(AppleLivePhotoProviderTest, RejectsNonAppleMp4AndTruncatedStreams) {
@@ -209,6 +217,69 @@ TEST(AppleLivePhotoProviderTest, RejectsNonAppleMp4AndTruncatedStreams) {
   block.data_view_size = short_buf.size();
   block.total_payload_size = short_buf.size();
   EXPECT_FALSE(provider.Identify(block));
+}
+
+TEST(AppleLivePhotoProviderTest, GuardsLarge64BitDurationOverflow) {
+  // Construct an elst v1 box with a huge empty duration that would overflow
+  // uint64_t * 1000000ULL if not guarded.
+  std::vector<uint8_t> mvhd_payload(24, 0);
+  mvhd_payload[14] = 0x02;
+  mvhd_payload[15] = 0x58;  // timescale = 600
+  auto mvhd = MakeBox("mvhd", mvhd_payload);
+
+  std::string key = "mdta.com.apple.quicktime.still-image-time";
+  std::vector<uint8_t> mebx_payload(8, 0);
+  mebx_payload.insert(mebx_payload.end(), key.begin(), key.end());
+  auto mebx = MakeBox("mebx", mebx_payload);
+  std::vector<uint8_t> stsd_payload(8, 0);
+  stsd_payload[7] = 1;
+  stsd_payload.insert(stsd_payload.end(), mebx.begin(), mebx.end());
+  auto stsd = MakeBox("stsd", stsd_payload);
+
+  std::vector<uint8_t> hdlr_payload(12, 0);
+  hdlr_payload[8] = 'm';
+  hdlr_payload[9] = 'e';
+  hdlr_payload[10] = 't';
+  hdlr_payload[11] = 'a';
+  auto hdlr = MakeBox("hdlr", hdlr_payload);
+
+  std::vector<uint8_t> mdhd_payload(24, 0);
+  mdhd_payload[14] = 0x02;
+  mdhd_payload[15] = 0x58;
+  auto mdhd = MakeBox("mdhd", mdhd_payload);
+
+  std::vector<uint8_t> elst_payload(8, 0);
+  elst_payload[0] = 1;  // version 1
+  elst_payload[7] = 1;  // entry_count = 1
+  // segment_duration = 0xFFFFFFFFFFFFFFFF (would overflow uint64_t * 1e6)
+  PushU32(&elst_payload, 0xFFFFFFFF);
+  PushU32(&elst_payload, 0xFFFFFFFF);
+  // media_time = -1 (64-bit)
+  PushU32(&elst_payload, 0xFFFFFFFF);
+  PushU32(&elst_payload, 0xFFFFFFFF);
+  PushU32(&elst_payload, 0x00010000);
+  auto edts = MakeBox("edts", MakeBox("elst", elst_payload));
+
+  auto stbl = MakeBox("stbl", stsd);
+  auto minf = MakeBox("minf", stbl);
+  std::vector<uint8_t> mdia_payload;
+  mdia_payload.insert(mdia_payload.end(), mdhd.begin(), mdhd.end());
+  mdia_payload.insert(mdia_payload.end(), hdlr.begin(), hdlr.end());
+  mdia_payload.insert(mdia_payload.end(), minf.begin(), minf.end());
+  auto mdia = MakeBox("mdia", mdia_payload);
+
+  std::vector<uint8_t> trak_payload;
+  trak_payload.insert(trak_payload.end(), edts.begin(), edts.end());
+  trak_payload.insert(trak_payload.end(), mdia.begin(), mdia.end());
+  auto trak = MakeBox("trak", trak_payload);
+
+  std::vector<uint8_t> moov_payload = mvhd;
+  moov_payload.insert(moov_payload.end(), trak.begin(), trak.end());
+  auto mov = MakeBox("moov", moov_payload);
+
+  EXPECT_EQ(
+      AppleLivePhotoProvider::ExtractStillImageTimestampUs(mov.data(), mov.size()),
+      -1);
 }
 
 }  // namespace

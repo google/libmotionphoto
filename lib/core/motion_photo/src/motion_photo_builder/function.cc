@@ -30,9 +30,11 @@
 
 #include "absl/strings/match.h"
 #include "image_io/base/byte_data.h"
+#include "image_io/base/data_destination.h"
 #include "image_io/base/data_range.h"
 #include "image_io/base/data_segment.h"
 #include "image_io/base/data_segment_data_source.h"
+#include "image_io/base/data_source.h"
 #include "image_io/base/message.h"
 #include "image_io/base/message_handler.h"
 #include "image_io/base/message_writer.h"
@@ -43,6 +45,8 @@
 #include "image_io/utils/string_outputter_message_writer.h"
 #include "image_io/xmp/xmp_container_metadata.h"
 #include "motion_photo/camera_metadata.h"
+#include "motion_photo/metadata_block.h"
+#include "motion_photo/metadata_provider_registry.h"
 #include "motion_photo/motion_photo.h"
 #include "motion_photo/motion_photo_reader.h"
 #include "motion_photo/motion_photo_source.h"
@@ -53,7 +57,6 @@
 #include "motion_photo_jpeg/motion_photo_jpeg_image_builder.h"
 #include "motion_photo_jpeg/motion_photo_jpeg_info_builder.h"
 #include "motion_photo_mp4/motion_photo_mp4_file_builder.h"
-#include "plugins/apple_live_photo/apple_live_photo_provider.h"
 
 namespace libmotionphoto {
 namespace motion_photo {
@@ -84,6 +87,129 @@ const char kBuilderVersion[] = " V1.0";
 
 const char kWorkVideoFileName[] = "/tmp/motion_photo_working_trailer.mp4";
 const char kOptVideoFileName[] = "/tmp/motion_photo_optimized_trailer.mp4";
+
+class MediaSourceDataSource : public image_io::DataSource {
+ public:
+  explicit MediaSourceDataSource(const MediaSource* source) : source_(source) {}
+
+  std::shared_ptr<DataSegment> GetDataSegment(size_t begin,
+                                              size_t min_size) override {
+    if (source_ == nullptr || begin >= source_->GetSize() || min_size == 0) {
+      return nullptr;
+    }
+    const size_t avail = source_->GetSize() - begin;
+    const size_t to_read = std::min(avail, min_size);
+    auto* buf = new Byte[to_read];
+    if (!source_->ReadAt(begin, to_read, buf)) {
+      delete[] buf;
+      return nullptr;
+    }
+    return DataSegment::Create(DataRange(begin, begin + to_read), buf,
+                               DataSegment::BufferDispositionPolicy::kDelete);
+  }
+
+  void Reset() override {}
+
+  TransferDataResult TransferData(const DataRange&, size_t,
+                                  image_io::DataDestination*) override {
+    return kTransferDataNone;
+  }
+
+ private:
+  const MediaSource* source_;
+};
+
+class VideoFileDataSource : public image_io::DataSource {
+ public:
+  VideoFileDataSource(ifstream* stream, size_t file_size)
+      : stream_(stream), file_size_(file_size) {}
+
+  std::shared_ptr<DataSegment> GetDataSegment(size_t begin,
+                                              size_t min_size) override {
+    if (stream_ == nullptr || begin >= file_size_ || min_size == 0) {
+      return nullptr;
+    }
+    const size_t avail = file_size_ - begin;
+    const size_t to_read = std::min(avail, min_size);
+    auto* buf = new Byte[to_read];
+    stream_->clear();
+    stream_->seekg(static_cast<std::streamoff>(begin), std::ios::beg);
+    if (!stream_->read(reinterpret_cast<char*>(buf),
+                       static_cast<std::streamsize>(to_read))) {
+      delete[] buf;
+      return nullptr;
+    }
+    return DataSegment::Create(DataRange(begin, begin + to_read), buf,
+                               DataSegment::BufferDispositionPolicy::kDelete);
+  }
+
+  void Reset() override {
+    if (stream_) {
+      stream_->clear();
+      stream_->seekg(0, std::ios::beg);
+    }
+  }
+
+  TransferDataResult TransferData(const DataRange&, size_t,
+                                  image_io::DataDestination*) override {
+    return kTransferDataNone;
+  }
+
+ private:
+  ifstream* stream_;
+  size_t file_size_;
+};
+
+int64_t ExtractPresentationTimestampFromProviders(
+    const RawMetadataBlock& block) {
+  for (const auto& provider : MetadataProviderRegistry::Get3pProviders()) {
+    if (!provider) continue;
+    int64_t ts = provider->GetPresentationTimestampUs(block);
+    if (ts >= 0) {
+      return ts;
+    }
+  }
+  return -1;
+}
+
+int64_t ExtractPresentationTimestampFromVideoSource(
+    const MediaSource* video_source) {
+  if (video_source == nullptr || video_source->GetSize() == 0) {
+    return -1;
+  }
+  RawMetadataBlock block;
+  block.type = "PROPRIETARY";
+  block.format_identifier = "video.mov";
+  block.total_payload_size = video_source->GetSize();
+  MediaSourceDataSource lazy_source(video_source);
+  if (video_source->GetData() != nullptr) {
+    block.data_view = video_source->GetData();
+    block.data_view_size = video_source->GetSize();
+  } else {
+    block.data_source = &lazy_source;
+  }
+  return ExtractPresentationTimestampFromProviders(block);
+}
+
+int64_t ExtractPresentationTimestampFromVideoFile(
+    const std::string& file_path) {
+  ifstream stream(file_path, std::ios::binary | std::ios::ate);
+  if (!stream.is_open()) {
+    return -1;
+  }
+  const std::streamoff end_pos = stream.tellg();
+  if (end_pos <= 0) {
+    return -1;
+  }
+  const size_t file_size = static_cast<size_t>(end_pos);
+  VideoFileDataSource file_source(&stream, file_size);
+  RawMetadataBlock block;
+  block.type = "PROPRIETARY";
+  block.format_identifier = "video.mov";
+  block.total_payload_size = file_size;
+  block.data_source = &file_source;
+  return ExtractPresentationTimestampFromProviders(block);
+}
 
 string GetDefaultXmpData(int model_version = 1) {
   return string(
@@ -534,18 +660,11 @@ int BuildMotionPhotoDirect(const MotionPhotoStreamParams& params,
     }
   }
 
-  // Check if input video is from Apple live photo, which has timestamp
+  // Query registered 3P providers (e.g. Apple Live Photo .mov timed metadata)
+  // for a still-image presentation timestamp when none was explicitly supplied.
   if (target_timestamp < 0 && params.primary_video != nullptr) {
-    if (params.primary_video->GetData() != nullptr) {
-      target_timestamp = AppleLivePhotoProvider::ExtractStillImageTimestampUs(
-          params.primary_video->GetData(), params.primary_video->GetSize());
-    } else if (params.primary_video->GetSize() > 0) {
-      std::vector<uint8_t> video_buf(params.primary_video->GetSize());
-      if (params.primary_video->ReadAt(0, video_buf.size(), video_buf.data())) {
-        target_timestamp = AppleLivePhotoProvider::ExtractStillImageTimestampUs(
-            video_buf.data(), video_buf.size());
-      }
-    }
+    target_timestamp =
+        ExtractPresentationTimestampFromVideoSource(params.primary_video.get());
     if (target_timestamp >= 0) {
       motion_photo.SetImageTimestamp(target_timestamp);
     }
@@ -765,9 +884,8 @@ int BuildMotionPhoto(const MotionPhotoBuilderParams& params,
   }
 
   if (target_timestamp < 0 && !local_params.primary_video_file_name.empty()) {
-    target_timestamp =
-        AppleLivePhotoProvider::ExtractStillImageTimestampUsFromFile(
-            local_params.primary_video_file_name);
+    target_timestamp = ExtractPresentationTimestampFromVideoFile(
+        local_params.primary_video_file_name);
     if (target_timestamp >= 0) {
       motion_photo.SetImageTimestamp(target_timestamp);
     }

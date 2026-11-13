@@ -23,6 +23,7 @@
 #include <iostream>
 #include <string>
 
+#include "libmotionphoto_api.h"
 #include "motion_photo/tests/test_framework.h"
 #include "motion_photo/video_track_data.h"
 #include "motion_photo_extractor/function.h"
@@ -157,6 +158,70 @@ TEST(MotionPhotoExtractorFunctionTest, HeicVideoOnlyExtraction) {
   EXPECT_TRUE(mp4_reader.Read(kOutputFileVideo, 0));
   EXPECT_EQ(mp4_reader.GetVideoTrackData().high_res_metadata_track_id,
             kInvalidTrackId);
+
+  fs::remove_all(kTestDir);
+}
+
+// Ensures full extraction (still image + video + metadata) works for HEIC
+// motion photo without requiring libheif or Android media codecs.
+TEST(MotionPhotoExtractorFunctionTest, HeicFullExtraction) {
+  const string kTestDir = CreateTestDir("HeicFullExtraction");
+  const string kInputFile =
+      "lib/core/motion_photo/testdata/motion_photo_single_video_track.MP.heic";
+  const string kOutputFileImage =
+      (fs::path(kTestDir) / "extracted_still.heic").string();
+  const string kOutputFileVideo =
+      (fs::path(kTestDir) / "extracted_video.mp4").string();
+  const string kOutputFileMetadata =
+      (fs::path(kTestDir) / "extracted_metadata.xml").string();
+
+  const char* argv[] = {
+      "MotionPhotoExtractor",     "-mi", kInputFile.c_str(),       "-po",
+      kOutputFileImage.c_str(),   "-vo", kOutputFileVideo.c_str(), "-mo",
+      kOutputFileMetadata.c_str()};
+
+  bool has_usage = false;
+  bool has_zero_errors = false;
+  int status =
+      MotionPhotoExtractorFunction(9, argv, [&](absl::string_view str) {
+        std::cout << str;
+        if (absl::StrContains(str, "Usage")) {
+          has_usage = true;
+        }
+        if (absl::StrContains(str, "0 errors")) {
+          has_zero_errors = true;
+        }
+      });
+
+  EXPECT_EQ(status, 0);
+  EXPECT_FALSE(has_usage);
+  EXPECT_TRUE(has_zero_errors);
+  EXPECT_TRUE(fs::exists(kOutputFileImage));
+  EXPECT_TRUE(fs::exists(kOutputFileVideo));
+  EXPECT_TRUE(fs::exists(kOutputFileMetadata));
+
+  // Verify extracted still image size matches the exact byte offset of mpvd box
+  // (input_size - video_length - 16-byte extended mpvd header) and that the
+  // extracted still image has its MotionPhoto XMP tags stripped (so it is no
+  // longer detected as a Motion Photo).
+  api::MotionPhotoMetadata metadata;
+  EXPECT_TRUE(api::ParseMotionPhotoFromFile(kInputFile, &metadata));
+  EXPECT_EQ(fs::file_size(kOutputFileImage),
+            fs::file_size(kInputFile) -
+                static_cast<size_t>(metadata.video_length) - 16u);
+  EXPECT_FALSE(api::ParseMotionPhotoFromFile(kOutputFileImage, nullptr));
+
+  // Verify extracted video is a valid MP4 with its metadata track stripped.
+  MotionPhotoMp4FileReader mp4_reader;
+  EXPECT_TRUE(mp4_reader.Read(kOutputFileVideo, 0));
+  EXPECT_EQ(mp4_reader.GetVideoTrackData().high_res_metadata_track_id,
+            kInvalidTrackId);
+
+  // Verify extracted metadata contains the original XMP payload.
+  std::ifstream meta_in(kOutputFileMetadata, std::ios::binary);
+  string meta_str((std::istreambuf_iterator<char>(meta_in)),
+                  std::istreambuf_iterator<char>());
+  EXPECT_TRUE(absl::StrContains(meta_str, "MotionPhoto"));
 
   fs::remove_all(kTestDir);
 }

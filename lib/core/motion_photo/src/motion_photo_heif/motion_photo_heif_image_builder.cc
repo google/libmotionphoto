@@ -16,19 +16,14 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
 
-#if defined(MOTION_PHOTO_HEIC_SUPPORT)
-#include <libheif/heif.h>
-#include "motion_photo_heif/libheif_deleter.h"
-#endif  // defined(MOTION_PHOTO_HEIC_SUPPORT)
-
 #include "image_io/utils/file_utils.h"
 #include "motion_photo/motion_photo_source.h"
 #include "motion_photo/mpvd_box.h"
+#include "motion_photo_heif/heif_iso_meta_editor.h"
 
 namespace libmotionphoto {
 namespace motion_photo {
@@ -37,24 +32,6 @@ namespace {
 
 using image_io::Byte;
 using libmotionphoto::image_io::Message;
-
-#if defined(MOTION_PHOTO_HEIC_SUPPORT)
-struct HeifSinkWriter {
-  static struct heif_error WriteCallback(struct heif_context* ctx,
-                                         const void* data, size_t size,
-                                         void* userdata) {
-    DataSink* sink = static_cast<DataSink*>(userdata);
-    if (!sink->Write(static_cast<const uint8_t*>(data), size)) {
-      struct heif_error err = {heif_error_Encoding_error,
-                               heif_suberror_Cannot_write_output_data,
-                               "Failed to write to data sink"};
-      return err;
-    }
-    struct heif_error ok = {heif_error_Ok, heif_suberror_Unspecified, "Success"};
-    return ok;
-  }
-};
-#endif  // defined(MOTION_PHOTO_HEIC_SUPPORT)
 
 }  // namespace
 
@@ -71,7 +48,6 @@ bool MotionPhotoHeifImageBuilder::Build(const MediaSource& image_source,
                                         std::string_view xmp_metadata,
                                         const MpvdBox* mpvd_box,
                                         DataSink* output_sink) {
-#if defined(MOTION_PHOTO_HEIC_SUPPORT)
   if (output_sink == nullptr || image_source.GetSize() == 0) {
     return false;
   }
@@ -87,82 +63,24 @@ bool MotionPhotoHeifImageBuilder::Build(const MediaSource& image_source,
     raw_bytes = local_buffer.data();
   }
 
-  heif_error error;
-  std::unique_ptr<heif_context, LibHeifDeleter> context(heif_context_alloc());
-  error = heif_context_read_from_memory_without_copy(context.get(), raw_bytes,
-                                                     raw_size, nullptr);
-  if (error.code != heif_error_Ok) {
-    message_handler_->ReportMessage(Message::kDecodingError,
-                                    "Failed to create heif context");
-    return false;
-  }
-
-  heif_image_handle* handle_ptr;
-  error = heif_context_get_primary_image_handle(context.get(), &handle_ptr);
-  std::unique_ptr<heif_image_handle, LibHeifDeleter> handle(handle_ptr);
-  if (error.code != heif_error_Ok) {
-    message_handler_->ReportMessage(Message::kDecodingError,
-                                    "Failed to get heif primary image handle");
-    return false;
-  }
-
-  heif_image* img_ptr;
-  error = heif_decode_image(handle.get(), &img_ptr, heif_colorspace_RGB,
-                            heif_chroma_interleaved_RGB, nullptr);
-  if (error.code != heif_error_Ok) {
-    message_handler_->ReportMessage(Message::kDecodingError,
-                                    "Failed to decode the HEIF image");
-    return false;
-  }
-  std::unique_ptr<heif_image, LibHeifDeleter> img(img_ptr);
-
-  heif_compression_format compression_format = heif_compression_HEVC;
-  const char* mime = heif_get_file_mime_type(raw_bytes, raw_size);
-  if (mime != nullptr) {
-    std::string_view mime_str(mime);
-    if (mime_str.find("avif") != std::string_view::npos) {
-      compression_format = heif_compression_AV1;
+  // Losslessly rewrite the HEIF 'meta' box: the coded image items are copied
+  // bit-exactly and only the primary image XMP item is replaced, so no HEVC/AV1
+  // decoder or encoder is needed on any platform.
+  std::vector<uint8_t> edited;
+  std::string error;
+  if (!HeifIsoMetaEditor::SetPrimaryXmp(raw_bytes, raw_size, xmp_metadata,
+                                        &edited, &error)) {
+    if (message_handler_ != nullptr) {
+      message_handler_->ReportMessage(
+          Message::kDecodingError, "Failed to set HEIF primary XMP: " + error);
     }
-  }
-
-  heif_encoder* encoder_ptr;
-  error = heif_context_get_encoder_for_format(context.get(), compression_format,
-                                              &encoder_ptr);
-  if (error.code != heif_error_Ok) {
-    std::string error_msg = "Failed to get encoder for format: ";
-    error_msg += (compression_format == heif_compression_AV1) ? "AV1" : "HEVC";
-    message_handler_->ReportMessage(Message::kDecodingError, error_msg);
     return false;
   }
-  std::unique_ptr<heif_encoder, LibHeifDeleter> encoder(encoder_ptr);
-  heif_encoder_set_lossy_quality(encoder.get(), 100);
-
-  std::unique_ptr<heif_context, LibHeifDeleter> new_context(heif_context_alloc());
-  error = heif_context_encode_image(new_context.get(), img.get(), encoder.get(),
-                                    nullptr, nullptr);
-  if (error.code != heif_error_Ok) {
-    message_handler_->ReportMessage(Message::kDecodingError,
-                                    "Failed to re-encode the image");
-    return false;
-  }
-
-  error =
-      heif_context_add_XMP_metadata(new_context.get(), handle.get(),
-                                    xmp_metadata.data(), xmp_metadata.length());
-  if (error.code != heif_error_Ok) {
-    message_handler_->ReportMessage(Message::kDecodingError,
-                                    "Failed to add XMP to HEIF image");
-    return false;
-  }
-
-  struct heif_writer writer;
-  writer.writer_api_version = 1;
-  writer.write = HeifSinkWriter::WriteCallback;
-
-  error = heif_context_write(new_context.get(), &writer, output_sink);
-  if (error.code != heif_error_Ok) {
-    message_handler_->ReportMessage(Message::kDecodingError,
-                                    "Failed to write HEIF image to sink");
+  if (!output_sink->Write(edited.data(), edited.size())) {
+    if (message_handler_ != nullptr) {
+      message_handler_->ReportMessage(Message::kDecodingError,
+                                      "Failed to write HEIF image to sink");
+    }
     return false;
   }
 
@@ -175,11 +93,6 @@ bool MotionPhotoHeifImageBuilder::Build(const MediaSource& image_source,
   }
 
   return true;
-#else   // defined(MOTION_PHOTO_HEIC_SUPPORT)
-  message_handler_->ReportMessage(Message::kDecodingError,
-                                  "HEIF support is disabled in this build");
-  return false;
-#endif  // !defined(MOTION_PHOTO_HEIC_SUPPORT)
 }
 
 bool MotionPhotoHeifImageBuilder::AddImageFileAndMetadata(

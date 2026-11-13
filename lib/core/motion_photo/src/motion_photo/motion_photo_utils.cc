@@ -20,6 +20,7 @@
 #include <cctype>
 #include <cstdint>
 #include <fstream>
+#include <regex>
 #include <string>
 
 #include "motion_photo/motion_photo.h"
@@ -94,6 +95,43 @@ FileType GetFileTypeFromFileName(const std::string& file_name) {
   }
 
   return GetFileTypeFromFileExtension(file_name);
+}
+
+std::string StripMotionPhotoMetadata(const std::string& xmp) {
+  std::string result = xmp;
+
+  bool has_gainmap =
+      (xmp.find("Item:Semantic=\"GainMap\"") != std::string::npos ||
+       xmp.find("Item:Semantic='GainMap'") != std::string::npos ||
+       xmp.find("<Item:Semantic>GainMap</Item:Semantic>") != std::string::npos);
+
+  if (has_gainmap) {
+    std::regex attr_regex(
+        R"(\b(GCamera|Camera):(MotionPhoto|MotionPhotoVersion|MotionPhotoPresentationTimestampUs)\s*=\s*("[^"]*"|'[^']*'))");
+    result = std::regex_replace(result, attr_regex, "");
+
+    std::regex elem_regex(
+        R"(<((GCamera|Camera):(MotionPhoto|MotionPhotoVersion|MotionPhotoPresentationTimestampUs))>[^<]*</\1>)");
+    result = std::regex_replace(result, elem_regex, "");
+
+    std::regex item_regex(
+        R"raw(\s*<rdf:li\b(?:(?!</rdf:li>)[\s\S])*?Item:Semantic="MotionPhoto"(?:(?!</rdf:li>)[\s\S])*?</rdf:li>)raw");
+    result = std::regex_replace(result, item_regex, "");
+  } else {
+    std::regex attr_regex(
+        R"(\b(GCamera|Camera):(MotionPhoto|MotionPhotoVersion|MotionPhotoPresentationTimestampUs|Container:Version)\s*=\s*("[^"]*"|'[^']*'))");
+    result = std::regex_replace(result, attr_regex, "");
+
+    std::regex elem_regex(
+        R"(<((GCamera|Camera):(MotionPhoto|MotionPhotoVersion|MotionPhotoPresentationTimestampUs))>[^<]*</\1>)");
+    result = std::regex_replace(result, elem_regex, "");
+
+    std::regex directory_regex(
+        R"(<Container:Directory>[\s\S]*?</Container:Directory>)");
+    result = std::regex_replace(result, directory_regex, "");
+  }
+
+  return result;
 }
 
 }  // namespace motion_photo

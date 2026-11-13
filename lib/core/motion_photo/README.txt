@@ -23,9 +23,10 @@ This package's include and src directories have the same subdirectory structure:
         //third_party/mp4v2 library.
 *   motion_photo_heic
     *   The C++ classes that can be used to get motion photo metadata from an
-        HEIC file.
-    *   This code depends on the motion_photo and its dependencies, and on the
-        //third_party/libheif library.
+        HEIC file, and to losslessly rewrite HEIF (HEIC/AVIF) XMP metadata
+        (HeifIsoMetaEditor) without decoding or re-encoding image data.
+    *   This code depends on the motion_photo and its dependencies only; it
+        has no image codec dependency.
 *   motion_photo_checker_extractor_common (Internal Usage Only)
     *   Shared logic for checker and extractor, including helper functions for
         file I/O, parsing XMP metadata, and reading MP4 video details. This

@@ -190,47 +190,8 @@ string String(const T& value) {
   return ss.str();
 }
 
-//   track_id: The id of the track to return a representation of.
-// Returns a string representation of the track.
-
-std::string StripMotionPhotoMetadata(const std::string& xmp) {
-  std::string result = xmp;
-
-  bool has_gainmap =
-      (xmp.find("Item:Semantic=\"GainMap\"") != std::string::npos ||
-       xmp.find("Item:Semantic='GainMap'") != std::string::npos ||
-       xmp.find("<Item:Semantic>GainMap</Item:Semantic>") != std::string::npos);
-
-  if (has_gainmap) {
-    // Keep container, only remove MotionPhoto item
-    std::regex attr_regex(
-        R"(\b(GCamera|Camera):(MotionPhoto|MotionPhotoVersion|MotionPhotoPresentationTimestampUs)\s*=\s*("[^"]*"|'[^']*'))");
-    result = std::regex_replace(result, attr_regex, "");
-
-    std::regex elem_regex(
-        R"(<((GCamera|Camera):(MotionPhoto|MotionPhotoVersion|MotionPhotoPresentationTimestampUs))>[^<]*</\1>)");
-    result = std::regex_replace(result, elem_regex, "");
-
-    std::regex item_regex(
-        R"raw(\s*<rdf:li\b(?:(?!</rdf:li>)[\s\S])*?Item:Semantic="MotionPhoto"(?:(?!</rdf:li>)[\s\S])*?</rdf:li>)raw");
-    result = std::regex_replace(result, item_regex, "");
-  } else {
-    // Original aggressive stripping
-    std::regex attr_regex(
-        R"(\b(GCamera|Camera):(MotionPhoto|MotionPhotoVersion|MotionPhotoPresentationTimestampUs|Container:Version)\s*=\s*("[^"]*"|'[^']*'))");
-    result = std::regex_replace(result, attr_regex, "");
-
-    std::regex elem_regex(
-        R"(<((GCamera|Camera):(MotionPhoto|MotionPhotoVersion|MotionPhotoPresentationTimestampUs))>[^<]*</\1>)");
-    result = std::regex_replace(result, elem_regex, "");
-
-    std::regex directory_regex(
-        R"(<Container:Directory>[\s\S]*?</Container:Directory>)");
-    result = std::regex_replace(result, directory_regex, "");
-  }
-
-  return result;
-}
+// Strips MotionPhoto metadata from XMP using StripMotionPhotoMetadata() in
+// motion_photo_utils.h.
 
 }  // namespace
 
@@ -340,12 +301,14 @@ int ExtractMotionPhoto(const MotionPhotoExtractorParams& params,
               std::fstream out_heic(
                   params.primary_image_file_name_output,
                   std::ios::in | std::ios::out | std::ios::binary);
-              if (out_heic.is_open() &&
-                  out_heic.seekp(
-                      static_cast<std::streamoff>(xmp_range.GetBegin()))) {
-                out_heic.write(
-                    stripped_xmp.data(),
-                    static_cast<std::streamsize>(stripped_xmp.size()));
+              if (!out_heic.is_open() ||
+                  !out_heic.seekp(
+                      static_cast<std::streamoff>(xmp_range.GetBegin())) ||
+                  !out_heic.write(
+                      stripped_xmp.data(),
+                      static_cast<std::streamsize>(stripped_xmp.size())) ||
+                  !out_heic.flush()) {
+                return 1;
               }
             }
           }
@@ -443,11 +406,13 @@ int ExtractMotionPhoto(const MotionPhotoExtractorParams& params,
           std::fstream out_heic(
               params.primary_image_file_name_output,
               std::ios::in | std::ios::out | std::ios::binary);
-          if (out_heic.is_open() &&
-              out_heic.seekp(
-                  static_cast<std::streamoff>(xmp_range.GetBegin()))) {
-            out_heic.write(padded_xmp.data(),
-                           static_cast<std::streamsize>(padded_xmp.size()));
+          if (!out_heic.is_open() ||
+              !out_heic.seekp(
+                  static_cast<std::streamoff>(xmp_range.GetBegin())) ||
+              !out_heic.write(padded_xmp.data(),
+                              static_cast<std::streamsize>(padded_xmp.size())) ||
+              !out_heic.flush()) {
+            build_success = false;
           }
         }
       } else {

@@ -603,6 +603,62 @@ int CheckMotionPhotoFromMemory(const uint8_t* data, size_t size,
 // 3. Media & Metadata Extraction
 // =========================================================================
 
+namespace {
+
+bool IsHeifHeader(const uint8_t* data, size_t size) {
+  return size >= 12 && data[4] == 'f' && data[5] == 't' && data[6] == 'y' &&
+         data[7] == 'p';
+}
+
+bool ScanHeifMpvdBox(::photos_editing_formats::image_io::DataSource* data_source,
+                     ::libmotionphoto::motion_photo::MpvdBox* out_box) {
+  ::libmotionphoto::motion_photo::MpvdBoxScanReceiver receiver(*out_box);
+  ::libmotionphoto::motion_photo::MpvdBox::Scan(data_source, 0, receiver);
+  return out_box->IsValid();
+}
+
+bool ScanHeifMpvdBoxFromMemory(const uint8_t* data, size_t size,
+                               ::libmotionphoto::motion_photo::MpvdBox* out_box) {
+  auto data_segment = ::photos_editing_formats::image_io::DataSegment::Create(
+      ::photos_editing_formats::image_io::DataRange(0, size), data,
+      ::photos_editing_formats::image_io::DataSegment::BufferDispositionPolicy::
+          kDontDelete);
+  ::photos_editing_formats::image_io::DataSegmentDataSource data_source(
+      data_segment);
+  return ScanHeifMpvdBox(&data_source, out_box);
+}
+
+void StripHeifMotionPhotoXmpInPlace(std::vector<uint8_t>* buffer) {
+  if (buffer == nullptr || !IsHeifHeader(buffer->data(), buffer->size())) {
+    return;
+  }
+  auto data_segment = ::photos_editing_formats::image_io::DataSegment::Create(
+      ::photos_editing_formats::image_io::DataRange(0, buffer->size()),
+      buffer->data(),
+      ::photos_editing_formats::image_io::DataSegment::BufferDispositionPolicy::
+          kDontDelete);
+  ::photos_editing_formats::image_io::DataSegmentDataSource data_source(
+      data_segment);
+  ::photos_editing_formats::image_io::DataRange xmp_range =
+      ::libmotionphoto::motion_photo::FindHeifPrimaryXmpRange(&data_source,
+                                                              buffer->size());
+  if (!xmp_range.IsValid() || xmp_range.GetEnd() > buffer->size()) {
+    return;
+  }
+  std::string original_xmp(
+      reinterpret_cast<const char*>(buffer->data() + xmp_range.GetBegin()),
+      xmp_range.GetLength());
+  std::string stripped_xmp =
+      ::libmotionphoto::motion_photo::StripMotionPhotoMetadata(original_xmp);
+  if (stripped_xmp.size() <= xmp_range.GetLength()) {
+    stripped_xmp.append(xmp_range.GetLength() - stripped_xmp.size(), ' ');
+    std::memcpy(buffer->data() + xmp_range.GetBegin(), stripped_xmp.data(),
+                stripped_xmp.size());
+  }
+}
+
+}  // namespace
+
 bool ExtractPrimaryImageFromFile(const std::string& input_filepath,
                                  const std::string& output_image_path,
                                  MessageCallback callback) {
@@ -631,15 +687,15 @@ bool ExtractPrimaryImageFromFd(int fd, int64_t offset, int64_t length,
     return false;
   }
   int64_t image_length = length - metadata.video_length;
-  char header_buf[12];
+  uint8_t header_buf[12];
   ssize_t header_read = pread(fd, header_buf, sizeof(header_buf), offset);
-  if (header_read >= 12 && header_buf[4] == 'f' && header_buf[5] == 't' &&
-      header_buf[6] == 'y' && header_buf[7] == 'p') {
+  const bool is_heif =
+      header_read >= 12 && IsHeifHeader(header_buf, sizeof(header_buf));
+  if (is_heif) {
     FdDataSource data_source(fd, offset, length, /*owns_fd=*/false);
     ::libmotionphoto::motion_photo::MpvdBox mpvd_box;
-    ::libmotionphoto::motion_photo::MpvdBoxScanReceiver receiver(mpvd_box);
-    ::libmotionphoto::motion_photo::MpvdBox::Scan(&data_source, 0, receiver);
-    if (!mpvd_box.IsValid() || mpvd_box.GetStartIndex() == 0) {
+    if (!ScanHeifMpvdBox(&data_source, &mpvd_box) ||
+        mpvd_box.GetStartIndex() == 0) {
       return false;
     }
     image_length = static_cast<int64_t>(mpvd_box.GetStartIndex());
@@ -656,6 +712,9 @@ bool ExtractPrimaryImageFromFd(int fd, int64_t offset, int64_t length,
     total_read += static_cast<size_t>(bytes);
   }
   if (total_read != static_cast<size_t>(image_length)) return false;
+  if (is_heif) {
+    StripHeifMotionPhotoXmpInPlace(&buffer);
+  }
   return WriteBufferToFile(output_image_path, buffer.data(), image_length);
 }
 
@@ -669,23 +728,21 @@ bool ExtractPrimaryImageFromMemory(const uint8_t* data, size_t size,
     return false;
   }
   size_t image_length = size - metadata.video_length;
-  if (size >= 12 && data[4] == 'f' && data[5] == 't' && data[6] == 'y' &&
-      data[7] == 'p') {
-    auto data_segment = ::photos_editing_formats::image_io::DataSegment::Create(
-        ::photos_editing_formats::image_io::DataRange(0, size), data,
-        ::photos_editing_formats::image_io::DataSegment::
-            BufferDispositionPolicy::kDontDelete);
-    ::photos_editing_formats::image_io::DataSegmentDataSource data_source(
-        data_segment);
+  const bool is_heif = IsHeifHeader(data, size);
+  if (is_heif) {
     ::libmotionphoto::motion_photo::MpvdBox mpvd_box;
-    ::libmotionphoto::motion_photo::MpvdBoxScanReceiver receiver(mpvd_box);
-    ::libmotionphoto::motion_photo::MpvdBox::Scan(&data_source, 0, receiver);
-    if (!mpvd_box.IsValid() || mpvd_box.GetStartIndex() == 0) {
+    if (!ScanHeifMpvdBoxFromMemory(data, size, &mpvd_box) ||
+        mpvd_box.GetStartIndex() == 0) {
       return false;
     }
     image_length = mpvd_box.GetStartIndex();
   }
   if (image_length == 0 || image_length > size) return false;
+  if (is_heif) {
+    std::vector<uint8_t> buffer(data, data + image_length);
+    StripHeifMotionPhotoXmpInPlace(&buffer);
+    return WriteBufferToFile(output_image_path, buffer.data(), buffer.size());
+  }
   return WriteBufferToFile(output_image_path, data, image_length);
 }
 
@@ -718,15 +775,13 @@ bool ExtractVideoTrackFromFd(int fd, int64_t offset, int64_t length,
   }
   int64_t video_offset = length - metadata.video_length;
   int64_t video_length = metadata.video_length;
-  char header_buf[12];
+  uint8_t header_buf[12];
   ssize_t header_read = pread(fd, header_buf, sizeof(header_buf), offset);
-  if (header_read >= 12 && header_buf[4] == 'f' && header_buf[5] == 't' &&
-      header_buf[6] == 'y' && header_buf[7] == 'p') {
+  if (header_read >= 12 && IsHeifHeader(header_buf, sizeof(header_buf))) {
     FdDataSource data_source(fd, offset, length, /*owns_fd=*/false);
     ::libmotionphoto::motion_photo::MpvdBox mpvd_box;
-    ::libmotionphoto::motion_photo::MpvdBoxScanReceiver receiver(mpvd_box);
-    ::libmotionphoto::motion_photo::MpvdBox::Scan(&data_source, 0, receiver);
-    if (!mpvd_box.IsValid() || mpvd_box.GetVideoLength() == 0) {
+    if (!ScanHeifMpvdBox(&data_source, &mpvd_box) ||
+        mpvd_box.GetVideoLength() == 0) {
       return false;
     }
     video_offset = static_cast<int64_t>(mpvd_box.GetStartIndex() +
@@ -768,18 +823,10 @@ bool ExtractVideoTrackFromMemory(const uint8_t* data, size_t size,
   }
   size_t video_offset = size - metadata.video_length;
   size_t video_length = static_cast<size_t>(metadata.video_length);
-  if (size >= 12 && data[4] == 'f' && data[5] == 't' && data[6] == 'y' &&
-      data[7] == 'p') {
-    auto data_segment = ::photos_editing_formats::image_io::DataSegment::Create(
-        ::photos_editing_formats::image_io::DataRange(0, size), data,
-        ::photos_editing_formats::image_io::DataSegment::
-            BufferDispositionPolicy::kDontDelete);
-    ::photos_editing_formats::image_io::DataSegmentDataSource data_source(
-        data_segment);
+  if (IsHeifHeader(data, size)) {
     ::libmotionphoto::motion_photo::MpvdBox mpvd_box;
-    ::libmotionphoto::motion_photo::MpvdBoxScanReceiver receiver(mpvd_box);
-    ::libmotionphoto::motion_photo::MpvdBox::Scan(&data_source, 0, receiver);
-    if (!mpvd_box.IsValid() || mpvd_box.GetVideoLength() == 0) {
+    if (!ScanHeifMpvdBoxFromMemory(data, size, &mpvd_box) ||
+        mpvd_box.GetVideoLength() == 0) {
       return false;
     }
     video_offset = mpvd_box.GetStartIndex() + mpvd_box.GetHeaderLength();

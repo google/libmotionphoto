@@ -277,10 +277,16 @@ TEST(LibMotionPhotoApiTest, ExtractHeicTriadValid) {
   EXPECT_TRUE(fs::file_size(img_file) > 0u);
   EXPECT_EQ(fs::file_size(img_file), fs::file_size(img_fd));
   EXPECT_EQ(fs::file_size(img_file), fs::file_size(img_mem));
-  // Extracted still image from File has MotionPhoto XMP stripped and no mpvd box.
+  // Extracted still image from File/Fd/Memory has MotionPhoto XMP stripped and no mpvd box.
   EXPECT_FALSE(ParseMotionPhotoFromFile(img_file, nullptr));
   EXPECT_FALSE(ParseMotionPhotoFromFile(img_fd, nullptr));
   EXPECT_FALSE(ParseMotionPhotoFromFile(img_mem, nullptr));
+  for (const std::string& extracted_path : {img_file, img_fd, img_mem}) {
+    std::ifstream in(extracted_path, std::ios::binary);
+    std::string bytes((std::istreambuf_iterator<char>(in)),
+                      std::istreambuf_iterator<char>());
+    EXPECT_EQ(bytes.find("MotionPhoto="), std::string::npos);
+  }
   fs::remove(img_file);
   fs::remove(img_fd);
   fs::remove(img_mem);

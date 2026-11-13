@@ -218,7 +218,8 @@ bool ParseIloc(const uint8_t* payload, size_t size, Iloc* iloc) {
       return false;
     }
     const size_t extent_bytes = index_size + offset_size + length_size;
-    if (extent_bytes > 0 && extent_count > r.remaining() / extent_bytes) {
+    if ((extent_bytes == 0 && extent_count > 1) ||
+        (extent_bytes > 0 && extent_count > r.remaining() / extent_bytes)) {
       return false;
     }
     for (uint64_t e = 0; e < extent_count; ++e) {

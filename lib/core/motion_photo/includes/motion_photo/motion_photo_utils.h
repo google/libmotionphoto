@@ -28,6 +28,10 @@ namespace motion_photo {
 // Returns the type of the file based on the extension.
 FileType GetFileTypeFromFileName(const std::string& file_name);
 
+// Strips MotionPhoto-specific XMP attributes/elements while preserving
+// unrelated XMP properties (and Container:Directory if a GainMap is present).
+std::string StripMotionPhotoMetadata(const std::string& xmp);
+
 }  // namespace motion_photo
 }  // namespace libmotionphoto
 

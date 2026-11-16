@@ -53,6 +53,7 @@
 #include "motion_photo_jpeg/motion_photo_jpeg_image_builder.h"
 #include "motion_photo_jpeg/motion_photo_jpeg_info_builder.h"
 #include "motion_photo_mp4/motion_photo_mp4_file_builder.h"
+#include "motion_photo_mp4/mp4_mett_box_injector.h"
 
 namespace libmotionphoto {
 namespace motion_photo {
@@ -512,103 +513,131 @@ int BuildMotionPhotoDirect(const MotionPhotoStreamParams& params,
 
   MotionPhoto motion_photo(file_type);
   MotionPhotoWriter motion_photo_writer(motion_photo);
-  int64_t target_timestamp = params.presentation_timestamp_us;
-  if (target_timestamp >= 0) {
-    motion_photo.SetImageTimestamp(target_timestamp);
-  }
+  std::shared_ptr<DataSegment> jpeg_segment;
+  std::unique_ptr<DataSegmentDataSource> jpeg_source;
+  std::unique_ptr<MotionPhotoJpegInfoBuilder> jpeg_info_builder;
 
-  if (!params.moments_xmp.empty()) {
-    size_t count = 0;
-    MotionPhotoReader motion_photo_reader(&motion_photo, &message_handler);
-    if (motion_photo_reader.ReadVideoMetadata(params.moments_xmp, &count)) {
-      if (target_timestamp < 0) {
-        target_timestamp = motion_photo.GetVideoMetadata()
-                               .GetScoreDescriptor()
-                               .GetPrimaryImageFrameScoreDescriptor()
-                               .GetPresentationTimestampUs();
-        if (target_timestamp >= 0) {
-          motion_photo.SetImageTimestamp(target_timestamp);
+  if (file_type == FileType::kJpeg) {
+    size_t image_size = params.primary_image->GetSize();
+    if (image_size == 0) {
+      message_handler.ReportMessage(Message::kDecodingError,
+                                    "Empty primary image stream");
+      return 1;
+    }
+    std::unique_ptr<Byte[]> img_buf(new Byte[image_size]);
+    if (!params.primary_image->ReadAt(0, image_size, img_buf.get())) {
+      message_handler.ReportMessage(Message::kDecodingError,
+                                    "Failed to read primary image stream");
+      return 1;
+    }
+    jpeg_segment = DataSegment::Create(DataRange(0, image_size),
+                                       img_buf.release(), DataSegment::kDelete);
+    jpeg_source = std::make_unique<DataSegmentDataSource>(jpeg_segment);
+    jpeg_info_builder =
+        std::make_unique<MotionPhotoJpegInfoBuilder>(&message_handler);
+    jpeg_info_builder->Build(jpeg_source.get());
+    if (jpeg_info_builder->GetPrimaryXmpStringRange().IsValid()) {
+      size_t bytes_parsed = 0;
+      MotionPhotoReader image_reader(&motion_photo, &message_handler);
+      image_reader.ReadImageMetadata(
+          {jpeg_info_builder->GetPrimaryXmpStringRange()}, jpeg_source.get(),
+          &bytes_parsed);
+    }
+    motion_photo.SetIsMotionPhoto(true);
+
+    const auto& image_ranges = jpeg_info_builder->GetInfo().GetImageRanges();
+    ContainerMetadata container = motion_photo.GetContainerMetadata();
+    auto& items = container.items;
+    if (image_ranges.size() > 1) {
+      bool has_gainmap = false;
+      for (auto& item : items) {
+        if (item.semantic.WasAssigned() &&
+            item.semantic.GetValue() == kContainerItemSemanticGainMap) {
+          item.length = image_ranges[1].GetLength();
+          has_gainmap = true;
+          break;
+        }
+      }
+      if (!has_gainmap) {
+        ContainerItemMetadata gainmap_item;
+        gainmap_item.semantic = kContainerItemSemanticGainMap;
+        gainmap_item.mime = kContainerJpegImageItemMime;
+        gainmap_item.length = image_ranges[1].GetLength();
+        items.insert(items.begin() + 1, gainmap_item);
+      }
+    } else {
+      for (auto it = items.begin(); it != items.end(); ++it) {
+        if (it->semantic.WasAssigned() &&
+            it->semantic.GetValue() == kContainerItemSemanticGainMap) {
+          items.erase(it);
+          break;
         }
       }
     }
+    motion_photo.SetContainerMetadata(std::move(container));
   }
 
-  size_t video_size = params.primary_video->GetSize();
-  motion_photo.SetVideoLength(video_size);
+  bool has_video_xmp = false;
+  if (!params.moments_xmp.empty()) {
+    size_t count = 0;
+    MotionPhotoReader video_reader(&motion_photo, &message_handler);
+    has_video_xmp = video_reader.ReadVideoMetadata(params.moments_xmp, &count);
+  }
 
+  if (params.presentation_timestamp_us >= 0) {
+    motion_photo.SetImageTimestamp(params.presentation_timestamp_us);
+  } else if (has_video_xmp) {
+    int64_t video_xmp_timestamp = motion_photo.GetVideoMetadata()
+                                      .GetScoreDescriptor()
+                                      .GetPrimaryImageFrameScoreDescriptor()
+                                      .GetPresentationTimestampUs();
+    if (video_xmp_timestamp >= 0) {
+      motion_photo.SetImageTimestamp(video_xmp_timestamp);
+    }
+  }
+  motion_photo.EnforceConsistentValues();
+
+  vector<uint8_t> video_metadata;
+  motion_photo_writer.EncodeVideoMetadata(&video_metadata);
+  if (video_metadata.empty()) {
+    message_handler.ReportMessage(
+        Message::kInternalError,
+        "Failed to encode Motion Photo video metadata");
+    return 1;
+  }
+
+  PreparedMp4MettInjection prepared_mp4;
+  if (!PrepareMp4MettInjection(*params.primary_video, video_metadata,
+                               &prepared_mp4)) {
+    message_handler.ReportMessage(
+        Message::kDecodingError,
+        "Failed to inject Motion Photo metadata track into video");
+    return 1;
+  }
+
+  size_t video_size = prepared_mp4.output_video_size;
+  motion_photo.SetVideoLength(video_size);
   if (IsHeif(file_type)) {
     motion_photo.SetMpvdBox(MpvdBox(video_size));
     motion_photo.SetImagePadding(motion_photo.GetMpvdBox().GetHeaderLength());
   }
+  motion_photo.EnforceConsistentValues();
 
   string image_metadata;
   bool xmp_merged = false;
-  std::unique_ptr<MotionPhotoJpegInfoBuilder> jpeg_info_builder;
-
-  if (file_type == FileType::kJpeg) {
-    jpeg_info_builder =
-        std::make_unique<MotionPhotoJpegInfoBuilder>(&message_handler);
-    size_t image_size = params.primary_image->GetSize();
-    Byte* img_buf = new Byte[image_size];
-    if (params.primary_image->ReadAt(0, image_size, img_buf)) {
-      auto image_segment = DataSegment::Create(
-          DataRange(0, image_size), img_buf, DataSegment::kDelete);
-      image_io::DataSegmentDataSource image_source(image_segment);
-      jpeg_info_builder->Build(&image_source);
-      if (jpeg_info_builder->GetPrimaryXmpStringRange().IsValid()) {
-        size_t bytes_parsed = 0;
-        MotionPhotoReader motion_photo_reader(&motion_photo, &message_handler);
-        motion_photo_reader.ReadImageMetadata(
-            {jpeg_info_builder->GetPrimaryXmpStringRange()}, &image_source,
-            &bytes_parsed);
-        if (target_timestamp != -1) {
-          motion_photo.SetImageTimestamp(target_timestamp);
-        }
-      }
-      motion_photo.SetIsMotionPhoto(true);
-
-      const auto& image_ranges = jpeg_info_builder->GetInfo().GetImageRanges();
-      if (image_ranges.size() > 1) {
-        ContainerMetadata container = motion_photo.GetContainerMetadata();
-        bool has_gainmap = false;
-        for (auto& item : container.items) {
-          if (item.semantic.WasAssigned() &&
-              item.semantic.GetValue() == kContainerItemSemanticGainMap) {
-            item.length = image_ranges[1].GetLength();
-            has_gainmap = true;
-            break;
-          }
-        }
-        if (!has_gainmap) {
-          ContainerItemMetadata gainmap_item;
-          gainmap_item.semantic = kContainerItemSemanticGainMap;
-          gainmap_item.mime = kContainerJpegImageItemMime;
-          gainmap_item.length = image_ranges[1].GetLength();
-          container.items.insert(container.items.begin() + 1, gainmap_item);
-        }
-        motion_photo.SetContainerMetadata(std::move(container));
-      }
-      motion_photo.SetVideoLength(video_size);
-      motion_photo.EnforceConsistentValues();
-
-      if (jpeg_info_builder->GetPrimaryXmpStringRange().IsValid()) {
-        auto xmp_range = jpeg_info_builder->GetPrimaryXmpStringRange();
-        auto xmp_segment = image_source.GetDataSegment(xmp_range.GetBegin(),
-                                                       xmp_range.GetLength());
-        if (xmp_segment) {
-          string original_xmp(
-              reinterpret_cast<const char*>(
-                  xmp_segment->GetBuffer(xmp_range.GetBegin())),
-              xmp_range.GetLength());
-          image_metadata = MergeXmpMetadata(original_xmp, motion_photo);
-          xmp_merged = true;
-        }
-      }
-    } else {
-      delete[] img_buf;
+  if (file_type == FileType::kJpeg && jpeg_info_builder != nullptr &&
+      jpeg_info_builder->GetPrimaryXmpStringRange().IsValid()) {
+    auto xmp_range = jpeg_info_builder->GetPrimaryXmpStringRange();
+    auto xmp_segment = jpeg_source->GetDataSegment(xmp_range.GetBegin(),
+                                                   xmp_range.GetLength());
+    if (xmp_segment) {
+      string original_xmp(reinterpret_cast<const char*>(
+                              xmp_segment->GetBuffer(xmp_range.GetBegin())),
+                          xmp_range.GetLength());
+      image_metadata = MergeXmpMetadata(original_xmp, motion_photo);
+      xmp_merged = true;
     }
   }
-
   if (!xmp_merged) {
     motion_photo_writer.WriteImageMetadata(&image_metadata);
   }
@@ -628,10 +657,12 @@ int BuildMotionPhotoDirect(const MotionPhotoStreamParams& params,
     }
   }
 
-  // 2. Direct Video Transfer into output sink
-  if (!output_sink->TransferFrom(*params.primary_video, 0, video_size)) {
-    message_handler.ReportMessage(Message::kInternalError,
-                                  "Failed to append video payload to output sink");
+  // 2. Direct Video + 'meta' Track Transfer into output sink
+  if (!WriteMp4WithMettToSink(*params.primary_video, prepared_mp4,
+                              output_sink)) {
+    message_handler.ReportMessage(
+        Message::kInternalError,
+        "Failed to append video payload to output sink");
     return 1;
   }
 
@@ -709,6 +740,61 @@ int BuildMotionPhoto(const MotionPhotoBuilderParams& params,
 
   MotionPhoto motion_photo(file_type);
   MotionPhotoWriter motion_photo_writer(motion_photo);
+  std::shared_ptr<DataSegment> jpeg_segment;
+  std::unique_ptr<DataSegmentDataSource> jpeg_source;
+  std::unique_ptr<MotionPhotoJpegInfoBuilder> jpeg_info_builder;
+
+  if (file_type == FileType::kJpeg) {
+    jpeg_segment =
+        ReadEntireFile(local_params.primary_image_file_name, &message_handler);
+    if (!jpeg_segment) {
+      return 1;
+    }
+    jpeg_source = std::make_unique<DataSegmentDataSource>(jpeg_segment);
+    jpeg_info_builder =
+        std::make_unique<MotionPhotoJpegInfoBuilder>(&message_handler);
+    jpeg_info_builder->Build(jpeg_source.get());
+    if (jpeg_info_builder->GetPrimaryXmpStringRange().IsValid()) {
+      size_t bytes_parsed = 0;
+      MotionPhotoReader image_reader(&motion_photo, &message_handler);
+      image_reader.ReadImageMetadata(
+          {jpeg_info_builder->GetPrimaryXmpStringRange()}, jpeg_source.get(),
+          &bytes_parsed);
+    }
+    motion_photo.SetIsMotionPhoto(true);
+
+    const auto& image_ranges = jpeg_info_builder->GetInfo().GetImageRanges();
+    ContainerMetadata container = motion_photo.GetContainerMetadata();
+    auto& items = container.items;
+    if (image_ranges.size() > 1) {
+      bool has_gainmap = false;
+      for (auto& item : items) {
+        if (item.semantic.WasAssigned() &&
+            item.semantic.GetValue() == kContainerItemSemanticGainMap) {
+          item.length = image_ranges[1].GetLength();
+          has_gainmap = true;
+          break;
+        }
+      }
+      if (!has_gainmap) {
+        ContainerItemMetadata gainmap_item;
+        gainmap_item.semantic = kContainerItemSemanticGainMap;
+        gainmap_item.mime = kContainerJpegImageItemMime;
+        gainmap_item.length = image_ranges[1].GetLength();
+        items.insert(items.begin() + 1, gainmap_item);
+      }
+    } else {
+      for (auto it = items.begin(); it != items.end(); ++it) {
+        if (it->semantic.WasAssigned() &&
+            it->semantic.GetValue() == kContainerItemSemanticGainMap) {
+          items.erase(it);
+          break;
+        }
+      }
+    }
+    motion_photo.SetContainerMetadata(std::move(container));
+  }
+
   vector<uint8_t> video_metadata;
   stringstream xmpss;
   bool has_xmp = false;
@@ -724,52 +810,61 @@ int BuildMotionPhoto(const MotionPhotoBuilderParams& params,
     has_xmp = true;
   }
 
-  if (local_params.presentation_timestamp_us >= 0) {
-    motion_photo.SetImageTimestamp(local_params.presentation_timestamp_us);
-  }
-
+  bool has_valid_video_xmp = false;
   if (has_xmp) {
     size_t count = 0;
     MotionPhotoReader motion_photo_reader(&motion_photo, &message_handler);
-    if (motion_photo_reader.ReadVideoMetadata(xmpss.str(), &count)) {
-      motion_photo_writer.EncodeVideoMetadata(&video_metadata);
-      if (local_params.presentation_timestamp_us < 0) {
-        target_timestamp = motion_photo.GetVideoMetadata()
-                               .GetScoreDescriptor()
-                               .GetPrimaryImageFrameScoreDescriptor()
-                               .GetPresentationTimestampUs();
-        motion_photo.SetImageTimestamp(target_timestamp);
-      }
-      stringstream ss;
-      GetSummary(motion_photo.GetVideoMetadata(), &ss);
-      outputter(ss.str());
+    has_valid_video_xmp =
+        motion_photo_reader.ReadVideoMetadata(xmpss.str(), &count);
+  }
+
+  if (local_params.presentation_timestamp_us >= 0) {
+    motion_photo.SetImageTimestamp(local_params.presentation_timestamp_us);
+  } else if (has_valid_video_xmp) {
+    target_timestamp = motion_photo.GetVideoMetadata()
+                           .GetScoreDescriptor()
+                           .GetPrimaryImageFrameScoreDescriptor()
+                           .GetPresentationTimestampUs();
+    if (target_timestamp >= 0) {
+      motion_photo.SetImageTimestamp(target_timestamp);
     }
   }
+  motion_photo.EnforceConsistentValues();
 
-  bool disable_mp4_optimize = false;
-#ifdef DISABLE_MP4_OPTIMIZE
-  disable_mp4_optimize = true;
-#endif
-
-  if (!disable_mp4_optimize && !local_params.primary_video_file_name.empty()) {
-    if (!MotionPhotoMp4FileBuilder::IsOptimizationSupported(
-            local_params.primary_video_file_name, &message_handler)) {
-      disable_mp4_optimize = true;
-    }
+  if (has_valid_video_xmp) {
+    stringstream ss;
+    GetSummary(motion_photo.GetVideoMetadata(), &ss);
+    outputter(ss.str());
   }
-
-  if (local_params.moments_video_file_name.empty() && video_metadata.empty()) {
-    disable_mp4_optimize = true;
+  motion_photo_writer.EncodeVideoMetadata(&video_metadata);
+  if (video_metadata.empty()) {
+    message_handler.ReportMessage(
+        Message::kInternalError,
+        "Failed to encode Motion Photo video metadata");
+    return 1;
   }
-
-  bool need_working_video = !local_params.moments_video_file_name.empty() ||
-                            !video_metadata.empty() || !disable_mp4_optimize;
 
   string track_summary;
   size_t file_size = 0;
   string video_to_append = local_params.primary_video_file_name;
+  bool use_mp4_file_builder = !local_params.moments_video_file_name.empty();
+  bool use_direct_mett_injector = false;
+  std::unique_ptr<MediaSource> direct_vid_source;
+  PreparedMp4MettInjection prepared_mp4;
 
-  if (need_working_video) {
+  if (use_mp4_file_builder) {
+    bool disable_mp4_optimize = false;
+#ifdef DISABLE_MP4_OPTIMIZE
+    disable_mp4_optimize = true;
+#endif
+    if (!disable_mp4_optimize &&
+        !local_params.primary_video_file_name.empty()) {
+      if (!MotionPhotoMp4FileBuilder::IsOptimizationSupported(
+              local_params.primary_video_file_name, &message_handler)) {
+        disable_mp4_optimize = true;
+      }
+    }
+
     video_to_append = local_params.working_video_file_name;
     MotionPhotoMp4FileBuilder mp4_builder(local_params.working_video_file_name,
                                           &message_handler);
@@ -782,25 +877,21 @@ int BuildMotionPhoto(const MotionPhotoBuilderParams& params,
         outputter(track_summary);
       }
     }
-    if (!local_params.moments_video_file_name.empty()) {
-      outputter("\nReading " + local_params.moments_video_file_name + "\n");
-      if (!mp4_builder.AddMomentsMp4FileTrack(
-              local_params.moments_video_file_name, &track_summary)) {
-        return 1;
-      } else {
-        outputter(track_summary);
-      }
+    outputter("\nReading " + local_params.moments_video_file_name + "\n");
+    if (!mp4_builder.AddMomentsMp4FileTrack(
+            local_params.moments_video_file_name, &track_summary)) {
+      return 1;
+    } else {
+      outputter(track_summary);
     }
-    if (!video_metadata.empty()) {
-      outputter("\nWriting video metadata: " + String(video_metadata.size()) +
-                " bytes\n");
-      if (!mp4_builder.AddMomentsMetadataTrack(video_metadata)) {
-        return 1;
-      } else {
-        stringstream ss;
-        GetHexDump(video_metadata, &ss);
-        outputter(ss.str());
-      }
+    outputter("\nWriting video metadata: " + String(video_metadata.size()) +
+              " bytes\n");
+    if (!mp4_builder.AddMomentsMetadataTrack(video_metadata)) {
+      return 1;
+    } else {
+      stringstream ss;
+      GetHexDump(video_metadata, &ss);
+      outputter(ss.str());
     }
 
     if (!local_params.optimized_video_file_name.empty() &&
@@ -828,99 +919,50 @@ int BuildMotionPhoto(const MotionPhotoBuilderParams& params,
       outputter(track_summary);
     }
     motion_photo.SetVideoLength(file_size);
-  } else {
-    video_to_append = local_params.primary_video_file_name;
-    if (!video_to_append.empty()) {
-      outputter("\nBypassing video trailer modification\n");
-      if (!GetFileSize(video_to_append, &file_size)) {
-        message_handler.ReportMessage(Message::kStdLibError, video_to_append);
-        return 1;
-      }
-      track_summary = MotionPhotoMp4FileBuilder::GetFileTrackSummary(
-          video_to_append, &message_handler);
-      if (track_summary.empty()) {
-        return 1;
-      }
-      outputter("Video trailer size: " + String(file_size) + " bytes\n");
-      outputter(track_summary);
-      motion_photo.SetVideoLength(file_size);
+  } else if (!local_params.primary_video_file_name.empty()) {
+    outputter("\nReading " + local_params.primary_video_file_name + "\n");
+    direct_vid_source = MediaSource::FromFile(
+        local_params.primary_video_file_name, &message_handler);
+    if (!direct_vid_source) {
+      return 1;
     }
+    outputter("\nWriting video metadata: " + String(video_metadata.size()) +
+              " bytes\n");
+    if (!PrepareMp4MettInjection(*direct_vid_source, video_metadata,
+                                 &prepared_mp4)) {
+      message_handler.ReportMessage(
+          Message::kDecodingError,
+          "Failed to inject Motion Photo metadata track into video");
+      return 1;
+    }
+    stringstream ss;
+    GetHexDump(video_metadata, &ss);
+    outputter(ss.str());
+    file_size = prepared_mp4.output_video_size;
+    outputter("Video trailer size: " + String(file_size) + " bytes\n");
+    motion_photo.SetVideoLength(file_size);
+    use_direct_mett_injector = true;
   }
 
   if (IsHeif(file_type)) {
     motion_photo.SetMpvdBox(MpvdBox(file_size));
     motion_photo.SetImagePadding(motion_photo.GetMpvdBox().GetHeaderLength());
   }
+  motion_photo.EnforceConsistentValues();
 
   string image_metadata;
   bool xmp_merged = false;
-
-  if (file_type == FileType::kJpeg) {
-    auto image_segment =
-        ReadEntireFile(local_params.primary_image_file_name, &message_handler);
-    if (image_segment) {
-      image_io::DataSegmentDataSource image_source(image_segment);
-      MotionPhotoJpegInfoBuilder info_builder(&message_handler);
-      info_builder.Build(&image_source);
-      if (info_builder.GetPrimaryXmpStringRange().IsValid()) {
-        size_t bytes_parsed = 0;
-        MotionPhotoReader motion_photo_reader(&motion_photo, &message_handler);
-        motion_photo_reader.ReadImageMetadata(
-            {info_builder.GetPrimaryXmpStringRange()}, &image_source,
-            &bytes_parsed);
-        if (target_timestamp != -1) {
-          motion_photo.SetImageTimestamp(target_timestamp);
-        }
-      }
-      motion_photo.SetIsMotionPhoto(true);
-
-      const auto& image_ranges = info_builder.GetInfo().GetImageRanges();
-      ContainerMetadata container = motion_photo.GetContainerMetadata();
-      auto& items = container.items;
-      if (image_ranges.size() > 1) {
-        bool has_gainmap = false;
-        for (auto& item : items) {
-          if (item.semantic.WasAssigned() &&
-              item.semantic.GetValue() == kContainerItemSemanticGainMap) {
-            item.length = image_ranges[1].GetLength();
-            has_gainmap = true;
-            break;
-          }
-        }
-        if (!has_gainmap) {
-          ContainerItemMetadata gainmap_item;
-          gainmap_item.semantic = kContainerItemSemanticGainMap;
-          gainmap_item.mime = kContainerJpegImageItemMime;
-          gainmap_item.length = image_ranges[1].GetLength();
-          items.insert(items.begin() + 1, gainmap_item);
-        }
-      } else {
-        for (auto it = items.begin(); it != items.end(); ++it) {
-          if (it->semantic.WasAssigned() &&
-              it->semantic.GetValue() == kContainerItemSemanticGainMap) {
-            items.erase(it);
-            break;
-          }
-        }
-      }
-      motion_photo.SetContainerMetadata(std::move(container));
-      if (file_size > 0) {
-        motion_photo.SetVideoLength(file_size);
-      }
-      motion_photo.EnforceConsistentValues();
-      if (info_builder.GetPrimaryXmpStringRange().IsValid()) {
-        auto xmp_range = info_builder.GetPrimaryXmpStringRange();
-        auto xmp_segment = image_source.GetDataSegment(xmp_range.GetBegin(),
-                                                       xmp_range.GetLength());
-        if (xmp_segment) {
-          string original_xmp(
-              reinterpret_cast<const char*>(
-                  xmp_segment->GetBuffer(xmp_range.GetBegin())),
-              xmp_range.GetLength());
-          image_metadata = MergeXmpMetadata(original_xmp, motion_photo);
-          xmp_merged = true;
-        }
-      }
+  if (file_type == FileType::kJpeg && jpeg_info_builder != nullptr &&
+      jpeg_info_builder->GetPrimaryXmpStringRange().IsValid()) {
+    auto xmp_range = jpeg_info_builder->GetPrimaryXmpStringRange();
+    auto xmp_segment = jpeg_source->GetDataSegment(xmp_range.GetBegin(),
+                                                   xmp_range.GetLength());
+    if (xmp_segment) {
+      string original_xmp(reinterpret_cast<const char*>(
+                              xmp_segment->GetBuffer(xmp_range.GetBegin())),
+                          xmp_range.GetLength());
+      image_metadata = MergeXmpMetadata(original_xmp, motion_photo);
+      xmp_merged = true;
     }
   }
 
@@ -934,11 +976,25 @@ int BuildMotionPhoto(const MotionPhotoBuilderParams& params,
   if (local_params.output_image_file_name.empty()) {
     // Check mode completed successfully
     outputter("Image read and metadata merged ok\n");
-    if (need_working_video &&
+    if (use_mp4_file_builder &&
         local_params.working_video_file_name == kWorkVideoFileName) {
       std::remove(local_params.working_video_file_name.c_str());
     }
-    return 0;
+    return message_stats->error_count == 0 ? 0 : 1;
+  }
+
+  auto img_source = MediaSource::FromFile(local_params.primary_image_file_name,
+                                          &message_handler);
+  if (!img_source) {
+    return 1;
+  }
+  std::unique_ptr<MediaSource> mp4_builder_vid_source;
+  if (use_mp4_file_builder) {
+    mp4_builder_vid_source =
+        MediaSource::FromFile(video_to_append, &message_handler);
+    if (!mp4_builder_vid_source) {
+      return 1;
+    }
   }
 
   // Direct generation into destination file
@@ -948,16 +1004,10 @@ int BuildMotionPhoto(const MotionPhotoBuilderParams& params,
     return 1;
   }
 
-  auto img_source = MediaSource::FromFile(local_params.primary_image_file_name,
-                                          &message_handler);
-  auto vid_source = MediaSource::FromFile(video_to_append, &message_handler);
-  if (!img_source || !vid_source) {
-    return 1;
-  }
-
   if (file_type == FileType::kJpeg) {
     MotionPhotoJpegImageBuilder jpeg_builder(&message_handler);
-    if (!jpeg_builder.Build(*img_source, image_metadata, out_sink.get())) {
+    if (!jpeg_builder.Build(*img_source, image_metadata, out_sink.get(),
+                            jpeg_info_builder.get())) {
       return 1;
     }
   } else if (IsHeif(file_type)) {
@@ -972,17 +1022,27 @@ int BuildMotionPhoto(const MotionPhotoBuilderParams& params,
   outputter("\nConcatenating image and video files into " +
             local_params.output_image_file_name + "\n");
 
-  if (!out_sink->TransferFrom(*vid_source, 0, vid_source->GetSize())) {
-    message_handler.ReportMessage(Message::kInternalError,
-                                  "Failed to append video payload");
-    return 1;
+  if (use_direct_mett_injector) {
+    if (!WriteMp4WithMettToSink(*direct_vid_source, prepared_mp4,
+                                out_sink.get())) {
+      message_handler.ReportMessage(Message::kInternalError,
+                                    "Failed to append video payload");
+      return 1;
+    }
+  } else if (use_mp4_file_builder) {
+    if (!out_sink->TransferFrom(*mp4_builder_vid_source, 0,
+                                mp4_builder_vid_source->GetSize())) {
+      message_handler.ReportMessage(Message::kInternalError,
+                                    "Failed to append video payload");
+      return 1;
+    }
   }
 
   out_sink->Flush();
   outputter("Motion photo written to " + local_params.output_image_file_name +
             " ok\n");
 
-  if (need_working_video &&
+  if (use_mp4_file_builder &&
       local_params.working_video_file_name == kWorkVideoFileName) {
     std::remove(local_params.working_video_file_name.c_str());
   }

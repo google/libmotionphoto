@@ -36,12 +36,19 @@
 #include <vector>
 
 #include "motion_photo/metadata_engine.h"
+#include "motion_photo/motion_photo.h"
+#include "motion_photo/motion_photo_reader.h"
 #include "motion_photo/motion_photo_source.h"
+#include "motion_photo/motion_photo_writer.h"
 #include "motion_photo/tests/test_framework.h"
+#include "motion_photo/video_track_data.h"
 #include "motion_photo_builder/function.h"
 #include "motion_photo_checker/function.h"
 #include "motion_photo_extractor/function.h"
+#include "motion_photo_mp4/motion_photo_mp4_file_builder.h"
 #include "motion_photo_mp4/motion_photo_mp4_file_reader.h"
+#include "motion_photo_mp4/mp4_box_reader.h"
+#include "motion_photo_mp4/mp4_mett_box_injector.h"
 
 namespace libmotionphoto {
 namespace motion_photo {
@@ -442,6 +449,7 @@ TEST(MotionPhotoBuilderTest, StreamingAndMemory_HighResHdr_BitExactParity) {
   auto file_bytes = ReadFileBytes(kFileOut);
   EXPECT_EQ(file_bytes.size(), mem_bytes.size());
   EXPECT_TRUE(std::memcmp(file_bytes.data(), mem_bytes.data(), file_bytes.size()) == 0);
+  EXPECT_EQ(CheckMotionPhoto(kFileOut, [](absl::string_view) {}), 0);
 
   fs::remove_all(kTestDir);
 }
@@ -494,8 +502,10 @@ TEST(MotionPhotoBuilderTest, StreamingAndMemory_AgtmPreservation_BitExactParity)
   auto file_bytes = ReadFileBytes(kFileOut);
   EXPECT_EQ(file_bytes.size(), mem_bytes.size());
   EXPECT_TRUE(std::memcmp(file_bytes.data(), mem_bytes.data(), file_bytes.size()) == 0);
+  EXPECT_EQ(CheckMotionPhoto(kFileOut, [](absl::string_view) {}), 0);
 
-  // 4. Assert AGTM dynamic metadata is preserved identically
+  // 4. Assert AGTM dynamic metadata is preserved alongside the Motion Photo
+  // 'meta' track
   MetadataEngine engine(nullptr);
   std::string expected_agtm = engine.ExtractAgtmAtTimestamp(kInputVideo, 500000);
   EXPECT_FALSE(expected_agtm.empty());
@@ -508,7 +518,7 @@ TEST(MotionPhotoBuilderTest, StreamingAndMemory_AgtmPreservation_BitExactParity)
 }
 
 // -----------------------------------------------------------------------------
-// 8. DataSink::TransferFrom Single-Shot and Sequential Chunk Continuity
+// 9. DataSink::TransferFrom Single-Shot and Sequential Chunk Continuity
 // -----------------------------------------------------------------------------
 TEST(MotionPhotoBuilderTest, DataSink_TransferFrom_ContinuityAndIntegrity) {
   const string kTestDir = CreateTestDir("DataSink_TransferFrom");
@@ -554,6 +564,316 @@ TEST(MotionPhotoBuilderTest, DataSink_TransferFrom_ContinuityAndIntegrity) {
     EXPECT_EQ(in_bytes.size(), out_bytes.size());
     EXPECT_TRUE(std::memcmp(in_bytes.data(), out_bytes.data(), in_bytes.size()) == 0);
   }
+
+  fs::remove_all(kTestDir);
+}
+
+// -----------------------------------------------------------------------------
+// 10. Regression: JPEG + MP4 + Timestamp (Empty moments_xmp & moments_video)
+//     Always Emits Canonical 45-Byte v1 'meta' Track Across File & Memory APIs
+// -----------------------------------------------------------------------------
+TEST(MotionPhotoBuilderTest,
+     BuildJpegMp4WithTimestampOnly_InjectsDefault45ByteMetaTrack) {
+  const string kTestDir = CreateTestDir("BuildJpegMp4WithTimestampOnly");
+  const string kInputImage =
+      "lib/core/motion_photo/testdata/motion_photo_photo_only.jpg";
+  const string kInputVideo =
+      "lib/core/motion_photo/testdata/motion_photo_video_only.mp4";
+  const string kFileOut = (fs::path(kTestDir) / "IMG_TS_ONLY_MP.jpg").string();
+  const string kMemOut =
+      (fs::path(kTestDir) / "IMG_TS_ONLY_MEM_MP.jpg").string();
+  constexpr int64_t kTimestampUs = 799680;
+
+  MotionPhotoBuilderParams file_params;
+  file_params.primary_image_file_name = kInputImage;
+  file_params.primary_video_file_name = kInputVideo;
+  file_params.output_image_file_name = kFileOut;
+  file_params.presentation_timestamp_us = kTimestampUs;
+  EXPECT_EQ(BuildMotionPhoto(file_params, [](const string&) {}), 0);
+
+  auto img_bytes = ReadFileBytes(kInputImage);
+  auto vid_bytes = ReadFileBytes(kInputVideo);
+  MotionPhotoBuilderMemoryParams mem_params;
+  mem_params.primary_image_bytes = img_bytes.data();
+  mem_params.primary_image_size = img_bytes.size();
+  mem_params.primary_video_bytes = vid_bytes.data();
+  mem_params.primary_video_size = vid_bytes.size();
+  mem_params.output_image_file_name = kMemOut;
+  mem_params.presentation_timestamp_us = kTimestampUs;
+  EXPECT_EQ(BuildMotionPhotoFromMemory(mem_params, [](const string&) {}), 0);
+
+  auto built_file_bytes = ReadFileBytes(kFileOut);
+  auto built_mem_bytes = ReadFileBytes(kMemOut);
+  EXPECT_EQ(built_file_bytes.size(), built_mem_bytes.size());
+  EXPECT_EQ(std::memcmp(built_file_bytes.data(), built_mem_bytes.data(),
+                        built_file_bytes.size()),
+            0);
+  EXPECT_EQ(CheckMotionPhoto(kFileOut, [](absl::string_view) {}), 0);
+
+  // Locate appended MP4 and verify the injected 'meta' track and 45-byte
+  // ISO/IEC 14496-1 MetadataDescriptor payload.
+  size_t mp4_offset = built_file_bytes.size();
+  for (size_t i = 0; i + 8 <= built_file_bytes.size(); ++i) {
+    if (std::memcmp(built_file_bytes.data() + i + 4, "ftyp", 4) == 0) {
+      mp4_offset = i;
+      break;
+    }
+  }
+  ASSERT_TRUE(mp4_offset < built_file_bytes.size());
+
+  MotionPhotoMp4FileReader mp4_reader;
+  ASSERT_TRUE(mp4_reader.Read(kFileOut, static_cast<int64_t>(mp4_offset)));
+  const VideoTrackData& track_data = mp4_reader.GetVideoTrackData();
+  EXPECT_NE(track_data.high_res_metadata_track_id, kInvalidTrackId);
+  const std::vector<uint8_t>& meta_payload =
+      mp4_reader.GetHighResTrackVideoMetadata();
+  EXPECT_EQ(meta_payload.size(), static_cast<size_t>(45));
+
+  MotionPhoto decoded_mp(FileType::kJpeg);
+  MotionPhotoReader mp_reader(&decoded_mp, nullptr);
+  ASSERT_TRUE(mp_reader.DecodeVideoMetadata(meta_payload));
+  const auto& score_desc = decoded_mp.GetVideoMetadata().GetScoreDescriptor();
+  EXPECT_EQ(score_desc.GetModelVersion(), 0u);
+  EXPECT_EQ(score_desc.GetPrimaryImageFrameScoreDescriptor()
+                .GetPresentationTimestampUs(),
+            kTimestampUs);
+  EXPECT_EQ(score_desc.GetHighResTrackScoreDescriptor().GetNumScoredFrames(),
+            static_cast<size_t>(0));
+
+  fs::remove_all(kTestDir);
+}
+
+// -----------------------------------------------------------------------------
+// 11. Regression: JPEG + MP4 + Moments XMP Metadata & Timestamp Override Sync
+// -----------------------------------------------------------------------------
+TEST(MotionPhotoBuilderTest,
+     BuildJpegMp4WithMomentsXmp_InjectsScoredMetaTrackAndSyncsTimestamp) {
+  const string kTestDir = CreateTestDir("BuildJpegMp4WithMomentsXmp");
+  const string kInputImage =
+      "lib/core/motion_photo/testdata/motion_photo_photo_only.jpg";
+  const string kInputVideo =
+      "lib/core/motion_photo/testdata/motion_photo_video_only.mp4";
+  const string kMomentsXmpFile =
+      "lib/core/motion_photo/testdata/MomentsVideoMetadata.xmp";
+  auto xmp_file_bytes = ReadFileBytes(kMomentsXmpFile);
+  const string moments_xmp_str(
+      reinterpret_cast<const char*>(xmp_file_bytes.data()),
+      xmp_file_bytes.size());
+
+  // Case A: Timestamp derived from MomentsVideoMetadata.xmp (500000 us)
+  {
+    const string kFileOut =
+        (fs::path(kTestDir) / "IMG_XMP_FILE_MP.jpg").string();
+    const string kMemOut = (fs::path(kTestDir) / "IMG_XMP_MEM_MP.jpg").string();
+
+    MotionPhotoBuilderParams file_params;
+    file_params.primary_image_file_name = kInputImage;
+    file_params.primary_video_file_name = kInputVideo;
+    file_params.moments_xmp_file_name = kMomentsXmpFile;
+    file_params.output_image_file_name = kFileOut;
+    EXPECT_EQ(BuildMotionPhoto(file_params, [](const string&) {}), 0);
+
+    auto img_bytes = ReadFileBytes(kInputImage);
+    auto vid_bytes = ReadFileBytes(kInputVideo);
+    MotionPhotoBuilderMemoryParams mem_params;
+    mem_params.primary_image_bytes = img_bytes.data();
+    mem_params.primary_image_size = img_bytes.size();
+    mem_params.primary_video_bytes = vid_bytes.data();
+    mem_params.primary_video_size = vid_bytes.size();
+    mem_params.moments_xmp = moments_xmp_str;
+    mem_params.output_image_file_name = kMemOut;
+    EXPECT_EQ(BuildMotionPhotoFromMemory(mem_params, [](const string&) {}), 0);
+
+    auto built_file = ReadFileBytes(kFileOut);
+    auto built_mem = ReadFileBytes(kMemOut);
+    EXPECT_EQ(built_file.size(), built_mem.size());
+    EXPECT_EQ(
+        std::memcmp(built_file.data(), built_mem.data(), built_file.size()), 0);
+    EXPECT_EQ(CheckMotionPhoto(kFileOut, [](absl::string_view) {}), 0);
+    EXPECT_EQ(CheckMotionPhoto(kMemOut, [](absl::string_view) {}), 0);
+
+    size_t mp4_offset = built_mem.size();
+    for (size_t i = 0; i + 8 <= built_mem.size(); ++i) {
+      if (std::memcmp(built_mem.data() + i + 4, "ftyp", 4) == 0) {
+        mp4_offset = i;
+        break;
+      }
+    }
+    MotionPhotoMp4FileReader mp4_reader;
+    ASSERT_TRUE(mp4_reader.Read(kMemOut, static_cast<int64_t>(mp4_offset)));
+    const auto& meta_payload = mp4_reader.GetHighResTrackVideoMetadata();
+    EXPECT_EQ(meta_payload.size(), static_cast<size_t>(101));
+
+    MotionPhoto decoded_mp(FileType::kJpeg);
+    MotionPhotoReader mp_reader(&decoded_mp, nullptr);
+    ASSERT_TRUE(mp_reader.DecodeVideoMetadata(meta_payload));
+    EXPECT_EQ(decoded_mp.GetVideoMetadata()
+                  .GetScoreDescriptor()
+                  .GetPrimaryImageFrameScoreDescriptor()
+                  .GetPresentationTimestampUs(),
+              500000);
+    EXPECT_EQ(decoded_mp.GetVideoMetadata()
+                  .GetScoreDescriptor()
+                  .GetHighResTrackScoreDescriptor()
+                  .GetNumScoredFrames(),
+              static_cast<size_t>(4));
+  }
+
+  // Case B: Explicit presentation_timestamp_us overrides Moments XMP Time
+  // in both JPEG XMP and MP4 'meta' track (verifies EnforceConsistentValues
+  // runs prior to EncodeVideoMetadata).
+  {
+    constexpr int64_t kOverrideTs = 1234567;
+    const string kSingleOut =
+        (fs::path(kTestDir) / "IMG_OVERRIDE_SINGLE_MP.jpg").string();
+    const string kDualOut =
+        (fs::path(kTestDir) / "IMG_OVERRIDE_DUAL_MP.jpg").string();
+    const string kWorkVid = (fs::path(kTestDir) / "work_override.mp4").string();
+    const string kOptVid = (fs::path(kTestDir) / "opt_override.mp4").string();
+
+    MotionPhotoBuilderParams single_params;
+    single_params.primary_image_file_name = kInputImage;
+    single_params.primary_video_file_name = kInputVideo;
+    single_params.moments_xmp_file_name = kMomentsXmpFile;
+    single_params.output_image_file_name = kSingleOut;
+    single_params.presentation_timestamp_us = kOverrideTs;
+    EXPECT_EQ(BuildMotionPhoto(single_params, [](const string&) {}), 0);
+    EXPECT_EQ(CheckMotionPhoto(kSingleOut, [](absl::string_view) {}), 0);
+
+    MotionPhotoBuilderParams dual_params = single_params;
+    dual_params.moments_video_file_name = kInputVideo;
+    dual_params.working_video_file_name = kWorkVid;
+    dual_params.optimized_video_file_name = kOptVid;
+    dual_params.output_image_file_name = kDualOut;
+    EXPECT_EQ(BuildMotionPhoto(dual_params, [](const string&) {}), 0);
+    EXPECT_EQ(CheckMotionPhoto(kDualOut, [](absl::string_view) {}), 0);
+  }
+
+  fs::remove_all(kTestDir);
+}
+
+// -----------------------------------------------------------------------------
+// 12. FastStart (moov < mdat) Chunk Offset Shifting & 'meta' Track
+// Deduplication
+// -----------------------------------------------------------------------------
+TEST(MotionPhotoBuilderTest,
+     Mp4MettBoxInjector_FastStartMoovBeforeMdat_ShiftsOffsetsAndDeduplicates) {
+  // Strip existing 'meta' track from faststart fixture (or use a synthetic
+  // faststart MP4 with moov before mdat and no prior 'meta' track) to verify
+  // non-zero +delta_moov chunk offset shifting on video & audio samples.
+  const string kTestDir = CreateTestDir("Mp4MettBoxInjector_FastStart");
+  const string kStrippedFastStartMp4 =
+      (fs::path(kTestDir) / "faststart_no_meta.mp4").string();
+  {
+    auto src_bytes = ReadFileBytes(
+        "lib/core/motion_photo/testdata/"
+        "motion_photo_video_only_with_high_res.mp4");
+    ASSERT_FALSE(src_bytes.empty());
+    std::ofstream out(kStrippedFastStartMp4, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(src_bytes.data()),
+              src_bytes.size());
+  }
+  EXPECT_TRUE(MotionPhotoMp4FileBuilder::StripMetadataTrack(
+      kStrippedFastStartMp4, nullptr));
+
+  auto faststart_bytes = ReadFileBytes(kStrippedFastStartMp4);
+  ASSERT_FALSE(faststart_bytes.empty());
+
+  // Verify faststart layout (moov precedes mdat) and record original sample #1
+  Mp4BoxReader orig_reader;
+  ASSERT_TRUE(orig_reader.ParseFromMemory(faststart_bytes.data(),
+                                          faststart_bytes.size()));
+  std::vector<uint8_t> expected_video_sample;
+  ASSERT_TRUE(orig_reader.ReadSample(1, 1, &expected_video_sample));
+  EXPECT_FALSE(expected_video_sample.empty());
+  for (const auto& t : orig_reader.GetTracks()) {
+    EXPECT_FALSE(Mp4BoxReader::TrackHasMettMime(t, kMotionPhotoMetadataMime));
+  }
+
+  // Inject first 'meta' payload (+423 B moov growth -> shifts stco offsets)
+  MotionPhoto mp1(FileType::kJpeg);
+  mp1.SetImageTimestamp(333333);
+  mp1.EnforceConsistentValues();
+  MotionPhotoWriter writer1(mp1);
+  std::vector<uint8_t> meta1;
+  writer1.EncodeVideoMetadata(&meta1);
+  ASSERT_FALSE(meta1.empty());
+
+  auto src1 =
+      MediaSource::FromMemory(faststart_bytes.data(), faststart_bytes.size());
+  PreparedMp4MettInjection prep1;
+  ASSERT_TRUE(PrepareMp4MettInjection(*src1, meta1, &prep1));
+  EXPECT_FALSE(prep1.moov_at_end);
+
+  std::vector<uint8_t> injected1;
+  auto sink1 = DataSink::ToMemory(&injected1);
+  ASSERT_TRUE(WriteMp4WithMettToSink(*src1, prep1, sink1.get()));
+  EXPECT_EQ(injected1.size(), prep1.output_video_size);
+
+  Mp4BoxReader reader1;
+  ASSERT_TRUE(reader1.ParseFromMemory(injected1.data(), injected1.size()));
+  std::vector<uint8_t> actual_video_sample1;
+  ASSERT_TRUE(reader1.ReadSample(1, 1, &actual_video_sample1));
+  EXPECT_EQ(actual_video_sample1.size(), expected_video_sample.size());
+  EXPECT_EQ(
+      std::memcmp(actual_video_sample1.data(), expected_video_sample.data(),
+                  expected_video_sample.size()),
+      0);
+
+  int mett_count1 = 0;
+  uint32_t mett_track_id1 = 0;
+  for (const auto& t : reader1.GetTracks()) {
+    if (Mp4BoxReader::TrackHasMettMime(t, kMotionPhotoMetadataMime)) {
+      ++mett_count1;
+      mett_track_id1 = t.track_id;
+    }
+  }
+  EXPECT_EQ(mett_count1, 1);
+
+  std::vector<uint8_t> read_meta1;
+  ASSERT_TRUE(reader1.ReadSample(mett_track_id1, 1, &read_meta1));
+  EXPECT_EQ(read_meta1.size(), meta1.size());
+  EXPECT_EQ(std::memcmp(read_meta1.data(), meta1.data(), meta1.size()), 0);
+
+  // Re-inject updated 'meta' payload into injected1: verifies existing 'mett'
+  // track is replaced rather than duplicated.
+  MotionPhoto mp2(FileType::kJpeg);
+  mp2.SetImageTimestamp(888888);
+  mp2.EnforceConsistentValues();
+  MotionPhotoWriter writer2(mp2);
+  std::vector<uint8_t> meta2;
+  writer2.EncodeVideoMetadata(&meta2);
+  ASSERT_FALSE(meta2.empty());
+
+  auto src2 = MediaSource::FromMemory(injected1.data(), injected1.size());
+  PreparedMp4MettInjection prep2;
+  ASSERT_TRUE(PrepareMp4MettInjection(*src2, meta2, &prep2));
+  std::vector<uint8_t> injected2;
+  auto sink2 = DataSink::ToMemory(&injected2);
+  ASSERT_TRUE(WriteMp4WithMettToSink(*src2, prep2, sink2.get()));
+
+  Mp4BoxReader reader2;
+  ASSERT_TRUE(reader2.ParseFromMemory(injected2.data(), injected2.size()));
+  int mett_count2 = 0;
+  uint32_t mett_track_id2 = 0;
+  for (const auto& t : reader2.GetTracks()) {
+    if (Mp4BoxReader::TrackHasMettMime(t, kMotionPhotoMetadataMime)) {
+      ++mett_count2;
+      mett_track_id2 = t.track_id;
+    }
+  }
+  EXPECT_EQ(mett_count2, 1);
+
+  std::vector<uint8_t> read_meta2;
+  ASSERT_TRUE(reader2.ReadSample(mett_track_id2, 1, &read_meta2));
+  MotionPhoto decoded2(FileType::kJpeg);
+  MotionPhotoReader mp_reader2(&decoded2, nullptr);
+  ASSERT_TRUE(mp_reader2.DecodeVideoMetadata(read_meta2));
+  EXPECT_EQ(decoded2.GetVideoMetadata()
+                .GetScoreDescriptor()
+                .GetPrimaryImageFrameScoreDescriptor()
+                .GetPresentationTimestampUs(),
+            888888);
 
   fs::remove_all(kTestDir);
 }

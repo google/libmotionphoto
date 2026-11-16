@@ -36,7 +36,17 @@ public class MotionPhotoBuilder {
       String momentsXmp,
       String outputImageFile,
       MotionPhotoJni.OutputCallback callback) {
+    return buildFromMemory(imageBytes, videoBytes, momentsXmp, -1L, outputImageFile, callback);
+  }
+
+  public static int buildFromMemory(
+      byte[] imageBytes,
+      byte[] videoBytes,
+      String momentsXmp,
+      long presentationTimestampUs,
+      String outputImageFile,
+      MotionPhotoJni.OutputCallback callback) {
     return MotionPhotoJni.builderFromMemory(
-        imageBytes, videoBytes, momentsXmp, outputImageFile, callback);
+        imageBytes, videoBytes, momentsXmp, presentationTimestampUs, outputImageFile, callback);
   }
 }

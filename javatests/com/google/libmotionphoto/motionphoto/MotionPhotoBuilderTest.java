@@ -79,6 +79,30 @@ public class MotionPhotoBuilderTest {
   }
 
   @Test
+  public void buildFromMemory_withExplicitTimestamp_recordsTimestamp() throws Exception {
+    File tempOutput = File.createTempFile("builder_mem_ts_test_out_", ".jpg");
+    tempOutput.deleteOnExit();
+    File tempMeta = File.createTempFile("builder_mem_ts_meta_", ".xml");
+    tempMeta.deleteOnExit();
+
+    byte[] imageBytes = Files.readAllBytes(Path.of(photoOnlyPath));
+    byte[] videoBytes = Files.readAllBytes(Path.of(videoOnlyPath));
+
+    int result =
+        MotionPhotoBuilder.buildFromMemory(
+            imageBytes, videoBytes, null, 456789L, tempOutput.getAbsolutePath(), msg -> {});
+    assertThat(result).isEqualTo(0);
+
+    int checkResult = MotionPhotoChecker.check(tempOutput.getAbsolutePath(), msg -> {});
+    assertThat(checkResult).isEqualTo(0);
+
+    assertThat(MetadataEngine.extractMetadata(tempOutput.getAbsolutePath(), tempMeta.getAbsolutePath()))
+        .isTrue();
+    String xmpXml = Files.readString(tempMeta.toPath());
+    assertThat(xmpXml).contains("MotionPhotoPresentationTimestampUs=\"456789\"");
+  }
+
+  @Test
   public void build_invalidParams_returnsNonZero() throws Exception {
     MotionPhotoBuilder.Params params = new MotionPhotoBuilder.Params();
     params.primaryImage = "non_existent_image.jpg";

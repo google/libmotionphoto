@@ -281,6 +281,50 @@ TEST(LibMotionPhotoApiTest, BuildMotionPhotoFromFileValid) {
   fs::remove(output_path);
 }
 
+TEST(LibMotionPhotoApiTest, BuildMotionPhotoFromMemoryTimestampPropagates) {
+  std::string image_path =
+      "lib/core/motion_photo/testdata/motion_photo_photo_only.jpg";
+  std::string video_path =
+      "lib/core/motion_photo/testdata/motion_photo_video_only.mp4";
+
+  std::ifstream img_in(image_path, std::ios::binary);
+  std::vector<uint8_t> image_bytes((std::istreambuf_iterator<char>(img_in)),
+                                   std::istreambuf_iterator<char>());
+  ASSERT_FALSE(image_bytes.empty());
+
+  std::ifstream vid_in(video_path, std::ios::binary);
+  std::vector<uint8_t> video_bytes((std::istreambuf_iterator<char>(vid_in)),
+                                   std::istreambuf_iterator<char>());
+  ASSERT_FALSE(video_bytes.empty());
+
+  // 1. Explicit presentation timestamp is recorded in both XMP and MP4 'meta'.
+  std::string explicit_out = "/tmp/built_motion_photo_mem_ts_explicit.jpg";
+  if (fs::exists(explicit_out)) fs::remove(explicit_out);
+  EXPECT_EQ(BuildMotionPhotoFromMemory(image_bytes.data(), image_bytes.size(),
+                                       video_bytes.data(), video_bytes.size(),
+                                       explicit_out, 456789),
+            0);
+  MotionPhotoMetadata explicit_meta;
+  EXPECT_TRUE(ParseMotionPhotoFromFile(explicit_out, &explicit_meta));
+  EXPECT_TRUE(explicit_meta.is_motion_photo);
+  EXPECT_EQ(explicit_meta.presentation_timestamp_us, 456789);
+  EXPECT_EQ(CheckMotionPhotoFromFile(explicit_out), 0);
+  fs::remove(explicit_out);
+
+  // 2. Default (-1) timestamp remains valid and spec-compliant.
+  std::string default_out = "/tmp/built_motion_photo_mem_ts_default.jpg";
+  if (fs::exists(default_out)) fs::remove(default_out);
+  EXPECT_EQ(BuildMotionPhotoFromMemory(image_bytes.data(), image_bytes.size(),
+                                       video_bytes.data(), video_bytes.size(),
+                                       default_out, -1),
+            0);
+  MotionPhotoMetadata default_meta;
+  EXPECT_TRUE(ParseMotionPhotoFromFile(default_out, &default_meta));
+  EXPECT_TRUE(default_meta.is_motion_photo);
+  EXPECT_EQ(CheckMotionPhotoFromFile(default_out), 0);
+  fs::remove(default_out);
+}
+
 // 7. Test GetLibMotionPhotoVersion
 TEST(LibMotionPhotoApiTest, GetLibMotionPhotoVersion) {
   std::string version = GetLibMotionPhotoVersion();

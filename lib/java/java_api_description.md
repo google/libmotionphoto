@@ -132,6 +132,14 @@ public static int buildFromMemory(
     String momentsXmp,
     String outputImageFile,
     MotionPhotoJni.OutputCallback callback)
+
+public static int buildFromMemory(
+    byte[] imageBytes,
+    byte[] videoBytes,
+    String momentsXmp,
+    long presentationTimestampUs,
+    String outputImageFile,
+    MotionPhotoJni.OutputCallback callback)
 ```
 
 #### Parameters: `MotionPhotoBuilder.Params`
@@ -154,7 +162,9 @@ Linux process file descriptors (`/proc/self/fd/N`) for in-memory streaming.*
 
 Directly combines in-memory primary image bytes and finalized MP4 video bytes
 into a Motion Photo container in a single pass with exact XMP video length
-metadata, eliminating upfront length estimation and secondary header rewriting.
+metadata and an optional `presentationTimestampUs` (defaulting to `-1L` in the
+5-argument overload), eliminating upfront length estimation and secondary header
+rewriting.
 
 #### Return Value
 
@@ -250,6 +260,7 @@ For secure, out-of-process media ingestion and creation, libmotionphoto provides
            in byte[] imageBytes,
            in byte[] videoBytes,
            in String momentsXmp,
+           long presentationTimestampUs,
            in String outputImagePath);
    }
    ```

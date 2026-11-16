@@ -14,17 +14,25 @@
 
 #include "motion_photo_mp4/motion_photo_mp4_file_builder.h"
 
+#include <fcntl.h>
 #include <mp4v2/file.h>
 #include <mp4v2/general.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <string_view>
 
 #include "image_io/utils/file_utils.h"
+#include "motion_photo/motion_photo_source.h"
 #include "motion_photo/video_track_data.h"
+#include "motion_photo_mp4/mp4_mett_box_injector.h"
 
 // The third_party/mp4v2/src/src.h header is needed to write the mett atom to
 // the MP4 file. This using statement in this nested namespace is neeeded to
@@ -343,56 +351,148 @@ bool MotionPhotoMp4FileBuilder::IsOptimizationSupported(
 
 bool MotionPhotoMp4FileBuilder::StripMetadataTrack(
     const string& file_name, MessageHandler* message_handler) {
-  MP4FileHandle read_handle = MP4Read(file_name.c_str());
-  if (read_handle == MP4_INVALID_FILE_HANDLE) {
-    message_handler->ReportMessage(Message::kStdLibError, "MP4Read failed: " + file_name);
+  auto report_error = [&](const string& msg) {
+    if (message_handler != nullptr) {
+      message_handler->ReportMessage(Message::kStdLibError, msg);
+    }
+  };
+
+  auto pread_all = [](int fd, uint8_t* dest, size_t size, off_t offset) {
+    size_t total_read = 0;
+    while (total_read < size) {
+      ssize_t n = pread(fd, dest + total_read, size - total_read,
+                        offset + static_cast<off_t>(total_read));
+      if (n <= 0) {
+        if (n < 0 && errno == EINTR) continue;
+        return false;
+      }
+      total_read += static_cast<size_t>(n);
+    }
+    return true;
+  };
+
+  auto pwrite_all = [](int fd, const uint8_t* data, size_t size, off_t offset) {
+    size_t total_written = 0;
+    while (total_written < size) {
+      ssize_t n = pwrite(fd, data + total_written, size - total_written,
+                         offset + static_cast<off_t>(total_written));
+      if (n <= 0) {
+        if (n < 0 && errno == EINTR) continue;
+        return false;
+      }
+      total_written += static_cast<size_t>(n);
+    }
+    return true;
+  };
+
+  class LocalFdMediaSource : public MediaSource {
+   public:
+    LocalFdMediaSource(int fd, size_t size) : fd_(fd), size_(size) {}
+    size_t GetSize() const override { return size_; }
+    bool ReadAt(size_t offset, size_t length, uint8_t* dest) const override {
+      if (fd_ < 0 || offset > size_ || length > size_ - offset ||
+          offset > static_cast<size_t>(std::numeric_limits<off_t>::max())) {
+        return false;
+      }
+      if (length == 0) {
+        return true;
+      }
+      if (dest == nullptr) {
+        return false;
+      }
+      size_t total_read = 0;
+      while (total_read < length) {
+        ssize_t n =
+            pread(fd_, dest + total_read, length - total_read,
+                  static_cast<off_t>(offset) + static_cast<off_t>(total_read));
+        if (n <= 0) {
+          if (n < 0 && errno == EINTR) continue;
+          return false;
+        }
+        total_read += static_cast<size_t>(n);
+      }
+      return true;
+    }
+    int GetFd() const override { return fd_; }
+
+   private:
+    int fd_;
+    size_t size_;
+  };
+
+  int fd = open(file_name.c_str(), O_RDWR);
+  if (fd < 0) {
+    report_error("Failed to open MP4 file: " + file_name);
+    return false;
+  }
+  struct ScopedFd {
+    int fd;
+    ~ScopedFd() {
+      if (fd >= 0) {
+        close(fd);
+      }
+    }
+  } fd_guard{fd};
+
+  struct stat st;
+  if (fstat(fd, &st) != 0 || st.st_size < 0) {
+    report_error("Failed to stat MP4 file: " + file_name);
+    return false;
+  }
+  const size_t source_size = static_cast<size_t>(st.st_size);
+  LocalFdMediaSource source(fd, source_size);
+
+  PreparedMp4MettStrip prepared;
+  if (!PrepareMp4MettStrip(source, &prepared)) {
+    errno = EIO;
+    report_error("Failed to parse MP4 metadata tracks: " + file_name);
     return false;
   }
 
-  bool has_metadata_track = false;
-  uint32_t track_count = MP4GetNumberOfTracks(read_handle, nullptr, 0);
-  for (uint32_t index = 0; index < track_count; ++index) {
-    MP4TrackId track_id = MP4FindTrackId(read_handle, index, nullptr, 0);
-    const char* track_type = MP4GetTrackType(read_handle, track_id);
-    if (track_type && strcmp(track_type, kVideoMetadataTrackType) == 0) {
-      has_metadata_track = true;
-      break;
-    }
-  }
-  MP4Close(read_handle);
-
-  if (!has_metadata_track) {
+  if (!prepared.has_changes) {
     return true;
   }
 
-  MP4FileHandle file_handle = MP4Modify(file_name.c_str());
-  if (file_handle == MP4_INVALID_FILE_HANDLE) {
-    message_handler->ReportMessage(Message::kStdLibError, file_name);
+  if (prepared.rebuilt_moov.size() > prepared.moov_size ||
+      prepared.output_video_size >
+          static_cast<size_t>(std::numeric_limits<off_t>::max())) {
+    errno = EIO;
+    report_error("Invalid stripped moov size for file: " + file_name);
     return false;
   }
 
-  bool deleted = false;
-  track_count = MP4GetNumberOfTracks(file_handle, nullptr, 0);
-  for (int index = (int)track_count - 1; index >= 0; --index) {
-    MP4TrackId track_id = MP4FindTrackId(file_handle, index, nullptr, 0);
-    const char* track_type = MP4GetTrackType(file_handle, track_id);
-    if (track_type && strcmp(track_type, kVideoMetadataTrackType) == 0) {
-      MP4DeleteTrack(file_handle, track_id);
-      deleted = true;
+  if (!pwrite_all(fd, prepared.rebuilt_moov.data(),
+                  prepared.rebuilt_moov.size(),
+                  static_cast<off_t>(prepared.moov_offset))) {
+    report_error("Failed to write rebuilt moov box: " + file_name);
+    return false;
+  }
+
+  if (!prepared.moov_at_end) {
+    constexpr size_t kSlideChunkSize = 64 * 1024;
+    vector<uint8_t> chunk(kSlideChunkSize);
+    size_t read_pos = prepared.moov_offset + prepared.moov_size;
+    size_t write_pos = prepared.moov_offset + prepared.rebuilt_moov.size();
+    while (read_pos < source_size) {
+      size_t to_move = std::min(kSlideChunkSize, source_size - read_pos);
+      if (!pread_all(fd, chunk.data(), to_move, static_cast<off_t>(read_pos)) ||
+          !pwrite_all(fd, chunk.data(), to_move,
+                      static_cast<off_t>(write_pos))) {
+        report_error("Failed to shift MP4 payload after stripping moov: " +
+                     file_name);
+        return false;
+      }
+      read_pos += to_move;
+      write_pos += to_move;
     }
   }
 
-  MP4Close(file_handle);
-
-  if (deleted) {
-    if (!MP4Optimize(file_name.c_str(), nullptr)) {
-      errno = EIO;
-      stringstream ss;
-      ss << "Can't optimize file after stripping metadata: " << file_name;
-      message_handler->ReportMessage(Message::kStdLibError, ss.str());
-      return false;
-    }
+  if (ftruncate(fd, static_cast<off_t>(prepared.output_video_size)) != 0) {
+    report_error("Failed to truncate MP4 file after stripping moov: " +
+                 file_name);
+    return false;
   }
+
   return true;
 }
 

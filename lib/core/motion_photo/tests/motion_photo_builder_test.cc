@@ -38,6 +38,7 @@
 #include "image_io/mpf/mpf_info.h"
 #include "image_io/mpf/mpf_info_decoder.h"
 #include "image_io/mpf/mpf_info_encoder.h"
+#include "libmotionphoto_api.h"
 #include "motion_photo/metadata_engine.h"
 #include "motion_photo/motion_photo.h"
 #include "motion_photo/motion_photo_reader.h"
@@ -1517,6 +1518,458 @@ TEST(MotionPhotoBuilderTest,
   auto mem_src = MediaSource::FromMemory(jpeg.data(), jpeg.size());
   auto mem_sink = DataSink::ToMemory(&out);
   EXPECT_FALSE(builder.Build(*mem_src, large_motion_xmp, mem_sink.get()));
+}
+
+// -----------------------------------------------------------------------------
+// 13. Zero-Temp-File StripMetadataTrack: mdat < moov, FastStart (moov < mdat),
+//     co64 Shifting, Same-FD Guard, and AGTM ('it35') Track Preservation
+// -----------------------------------------------------------------------------
+TEST(MotionPhotoBuilderTest,
+     StripMetadataTrack_MdatBeforeMoovAndFastStart_PreservesMediaSamples) {
+  const string kTestDir =
+      CreateTestDir("StripMetadataTrack_MdatBeforeMoovAndFastStart");
+
+  MotionPhoto mp(FileType::kJpeg);
+  mp.SetImageTimestamp(500000);
+  mp.EnforceConsistentValues();
+  MotionPhotoWriter writer(mp);
+  std::vector<uint8_t> meta_bytes;
+  writer.EncodeVideoMetadata(&meta_bytes);
+  ASSERT_FALSE(meta_bytes.empty());
+
+  // 1. mdat < moov layout (motion_photo_video_only.mp4 has moov at end).
+  {
+    auto raw_mp4 = ReadFileBytes(
+        "lib/core/motion_photo/testdata/motion_photo_video_only.mp4");
+    ASSERT_FALSE(raw_mp4.empty());
+
+    Mp4BoxReader orig_reader;
+    ASSERT_TRUE(orig_reader.ParseFromMemory(raw_mp4.data(), raw_mp4.size()));
+    std::vector<uint8_t> orig_vid_sample;
+    std::vector<uint8_t> orig_aud_sample;
+    ASSERT_TRUE(orig_reader.ReadSample(1, 1, &orig_vid_sample));
+    ASSERT_TRUE(orig_reader.ReadSample(
+        2, orig_reader.GetTrackNumberOfSamples(2), &orig_aud_sample));
+
+    // Inject Motion Photo 'meta' track (keeps moov at end).
+    auto src = MediaSource::FromMemory(raw_mp4.data(), raw_mp4.size());
+    PreparedMp4MettInjection inj;
+    ASSERT_TRUE(PrepareMp4MettInjection(*src, meta_bytes, &inj));
+    EXPECT_TRUE(inj.moov_at_end);
+    std::vector<uint8_t> with_mett;
+    auto mem_sink = DataSink::ToMemory(&with_mett);
+    ASSERT_TRUE(WriteMp4WithMettToSink(*src, inj, mem_sink.get()));
+
+    // Strip on disk via MotionPhotoMp4FileBuilder::StripMetadataTrack.
+    const string kDiskMp4 =
+        (fs::path(kTestDir) / "mdat_before_moov.mp4").string();
+    {
+      std::ofstream out(kDiskMp4, std::ios::binary);
+      out.write(reinterpret_cast<const char*>(with_mett.data()),
+                with_mett.size());
+    }
+    EXPECT_TRUE(
+        MotionPhotoMp4FileBuilder::StripMetadataTrack(kDiskMp4, nullptr));
+
+    auto stripped_bytes = ReadFileBytes(kDiskMp4);
+    ASSERT_FALSE(stripped_bytes.empty());
+    EXPECT_TRUE(stripped_bytes.size() < with_mett.size());
+
+    Mp4BoxReader stripped_reader;
+    ASSERT_TRUE(stripped_reader.ParseFromMemory(stripped_bytes.data(),
+                                                stripped_bytes.size()));
+    for (const auto& t : stripped_reader.GetTracks()) {
+      EXPECT_FALSE(Mp4BoxReader::TrackHasMettMime(t, kMotionPhotoMetadataMime));
+    }
+    std::vector<uint8_t> stripped_vid_sample;
+    std::vector<uint8_t> stripped_aud_sample;
+    ASSERT_TRUE(stripped_reader.ReadSample(1, 1, &stripped_vid_sample));
+    ASSERT_TRUE(stripped_reader.ReadSample(
+        2, stripped_reader.GetTrackNumberOfSamples(2), &stripped_aud_sample));
+    EXPECT_TRUE(stripped_vid_sample == orig_vid_sample);
+    EXPECT_TRUE(stripped_aud_sample == orig_aud_sample);
+
+    // Stripping an already-clean MP4 sets has_changes == false and passes
+    // through byte-for-byte.
+    auto clean_src =
+        MediaSource::FromMemory(stripped_bytes.data(), stripped_bytes.size());
+    PreparedMp4MettStrip noop_strip;
+    ASSERT_TRUE(PrepareMp4MettStrip(*clean_src, &noop_strip));
+    EXPECT_FALSE(noop_strip.has_changes);
+    std::vector<uint8_t> passthrough_bytes;
+    auto passthrough_sink = DataSink::ToMemory(&passthrough_bytes);
+    ASSERT_TRUE(WriteMp4WithoutMettToSink(*clean_src, noop_strip,
+                                          passthrough_sink.get()));
+    EXPECT_TRUE(passthrough_bytes == stripped_bytes);
+
+    // WriteMp4WithoutMettToSink rejects calls sharing the same FD.
+    auto file_src = MediaSource::FromFile(kDiskMp4, nullptr);
+    ASSERT_TRUE(file_src != nullptr);
+    auto same_fd_sink = DataSink::ToFd(file_src->GetFd());
+    ASSERT_TRUE(same_fd_sink != nullptr);
+    EXPECT_FALSE(
+        WriteMp4WithoutMettToSink(*file_src, noop_strip, same_fd_sink.get()));
+  }
+
+  // 2. Faststart moov < mdat layout (motion_photo_video_only_with_high_res.mp4
+  //    has moov before mdat -> stripping shrinks moov with delta_moov < 0).
+  {
+    auto faststart_with_mett = ReadFileBytes(
+        "lib/core/motion_photo/testdata/"
+        "motion_photo_video_only_with_high_res.mp4");
+    ASSERT_FALSE(faststart_with_mett.empty());
+
+    Mp4BoxReader orig_reader;
+    ASSERT_TRUE(orig_reader.ParseFromMemory(faststart_with_mett.data(),
+                                            faststart_with_mett.size()));
+    std::vector<uint8_t> orig_vid_first;
+    std::vector<uint8_t> orig_vid_last;
+    std::vector<uint8_t> orig_aud_last;
+    ASSERT_TRUE(orig_reader.ReadSample(1, 1, &orig_vid_first));
+    ASSERT_TRUE(orig_reader.ReadSample(
+        1, orig_reader.GetTrackNumberOfSamples(1), &orig_vid_last));
+    ASSERT_TRUE(orig_reader.ReadSample(
+        2, orig_reader.GetTrackNumberOfSamples(2), &orig_aud_last));
+
+    auto fs_src = MediaSource::FromMemory(faststart_with_mett.data(),
+                                          faststart_with_mett.size());
+    PreparedMp4MettStrip fs_plan;
+    ASSERT_TRUE(PrepareMp4MettStrip(*fs_src, &fs_plan));
+    EXPECT_TRUE(fs_plan.has_changes);
+    EXPECT_FALSE(fs_plan.moov_at_end);
+    EXPECT_TRUE(fs_plan.rebuilt_moov.size() < fs_plan.moov_size);
+
+    const string kFastStartMp4 =
+        (fs::path(kTestDir) / "faststart_stripped.mp4").string();
+    {
+      std::ofstream out(kFastStartMp4, std::ios::binary);
+      out.write(reinterpret_cast<const char*>(faststart_with_mett.data()),
+                faststart_with_mett.size());
+    }
+    EXPECT_TRUE(
+        MotionPhotoMp4FileBuilder::StripMetadataTrack(kFastStartMp4, nullptr));
+
+    auto stripped_fs = ReadFileBytes(kFastStartMp4);
+    EXPECT_EQ(stripped_fs.size(), fs_plan.output_video_size);
+
+    Mp4BoxReader stripped_reader;
+    ASSERT_TRUE(
+        stripped_reader.ParseFromMemory(stripped_fs.data(), stripped_fs.size()));
+    for (const auto& t : stripped_reader.GetTracks()) {
+      EXPECT_FALSE(Mp4BoxReader::TrackHasMettMime(t, kMotionPhotoMetadataMime));
+    }
+    std::vector<uint8_t> stripped_vid_first;
+    std::vector<uint8_t> stripped_vid_last;
+    std::vector<uint8_t> stripped_aud_last;
+    ASSERT_TRUE(stripped_reader.ReadSample(1, 1, &stripped_vid_first));
+    ASSERT_TRUE(stripped_reader.ReadSample(
+        1, stripped_reader.GetTrackNumberOfSamples(1), &stripped_vid_last));
+    ASSERT_TRUE(stripped_reader.ReadSample(
+        2, stripped_reader.GetTrackNumberOfSamples(2), &stripped_aud_last));
+    EXPECT_TRUE(stripped_vid_first == orig_vid_first);
+    EXPECT_TRUE(stripped_vid_last == orig_vid_last);
+    EXPECT_TRUE(stripped_aud_last == orig_aud_last);
+  }
+
+  fs::remove_all(kTestDir);
+}
+
+TEST(MotionPhotoBuilderTest,
+     StripMetadataTrack_PreservesAgtmIt35TrackAndSamples) {
+  const string kTestDir =
+      CreateTestDir("StripMetadataTrack_PreservesAgtmIt35");
+  const string kAgtmMotionPhoto =
+      "lib/core/motion_photo/testdata/motion_photo_agtm.MP.jpg";
+
+  // 1. End-to-end ExtractVideoTrackFromFile on AGTM Motion Photo preserves AGTM.
+  const string kExtractedAgtmVideo =
+      (fs::path(kTestDir) / "extracted_agtm.mp4").string();
+  ASSERT_TRUE(libmotionphoto::api::ExtractVideoTrackFromFile(
+      kAgtmMotionPhoto, kExtractedAgtmVideo));
+
+  MetadataEngine engine(nullptr);
+  string extracted_agtm_json =
+      engine.ExtractAgtmAtTimestamp(kExtractedAgtmVideo, 0);
+  EXPECT_FALSE(extracted_agtm_json.empty());
+  EXPECT_NE(extracted_agtm_json.find("hdrReferenceWhite"), string::npos);
+
+  auto agtm_video_bytes = ReadFileBytes(kExtractedAgtmVideo);
+  ASSERT_FALSE(agtm_video_bytes.empty());
+
+  Mp4BoxReader orig_agtm_reader;
+  ASSERT_TRUE(orig_agtm_reader.ParseFromMemory(agtm_video_bytes.data(),
+                                               agtm_video_bytes.size()));
+  uint32_t orig_agtm_track_id = 0;
+  uint32_t orig_video_track_id = 0;
+  for (const auto& t : orig_agtm_reader.GetTracks()) {
+    if (Mp4BoxReader::TrackIsAgtmMetadata(t)) {
+      orig_agtm_track_id = t.track_id;
+    } else if (t.handler_type == "vide") {
+      orig_video_track_id = t.track_id;
+    }
+  }
+  ASSERT_NE(orig_agtm_track_id, 0u);
+  ASSERT_NE(orig_video_track_id, 0u);
+
+  std::vector<uint8_t> expected_agtm_sample;
+  std::vector<uint8_t> expected_video_sample;
+  ASSERT_TRUE(orig_agtm_reader.ReadSample(orig_agtm_track_id, 1,
+                                          &expected_agtm_sample));
+  ASSERT_TRUE(orig_agtm_reader.ReadSample(orig_video_track_id, 1,
+                                          &expected_video_sample));
+  EXPECT_FALSE(expected_agtm_sample.empty());
+  EXPECT_FALSE(expected_video_sample.empty());
+
+  // 2. Inject Motion Photo 'meta' ("application/motionphoto-image-meta") into
+  //    the AGTM MP4 so it contains BOTH Motion Photo 'mett' AND 'it35' AGTM.
+  MotionPhoto mp(FileType::kJpeg);
+  mp.SetImageTimestamp(250000);
+  mp.EnforceConsistentValues();
+  MotionPhotoWriter writer(mp);
+  std::vector<uint8_t> meta_payload;
+  writer.EncodeVideoMetadata(&meta_payload);
+  ASSERT_FALSE(meta_payload.empty());
+
+  auto agtm_src = MediaSource::FromMemory(agtm_video_bytes.data(),
+                                          agtm_video_bytes.size());
+  PreparedMp4MettInjection inj;
+  ASSERT_TRUE(PrepareMp4MettInjection(*agtm_src, meta_payload, &inj));
+  std::vector<uint8_t> combined_mp4;
+  auto combined_sink = DataSink::ToMemory(&combined_mp4);
+  ASSERT_TRUE(WriteMp4WithMettToSink(*agtm_src, inj, combined_sink.get()));
+
+  // Verify combined MP4 initially has BOTH tracks.
+  {
+    Mp4BoxReader both_reader;
+    ASSERT_TRUE(
+        both_reader.ParseFromMemory(combined_mp4.data(), combined_mp4.size()));
+    bool has_mp_mett = false;
+    bool has_agtm = false;
+    for (const auto& t : both_reader.GetTracks()) {
+      if (Mp4BoxReader::TrackHasMettMime(t, kMotionPhotoMetadataMime)) {
+        has_mp_mett = true;
+      }
+      if (Mp4BoxReader::TrackIsAgtmMetadata(t)) {
+        has_agtm = true;
+      }
+    }
+    ASSERT_TRUE(has_mp_mett);
+    ASSERT_TRUE(has_agtm);
+  }
+
+  // 3. Strip combined MP4 via StripMetadataTrack: removes Motion Photo 'mett'
+  //    while keeping 'it35' AGTM track, samples, and parsed AGTM JSON intact.
+  const string kStrippedCombinedMp4 =
+      (fs::path(kTestDir) / "stripped_combined_agtm.mp4").string();
+  {
+    std::ofstream out(kStrippedCombinedMp4, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(combined_mp4.data()),
+              combined_mp4.size());
+  }
+  ASSERT_TRUE(MotionPhotoMp4FileBuilder::StripMetadataTrack(
+      kStrippedCombinedMp4, nullptr));
+
+  auto stripped_combined_bytes = ReadFileBytes(kStrippedCombinedMp4);
+  Mp4BoxReader after_reader;
+  ASSERT_TRUE(after_reader.ParseFromMemory(stripped_combined_bytes.data(),
+                                           stripped_combined_bytes.size()));
+
+  uint32_t after_agtm_track_id = 0;
+  uint32_t after_video_track_id = 0;
+  for (const auto& t : after_reader.GetTracks()) {
+    EXPECT_FALSE(Mp4BoxReader::TrackHasMettMime(t, kMotionPhotoMetadataMime));
+    EXPECT_FALSE(Mp4BoxReader::TrackHasMettMime(
+        t, "application/motionphoto-highres-score"));
+    if (Mp4BoxReader::TrackIsAgtmMetadata(t)) {
+      after_agtm_track_id = t.track_id;
+    } else if (t.handler_type == "vide") {
+      after_video_track_id = t.track_id;
+    }
+  }
+  ASSERT_NE(after_agtm_track_id, 0u);
+  ASSERT_NE(after_video_track_id, 0u);
+
+  std::vector<uint8_t> actual_agtm_sample;
+  std::vector<uint8_t> actual_video_sample;
+  ASSERT_TRUE(
+      after_reader.ReadSample(after_agtm_track_id, 1, &actual_agtm_sample));
+  ASSERT_TRUE(
+      after_reader.ReadSample(after_video_track_id, 1, &actual_video_sample));
+  EXPECT_TRUE(actual_agtm_sample == expected_agtm_sample);
+  EXPECT_TRUE(actual_video_sample == expected_video_sample);
+
+  string after_agtm_json =
+      engine.ExtractAgtmAtTimestamp(kStrippedCombinedMp4, 0);
+  EXPECT_EQ(after_agtm_json, extracted_agtm_json);
+
+  // 4. Synthetic faststart MP4 with co64 + "application/motionphoto-highres-score"
+  //    + 'it35' AGTM: verifies negative delta_moov on co64 and highres-score
+  //    stripping while preserving 'it35' AGTM.
+  const string kHighResScoreMime = "application/motionphoto-highres-score";
+  auto make_box = [](const char type[4], const std::vector<uint8_t>& payload) {
+    std::vector<uint8_t> b;
+    uint32_t sz = static_cast<uint32_t>(8 + payload.size());
+    b.push_back((sz >> 24) & 0xFF);
+    b.push_back((sz >> 16) & 0xFF);
+    b.push_back((sz >> 8) & 0xFF);
+    b.push_back(sz & 0xFF);
+    b.insert(b.end(), type, type + 4);
+    b.insert(b.end(), payload.begin(), payload.end());
+    return b;
+  };
+  auto make_u32 = [](uint32_t v, std::vector<uint8_t>* out) {
+    out->push_back((v >> 24) & 0xFF);
+    out->push_back((v >> 16) & 0xFF);
+    out->push_back((v >> 8) & 0xFF);
+    out->push_back(v & 0xFF);
+  };
+  auto make_u64 = [&](uint64_t v, std::vector<uint8_t>* out) {
+    make_u32(static_cast<uint32_t>(v >> 32), out);
+    make_u32(static_cast<uint32_t>(v & 0xFFFFFFFFu), out);
+  };
+  auto make_trak_with_co64 = [&](uint32_t track_id, const char hdlr_type[4],
+                                 const char stsd_fmt[4],
+                                 const std::vector<uint8_t>& stsd_entry_payload,
+                                 uint32_t sample_size, uint64_t chunk_offset) {
+    std::vector<uint8_t> tkhd_p(84, 0);
+    tkhd_p[3] = 1;
+    tkhd_p[15] = static_cast<uint8_t>(track_id);
+    std::vector<uint8_t> mdhd_p(24, 0);
+    mdhd_p[14] = 0x03;
+    mdhd_p[15] = 0xE8;
+    std::vector<uint8_t> hdlr_p(25, 0);
+    std::memcpy(hdlr_p.data() + 8, hdlr_type, 4);
+
+    std::vector<uint8_t> stsd_p;
+    make_u32(0, &stsd_p);
+    make_u32(1, &stsd_p);
+    auto entry = make_box(stsd_fmt, stsd_entry_payload);
+    stsd_p.insert(stsd_p.end(), entry.begin(), entry.end());
+
+    std::vector<uint8_t> stts_p;
+    make_u32(0, &stts_p);
+    make_u32(1, &stts_p);
+    make_u32(1, &stts_p);
+    make_u32(1, &stts_p);
+
+    std::vector<uint8_t> stsz_p;
+    make_u32(0, &stsz_p);
+    make_u32(sample_size, &stsz_p);
+    make_u32(1, &stsz_p);
+
+    std::vector<uint8_t> stsc_p;
+    make_u32(0, &stsc_p);
+    make_u32(1, &stsc_p);
+    make_u32(1, &stsc_p);
+    make_u32(1, &stsc_p);
+    make_u32(1, &stsc_p);
+
+    std::vector<uint8_t> co64_p;
+    make_u32(0, &co64_p);
+    make_u32(1, &co64_p);
+    make_u64(chunk_offset, &co64_p);
+
+    std::vector<uint8_t> stbl_p;
+    for (const auto& child :
+         {make_box("stsd", stsd_p), make_box("stts", stts_p),
+          make_box("stsz", stsz_p), make_box("stsc", stsc_p),
+          make_box("co64", co64_p)}) {
+      stbl_p.insert(stbl_p.end(), child.begin(), child.end());
+    }
+    auto minf = make_box("minf", make_box("stbl", stbl_p));
+    std::vector<uint8_t> mdia_p;
+    for (const auto& child :
+         {make_box("mdhd", mdhd_p), make_box("hdlr", hdlr_p), minf}) {
+      mdia_p.insert(mdia_p.end(), child.begin(), child.end());
+    }
+    std::vector<uint8_t> trak_p;
+    auto tkhd = make_box("tkhd", tkhd_p);
+    auto mdia = make_box("mdia", mdia_p);
+    trak_p.insert(trak_p.end(), tkhd.begin(), tkhd.end());
+    trak_p.insert(trak_p.end(), mdia.begin(), mdia.end());
+    return make_box("trak", trak_p);
+  };
+
+  std::vector<uint8_t> ftyp = make_box(
+      "ftyp", {'i', 's', 'o', 'm', 0, 0, 2, 0, 'i', 's', 'o', 'm'});
+  std::vector<uint8_t> mvhd_p(100, 0);
+  mvhd_p[99] = 4;
+  auto mvhd = make_box("mvhd", mvhd_p);
+
+  std::vector<uint8_t> score_mime_payload(kHighResScoreMime.begin(),
+                                          kHighResScoreMime.end());
+  score_mime_payload.push_back(0);
+  std::vector<uint8_t> dummy_vid_sample = {0x11, 0x22, 0x33, 0x44};
+  std::vector<uint8_t> dummy_agtm_sample = {0x05, 0xB5, 0x00, 0x90,
+                                            0x00, 0x01, 0x00, 0x00};
+
+  auto tmp_vid_trak =
+      make_trak_with_co64(1, "vide", "avc1", std::vector<uint8_t>(16, 0),
+                          dummy_vid_sample.size(), 0);
+  auto tmp_agtm_trak =
+      make_trak_with_co64(2, "meta", "it35", std::vector<uint8_t>(8, 0),
+                          dummy_agtm_sample.size(), 0);
+  auto tmp_score_trak =
+      make_trak_with_co64(3, "meta", "mett", score_mime_payload, 4, 0);
+  size_t moov_total_size = 8 + mvhd.size() + tmp_vid_trak.size() +
+                           tmp_agtm_trak.size() + tmp_score_trak.size();
+  uint64_t mdat_data_start = ftyp.size() + moov_total_size + 8;
+
+  auto vid_trak = make_trak_with_co64(1, "vide", "avc1",
+                                      std::vector<uint8_t>(16, 0),
+                                      dummy_vid_sample.size(), mdat_data_start);
+  auto agtm_trak = make_trak_with_co64(
+      2, "meta", "it35", std::vector<uint8_t>(8, 0), dummy_agtm_sample.size(),
+      mdat_data_start + dummy_vid_sample.size());
+  auto score_trak = make_trak_with_co64(
+      3, "meta", "mett", score_mime_payload, 4,
+      mdat_data_start + dummy_vid_sample.size() + dummy_agtm_sample.size());
+
+  std::vector<uint8_t> moov_p;
+  for (const auto& c : {mvhd, vid_trak, agtm_trak, score_trak}) {
+    moov_p.insert(moov_p.end(), c.begin(), c.end());
+  }
+  auto moov_box = make_box("moov", moov_p);
+  ASSERT_EQ(moov_box.size(), moov_total_size);
+
+  std::vector<uint8_t> mdat_p = dummy_vid_sample;
+  mdat_p.insert(mdat_p.end(), dummy_agtm_sample.begin(),
+                dummy_agtm_sample.end());
+  mdat_p.insert(mdat_p.end(), {0xDE, 0xAD, 0xBE, 0xEF});
+  auto mdat_box = make_box("mdat", mdat_p);
+
+  std::vector<uint8_t> synth_mp4 = ftyp;
+  synth_mp4.insert(synth_mp4.end(), moov_box.begin(), moov_box.end());
+  synth_mp4.insert(synth_mp4.end(), mdat_box.begin(), mdat_box.end());
+
+  auto synth_src = MediaSource::FromMemory(synth_mp4.data(), synth_mp4.size());
+  PreparedMp4MettStrip synth_plan;
+  ASSERT_TRUE(PrepareMp4MettStrip(*synth_src, &synth_plan));
+  EXPECT_TRUE(synth_plan.has_changes);
+  EXPECT_FALSE(synth_plan.moov_at_end);
+
+  std::vector<uint8_t> synth_stripped;
+  auto synth_sink = DataSink::ToMemory(&synth_stripped);
+  ASSERT_TRUE(
+      WriteMp4WithoutMettToSink(*synth_src, synth_plan, synth_sink.get()));
+
+  Mp4BoxReader synth_reader;
+  ASSERT_TRUE(
+      synth_reader.ParseFromMemory(synth_stripped.data(), synth_stripped.size()));
+  EXPECT_EQ(synth_reader.GetTrackCount(), 2u);
+  EXPECT_TRUE(synth_reader.FindTrackById(1) != nullptr);
+  ASSERT_TRUE(synth_reader.FindTrackById(2) != nullptr);
+  EXPECT_TRUE(synth_reader.FindTrackById(3) == nullptr);
+  EXPECT_TRUE(Mp4BoxReader::TrackIsAgtmMetadata(*synth_reader.FindTrackById(2)));
+
+  std::vector<uint8_t> read_synth_vid;
+  std::vector<uint8_t> read_synth_agtm;
+  ASSERT_TRUE(synth_reader.ReadSample(1, 1, &read_synth_vid));
+  ASSERT_TRUE(synth_reader.ReadSample(2, 1, &read_synth_agtm));
+  EXPECT_TRUE(read_synth_vid == dummy_vid_sample);
+  EXPECT_TRUE(read_synth_agtm == dummy_agtm_sample);
+
+  fs::remove_all(kTestDir);
 }
 
 }  // namespace motion_photo

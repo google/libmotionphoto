@@ -260,6 +260,12 @@ For secure, out-of-process media ingestion and creation, libmotionphoto provides
            in byte[] imageBytes,
            in byte[] videoBytes,
            in String momentsXmp,
+           in String outputImagePath);
+
+       int buildMotionPhotoFromMemoryWithTimestamp(
+           in byte[] imageBytes,
+           in byte[] videoBytes,
+           in String momentsXmp,
            long presentationTimestampUs,
            in String outputImagePath);
    }

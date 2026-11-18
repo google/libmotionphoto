@@ -93,6 +93,15 @@ public class MotionPhotoBuilderService extends Service {
         @Override
         @SuppressWarnings("CheckedExceptionNotThrown")
         public int buildMotionPhotoFromMemory(
+            byte[] imageBytes, byte[] videoBytes, String momentsXmp, String outputImagePath)
+            throws RemoteException {
+          return buildMotionPhotoFromMemoryWithTimestamp(
+              imageBytes, videoBytes, momentsXmp, -1L, outputImagePath);
+        }
+
+        @Override
+        @SuppressWarnings("CheckedExceptionNotThrown")
+        public int buildMotionPhotoFromMemoryWithTimestamp(
             byte[] imageBytes,
             byte[] videoBytes,
             String momentsXmp,

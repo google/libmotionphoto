@@ -33,6 +33,7 @@ class MotionPhotoJni {
       byte[] imageBytes,
       byte[] videoBytes,
       String momentsXmp,
+      long presentationTimestampUs,
       String outputImageFile,
       OutputCallback callback);
 

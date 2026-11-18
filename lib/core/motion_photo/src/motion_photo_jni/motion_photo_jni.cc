@@ -333,7 +333,8 @@ Java_com_google_libmotionphoto_motionphoto_MotionPhotoJni_builder(
 JNIEXPORT jint JNICALL
 Java_com_google_libmotionphoto_motionphoto_MotionPhotoJni_builderFromMemory(
     JNIEnv* env, jclass clazz, jbyteArray jimage_bytes, jbyteArray jvideo_bytes,
-    jstring jmoments_xmp, jstring joutput_image_file, jobject jcallback) {
+    jstring jmoments_xmp, jlong jpresentation_timestamp_us,
+    jstring joutput_image_file, jobject jcallback) {
   if (env == nullptr || jimage_bytes == nullptr || jvideo_bytes == nullptr ||
       joutput_image_file == nullptr) {
     return -1;
@@ -372,6 +373,8 @@ Java_com_google_libmotionphoto_motionphoto_MotionPhotoJni_builderFromMemory(
     params.primary_video_size = static_cast<size_t>(video_len);
     params.moments_xmp = moments_xmp;
     params.output_image_file_name = output_image_file;
+    params.presentation_timestamp_us =
+        static_cast<int64_t>(jpresentation_timestamp_us);
 
     StringOutputter callback = [](const std::string&) {};
     std::unique_ptr<JniOutputter> jni_outputter;

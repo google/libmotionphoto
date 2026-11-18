@@ -21,11 +21,9 @@ import android.webkit.MimeTypeMap;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
-import java.io.FileWriter;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.util.Locale;
 
 /** Utility class for file operations in the sample app. */
 public class StorageUtils {
@@ -72,39 +70,6 @@ public class StorageUtils {
           new File(uri.getPath()), ParcelFileDescriptor.MODE_READ_ONLY);
     }
     return context.getContentResolver().openFileDescriptor(uri, "r");
-  }
-
-  public static String generateXmpFile(Context context, long timestampUs) throws IOException {
-    String xmpTemplate =
-        "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"Adobe XMP Core 5.1.0-jc003\">\n"
-            + "  <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n"
-            + "    <rdf:Description rdf:about=\"\"\n"
-            + "      xmlns:Metadata=\"http://ns.google.com/1.0/motion_photo_video_metadata/\">\n"
-            + "      <Metadata:Flags>\n"
-            + "        <Metadata:LowRes Metadata:Stabilized=\"0\"/>\n"
-            + "        <Metadata:HighRes Metadata:Stabilized=\"0\" />\n"
-            + "      </Metadata:Flags>\n"
-            + "      <Metadata:Scores Metadata:ModelVersion=\"1\">\n"
-            + "        <Metadata:PrimaryImage>\n"
-            + "          <Metadata:Frame Metadata:Score=\"1.0\" Metadata:Time=\"%d\" />\n"
-            + "        </Metadata:PrimaryImage>\n"
-            + "        <Metadata:HighResTrack>\n"
-            + "          <rdf:Seq>\n"
-            + "            <rdf:li>\n"
-            + "              <Metadata:Frame Metadata:Score=\"1.0\" Metadata:Time=\"%d\" />\n"
-            + "            </rdf:li>\n"
-            + "          </rdf:Seq>\n"
-            + "        </Metadata:HighResTrack>\n"
-            + "      </Metadata:Scores>\n"
-            + "    </rdf:Description>\n"
-            + "  </rdf:RDF>\n"
-            + "</x:xmpmeta>\n";
-    String xmpContent = String.format(Locale.US, xmpTemplate, timestampUs, timestampUs);
-    File tempFile = File.createTempFile("moments", ".xmp", context.getCacheDir());
-    FileWriter writer = new FileWriter(tempFile);
-    writer.write(xmpContent);
-    writer.close();
-    return tempFile.getAbsolutePath();
   }
 
   public static File copyAssetToCache(Context context, String assetName) throws IOException {

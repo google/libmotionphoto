@@ -1969,6 +1969,27 @@ TEST(MotionPhotoBuilderTest,
   EXPECT_TRUE(read_synth_vid == dummy_vid_sample);
   EXPECT_TRUE(read_synth_agtm == dummy_agtm_sample);
 
+  // Also verify in-place StripMetadataTrack on the faststart MP4 file on disk
+  // and clean failure on a non-existent path.
+  const string faststart_path =
+      (fs::path(kTestDir) / "faststart_synth.mp4").string();
+  {
+    std::ofstream out(faststart_path, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(synth_mp4.data()),
+              synth_mp4.size());
+  }
+  ASSERT_TRUE(MotionPhotoMp4FileBuilder::StripMetadataTrack(faststart_path,
+                                                            nullptr));
+  EXPECT_EQ(fs::file_size(faststart_path), synth_stripped.size());
+  {
+    std::ifstream in(faststart_path, std::ios::binary);
+    std::vector<uint8_t> on_disk(
+        (std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    EXPECT_TRUE(on_disk == synth_stripped);
+  }
+  EXPECT_FALSE(MotionPhotoMp4FileBuilder::StripMetadataTrack(
+      (fs::path(kTestDir) / "does_not_exist.mp4").string(), nullptr));
+
   fs::remove_all(kTestDir);
 }
 

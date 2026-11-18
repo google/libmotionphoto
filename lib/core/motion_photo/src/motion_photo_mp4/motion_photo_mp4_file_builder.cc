@@ -349,40 +349,44 @@ bool MotionPhotoMp4FileBuilder::IsOptimizationSupported(
   return supported;
 }
 
+namespace {
+
+bool PreadAll(int fd, uint8_t* dest, size_t size, off_t offset) {
+  size_t total_read = 0;
+  while (total_read < size) {
+    ssize_t n = pread(fd, dest + total_read, size - total_read,
+                      offset + static_cast<off_t>(total_read));
+    if (n <= 0) {
+      if (n < 0 && errno == EINTR) continue;
+      return false;
+    }
+    total_read += static_cast<size_t>(n);
+  }
+  return true;
+}
+
+bool PwriteAll(int fd, const uint8_t* data, size_t size, off_t offset) {
+  size_t total_written = 0;
+  while (total_written < size) {
+    ssize_t n = pwrite(fd, data + total_written, size - total_written,
+                       offset + static_cast<off_t>(total_written));
+    if (n <= 0) {
+      if (n < 0 && errno == EINTR) continue;
+      return false;
+    }
+    total_written += static_cast<size_t>(n);
+  }
+  return true;
+}
+
+}  // namespace
+
 bool MotionPhotoMp4FileBuilder::StripMetadataTrack(
     const string& file_name, MessageHandler* message_handler) {
   auto report_error = [&](const string& msg) {
     if (message_handler != nullptr) {
       message_handler->ReportMessage(Message::kStdLibError, msg);
     }
-  };
-
-  auto pread_all = [](int fd, uint8_t* dest, size_t size, off_t offset) {
-    size_t total_read = 0;
-    while (total_read < size) {
-      ssize_t n = pread(fd, dest + total_read, size - total_read,
-                        offset + static_cast<off_t>(total_read));
-      if (n <= 0) {
-        if (n < 0 && errno == EINTR) continue;
-        return false;
-      }
-      total_read += static_cast<size_t>(n);
-    }
-    return true;
-  };
-
-  auto pwrite_all = [](int fd, const uint8_t* data, size_t size, off_t offset) {
-    size_t total_written = 0;
-    while (total_written < size) {
-      ssize_t n = pwrite(fd, data + total_written, size - total_written,
-                         offset + static_cast<off_t>(total_written));
-      if (n <= 0) {
-        if (n < 0 && errno == EINTR) continue;
-        return false;
-      }
-      total_written += static_cast<size_t>(n);
-    }
-    return true;
   };
 
   class LocalFdMediaSource : public MediaSource {
@@ -400,18 +404,7 @@ bool MotionPhotoMp4FileBuilder::StripMetadataTrack(
       if (dest == nullptr) {
         return false;
       }
-      size_t total_read = 0;
-      while (total_read < length) {
-        ssize_t n =
-            pread(fd_, dest + total_read, length - total_read,
-                  static_cast<off_t>(offset) + static_cast<off_t>(total_read));
-        if (n <= 0) {
-          if (n < 0 && errno == EINTR) continue;
-          return false;
-        }
-        total_read += static_cast<size_t>(n);
-      }
-      return true;
+      return PreadAll(fd_, dest, length, static_cast<off_t>(offset));
     }
     int GetFd() const override { return fd_; }
 
@@ -461,9 +454,23 @@ bool MotionPhotoMp4FileBuilder::StripMetadataTrack(
     return false;
   }
 
-  if (!pwrite_all(fd, prepared.rebuilt_moov.data(),
-                  prepared.rebuilt_moov.size(),
+  // Back up the original moov bytes covered by rebuilt_moov when sliding
+  // trailing mdat bytes, so an immediate read failure before any mdat write can
+  // cleanly restore the original moov header.
+  constexpr size_t kMaxMoovRollbackBytes = 16 * 1024 * 1024;
+  vector<uint8_t> original_moov_backup;
+  if (!prepared.moov_at_end &&
+      prepared.rebuilt_moov.size() <= kMaxMoovRollbackBytes) {
+    original_moov_backup.resize(prepared.rebuilt_moov.size());
+    if (!PreadAll(fd, original_moov_backup.data(), original_moov_backup.size(),
                   static_cast<off_t>(prepared.moov_offset))) {
+      original_moov_backup.clear();
+    }
+  }
+
+  if (!PwriteAll(fd, prepared.rebuilt_moov.data(),
+                 prepared.rebuilt_moov.size(),
+                 static_cast<off_t>(prepared.moov_offset))) {
     report_error("Failed to write rebuilt moov box: " + file_name);
     return false;
   }
@@ -473,15 +480,25 @@ bool MotionPhotoMp4FileBuilder::StripMetadataTrack(
     vector<uint8_t> chunk(kSlideChunkSize);
     size_t read_pos = prepared.moov_offset + prepared.moov_size;
     size_t write_pos = prepared.moov_offset + prepared.rebuilt_moov.size();
+    bool mdat_modified = false;
     while (read_pos < source_size) {
       size_t to_move = std::min(kSlideChunkSize, source_size - read_pos);
-      if (!pread_all(fd, chunk.data(), to_move, static_cast<off_t>(read_pos)) ||
-          !pwrite_all(fd, chunk.data(), to_move,
-                      static_cast<off_t>(write_pos))) {
+      if (!PreadAll(fd, chunk.data(), to_move, static_cast<off_t>(read_pos))) {
+        if (!mdat_modified && !original_moov_backup.empty()) {
+          PwriteAll(fd, original_moov_backup.data(), original_moov_backup.size(),
+                    static_cast<off_t>(prepared.moov_offset));
+        }
         report_error("Failed to shift MP4 payload after stripping moov: " +
                      file_name);
         return false;
       }
+      if (!PwriteAll(fd, chunk.data(), to_move,
+                     static_cast<off_t>(write_pos))) {
+        report_error("Failed to shift MP4 payload after stripping moov: " +
+                     file_name);
+        return false;
+      }
+      mdat_modified = true;
       read_pos += to_move;
       write_pos += to_move;
     }
@@ -490,6 +507,11 @@ bool MotionPhotoMp4FileBuilder::StripMetadataTrack(
   if (ftruncate(fd, static_cast<off_t>(prepared.output_video_size)) != 0) {
     report_error("Failed to truncate MP4 file after stripping moov: " +
                  file_name);
+    return false;
+  }
+
+  if (fsync(fd) != 0 && errno != EINVAL) {
+    report_error("Failed to sync MP4 file after stripping moov: " + file_name);
     return false;
   }
 

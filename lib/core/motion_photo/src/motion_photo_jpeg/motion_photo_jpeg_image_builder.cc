@@ -302,7 +302,12 @@ bool MotionPhotoJpegImageBuilder::Build(
             new_mpf_segment = DataSegment::Create(new_mpf_range, mpf_buffer,
                                                   DataSegment::kDelete);
           } else {
-            delta_mpf = 0;
+            if (message_handler_) {
+              message_handler_->ReportMessage(
+                  Message::kValueError,
+                  "MPF offsets or primary image size exceed 32-bit bounds.");
+            }
+            return false;
           }
         }
       }

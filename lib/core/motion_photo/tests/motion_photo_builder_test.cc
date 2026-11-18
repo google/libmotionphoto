@@ -35,6 +35,9 @@
 #include <utility>
 #include <vector>
 
+#include "image_io/mpf/mpf_info.h"
+#include "image_io/mpf/mpf_info_decoder.h"
+#include "image_io/mpf/mpf_info_encoder.h"
 #include "motion_photo/metadata_engine.h"
 #include "motion_photo/motion_photo.h"
 #include "motion_photo/motion_photo_reader.h"
@@ -1452,6 +1455,68 @@ TEST(MotionPhotoBuilderTest,
   }
 
   fs::remove_all(kTestDir);
+}
+
+TEST(MotionPhotoBuilderTest,
+     MultiImageMpf_OffsetExceedsUint32Max_ReturnsFalseWithoutStaleOutput) {
+  const auto gain_map_jpeg = BuildSyntheticSecondaryJpeg(0x11, 32);
+  const string small_xmp =
+      "<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF "
+      "xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:"
+      "Description/></rdf:RDF></x:xmpmeta>";
+  const string large_motion_xmp =
+      "<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF "
+      "xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:"
+      "Description xmlns:Camera='http://ns.google.com/photos/1.0/camera/' "
+      "Camera:MotionPhoto='1' Camera:MotionPhotoVersion='1' "
+      "Camera:MotionPhotoPresentationTimestampUs='250000'/></rdf:RDF></"
+      "x:xmpmeta>";
+
+  // Put XMP after MPF so growing the XMP shifts secondary MPF offsets by
+  // primary_delta > 0 and overflows 0xFFFFFFF0U past UINT32_MAX.
+  std::vector<uint8_t> jpeg = BuildMultiPictureJpeg(
+      HeaderSegmentOrder::kXmpAfterMpf, MpfTagLayout::kMinimal2Tags, small_xmp,
+      {gain_map_jpeg});
+
+  // Locate the MPF segment ("MPF\0") and patch entry[1].image_offset near
+  // UINT32_MAX so growing the preceding XMP overflows 32-bit MPF offsets.
+  const uint8_t kMpfHeader[] = {'M', 'P', 'F', 0x00};
+  auto mpf_it =
+      std::search(jpeg.begin(), jpeg.end(), std::begin(kMpfHeader),
+                  std::end(kMpfHeader));
+  ASSERT_TRUE(mpf_it != jpeg.end());
+  size_t mpf_header_pos = static_cast<size_t>(mpf_it - jpeg.begin());
+  size_t mpf_endian_pos = mpf_header_pos + 4;
+  photos_editing_formats::image_io::MpfInfoDecoder decoder(nullptr);
+  ASSERT_TRUE(decoder.Decode(jpeg.data() + mpf_endian_pos,
+                             jpeg.size() - mpf_endian_pos));
+  photos_editing_formats::image_io::MpfInfo mpf_info = decoder.GetInfo();
+  mpf_info.entries.size();
+  ASSERT_EQ(mpf_info.entries.size(), 2u);
+  const uint32_t orig_offset = mpf_info.entries[1].image_offset;
+  const uint8_t orig_bytes[4] = {
+      static_cast<uint8_t>((orig_offset >> 24) & 0xFF),
+      static_cast<uint8_t>((orig_offset >> 16) & 0xFF),
+      static_cast<uint8_t>((orig_offset >> 8) & 0xFF),
+      static_cast<uint8_t>(orig_offset & 0xFF),
+  };
+  auto search_end =
+      jpeg.begin() + static_cast<std::ptrdiff_t>(
+                         std::min(jpeg.size(), mpf_endian_pos + 128));
+  auto off_it = std::search(
+      jpeg.begin() + static_cast<std::ptrdiff_t>(mpf_endian_pos), search_end,
+      std::begin(orig_bytes), std::end(orig_bytes));
+  ASSERT_TRUE(off_it != search_end);
+  off_it[0] = 0xFF;
+  off_it[1] = 0xFF;
+  off_it[2] = 0xFF;
+  off_it[3] = 0xF0;
+
+  MotionPhotoJpegImageBuilder builder(nullptr);
+  std::vector<uint8_t> out;
+  auto mem_src = MediaSource::FromMemory(jpeg.data(), jpeg.size());
+  auto mem_sink = DataSink::ToMemory(&out);
+  EXPECT_FALSE(builder.Build(*mem_src, large_motion_xmp, mem_sink.get()));
 }
 
 }  // namespace motion_photo

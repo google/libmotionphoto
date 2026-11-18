@@ -567,13 +567,6 @@ public class CreatorResultFragment extends Fragment {
               return;
             }
 
-            viewModel.appendCreatorLog("Generating XMP metadata...");
-            String xmpPath = StorageUtils.generateXmpFile(context, timestampUs);
-            if (xmpPath == null) {
-              viewModel.appendCreatorLog("Failed to generate XMP metadata.");
-              return;
-            }
-
             String ext = imagePath.substring(imagePath.lastIndexOf('.'));
             File outputFile =
                 new File(context.getExternalFilesDir(null), "output_motion_photo" + ext);
@@ -587,7 +580,7 @@ public class CreatorResultFragment extends Fragment {
                       imagePath,
                       videoPath,
                       null,
-                      xmpPath,
+                      null,
                       timestampUs,
                       outputFile.getAbsolutePath());
             } else {
@@ -607,7 +600,6 @@ public class CreatorResultFragment extends Fragment {
             // Clean up temp files
             new File(imagePath).delete();
             new File(videoPath).delete();
-            new File(xmpPath).delete();
 
           } catch (IOException e) {
             viewModel.appendCreatorLog("IOException: " + e.getMessage());

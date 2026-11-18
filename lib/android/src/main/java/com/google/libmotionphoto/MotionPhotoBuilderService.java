@@ -54,23 +54,26 @@ public class MotionPhotoBuilderService extends Service {
             params.presentationTimestampUs = presentationTimestampUs;
             params.outputImage = outputImagePath;
 
-            File cacheDir = null;
-            try {
-              cacheDir = getCacheDir();
-            } catch (RuntimeException ignored) {
-              // Ignored when service is instantiated directly in unit tests without context.
-            }
-            if (cacheDir == null) {
-              cacheDir = new File(System.getProperty("java.io.tmpdir", "/tmp"));
-            }
+            if (momentsVideoPath != null && !momentsVideoPath.isEmpty()) {
+              File cacheDir = null;
+              try {
+                cacheDir = getCacheDir();
+              } catch (RuntimeException ignored) {
+                // Ignored when service is instantiated directly in unit tests without context.
+              }
+              if (cacheDir == null) {
+                cacheDir = new File(System.getProperty("java.io.tmpdir", "/tmp"));
+              }
 
-            try {
-              workingVideo = File.createTempFile("motion_photo_working_trailer", ".mp4", cacheDir);
-              optVideo = File.createTempFile("motion_photo_optimized_trailer", ".mp4", cacheDir);
-              params.workingVideo = workingVideo.getAbsolutePath();
-              params.optimizedVideo = optVideo.getAbsolutePath();
-            } catch (IOException e) {
-              Log.w(TAG, "Failed to create working video temp files in cache", e);
+              try {
+                workingVideo =
+                    File.createTempFile("motion_photo_working_trailer", ".mp4", cacheDir);
+                optVideo = File.createTempFile("motion_photo_optimized_trailer", ".mp4", cacheDir);
+                params.workingVideo = workingVideo.getAbsolutePath();
+                params.optimizedVideo = optVideo.getAbsolutePath();
+              } catch (IOException e) {
+                Log.w(TAG, "Failed to create working video temp files in cache", e);
+              }
             }
 
             return MotionPhotoBuilder.build(params, msg -> Log.i(TAG, "Builder: " + msg));

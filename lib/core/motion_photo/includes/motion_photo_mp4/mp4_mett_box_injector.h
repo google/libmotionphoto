@@ -56,6 +56,37 @@ bool WriteMp4WithMettToSink(const MediaSource& video_source,
                             const PreparedMp4MettInjection& prepared,
                             DataSink* output_sink);
 
+// Precomputed byte layout for stripping Motion Photo `'meta'` tracks
+// (`application/motionphoto-image-meta` and
+// `application/motionphoto-highres-score`) from an MP4/QuickTime stream while
+// preserving video, audio, and dynamic HDR (`it35` AGTM) tracks without
+// temporary files or reading `mdat` payloads into memory.
+struct PreparedMp4MettStrip {
+  bool has_changes = false;
+  size_t moov_offset = 0;
+  size_t moov_size = 0;
+  bool moov_at_end = false;
+  std::vector<uint8_t> rebuilt_moov;
+  size_t output_video_size = 0;
+};
+
+// Scans top-level box headers and the bounded `moov` box from `video_source`,
+// strips only Motion Photo metadata tracks
+// (`"application/motionphoto-image-meta"` and
+// `"application/motionphoto-highres-score"`) while preserving video, audio, and
+// dynamic HDR (`it35` AGTM) tracks, and shifts chunk offsets (`stco`/`co64`)
+// when `moov` precedes `mdat`. When no Motion Photo metadata track exists, sets
+// `prepared->has_changes = false` for zero-mutation pass-through.
+bool PrepareMp4MettStrip(const MediaSource& video_source,
+                         PreparedMp4MettStrip* prepared);
+
+// Streams `video_source` together with `prepared` into `output_sink` in a
+// single forward pass without temporary files. Rejects calls where
+// `video_source` and `output_sink` share the same underlying file descriptor.
+bool WriteMp4WithoutMettToSink(const MediaSource& video_source,
+                               const PreparedMp4MettStrip& prepared,
+                               DataSink* output_sink);
+
 }  // namespace motion_photo
 }  // namespace libmotionphoto
 

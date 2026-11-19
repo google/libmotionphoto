@@ -31,6 +31,17 @@ namespace {
 constexpr size_t kMaxMoovSize = 64 * 1024 * 1024;
 constexpr uint32_t kMetadataTimescaleHz = 1000;
 constexpr uint16_t kUndeterminedLanguageCode = 0x55C4;
+constexpr std::string_view kMotionPhotoHighResScoreMime =
+    "application/motionphoto-highres-score";
+
+struct TopLevelMoovScan {
+  size_t moov_offset = 0;
+  size_t moov_size = 0;
+  size_t moov_header_size = 8;
+  bool patch_open_tail_box = false;
+  size_t open_tail_box_offset = 0;
+  uint32_t open_tail_box_size = 0;
+};
 
 struct BoxSlice {
   size_t offset = 0;
@@ -203,7 +214,9 @@ void InspectStsdBox(const uint8_t* moov_data, const BoxSlice& stsd_box,
         *is_agtm_track = true;
       }
       if (entry_payload.find(kMotionPhotoMetadataMime) !=
-          std::string_view::npos) {
+              std::string_view::npos ||
+          entry_payload.find(kMotionPhotoHighResScoreMime) !=
+              std::string_view::npos) {
         *has_motion_photo_mett_mime = true;
       }
     }
@@ -308,7 +321,7 @@ bool ShiftChunkOffset(uint64_t orig_offset, size_t old_moov_end,
     *shifted_offset = orig_offset + add;
     return true;
   }
-  uint64_t sub = static_cast<uint64_t>(-delta_moov);
+  uint64_t sub = static_cast<uint64_t>(-(delta_moov + 1)) + 1;
   if (orig_offset < sub) {
     return false;
   }
@@ -688,27 +701,44 @@ bool BuildRebuiltMoov(const std::vector<uint8_t>& raw_moov,
   return true;
 }
 
-}  // namespace
+bool BuildStrippedMoov(const std::vector<uint8_t>& raw_moov,
+                       const std::vector<MoovChildInfo>& children,
+                       bool shift_offsets, size_t old_moov_end,
+                       int64_t delta_moov,
+                       std::vector<uint8_t>* rebuilt_moov) {
+  rebuilt_moov->clear();
+  std::vector<uint8_t> moov_payload;
+  moov_payload.reserve(raw_moov.size());
 
-bool PrepareMp4MettInjection(const MediaSource& video_source,
-                             const std::vector<uint8_t>& metadata,
-                             PreparedMp4MettInjection* prepared) {
-  if (prepared == nullptr || metadata.empty() ||
-      metadata.size() > UINT32_MAX - 8) {
-    return false;
+  for (const MoovChildInfo& child : children) {
+    if (child.is_trak && child.strip_trak) {
+      continue;
+    }
+    if (child.is_trak && shift_offsets && delta_moov != 0) {
+      if (!RebuildTrakBox(raw_moov.data(), child.box, old_moov_end, delta_moov,
+                          &moov_payload)) {
+        return false;
+      }
+    } else {
+      moov_payload.insert(moov_payload.end(),
+                          raw_moov.begin() + child.box.offset,
+                          raw_moov.begin() + child.box.offset + child.box.size);
+    }
   }
-  *prepared = PreparedMp4MettInjection();
 
+  AppendBox("moov", moov_payload, rebuilt_moov);
+  return true;
+}
+
+bool ScanTopLevelMoovBox(const MediaSource& video_source,
+                         TopLevelMoovScan* scan) {
   const size_t source_size = video_source.GetSize();
-  if (source_size < 16) {
+  if (scan == nullptr || source_size < 16) {
     return false;
   }
+  *scan = TopLevelMoovScan();
 
   bool found_moov = false;
-  size_t moov_offset = 0;
-  size_t moov_size = 0;
-  size_t moov_header_size = 8;
-
   size_t pos = 0;
   while (pos < source_size) {
     if (source_size - pos < 8) {
@@ -741,23 +771,45 @@ bool PrepareMp4MettInjection(const MediaSource& video_source,
         return false;
       }
       found_moov = true;
-      moov_offset = pos;
-      moov_size = static_cast<size_t>(box_size);
-      moov_header_size = header_size;
+      scan->moov_offset = pos;
+      scan->moov_size = static_cast<size_t>(box_size);
+      scan->moov_header_size = header_size;
     } else if (size32 == 0) {
       if (box_size > UINT32_MAX) {
         return false;
       }
-      prepared->patch_open_tail_box = true;
-      prepared->open_tail_box_offset = pos;
-      prepared->open_tail_box_size = static_cast<uint32_t>(box_size);
+      scan->patch_open_tail_box = true;
+      scan->open_tail_box_offset = pos;
+      scan->open_tail_box_size = static_cast<uint32_t>(box_size);
     }
     pos += static_cast<size_t>(box_size);
   }
 
-  if (!found_moov || pos != source_size) {
+  return found_moov && pos == source_size;
+}
+
+}  // namespace
+
+bool PrepareMp4MettInjection(const MediaSource& video_source,
+                             const std::vector<uint8_t>& metadata,
+                             PreparedMp4MettInjection* prepared) {
+  if (prepared == nullptr || metadata.empty() ||
+      metadata.size() > UINT32_MAX - 8) {
     return false;
   }
+  *prepared = PreparedMp4MettInjection();
+
+  const size_t source_size = video_source.GetSize();
+  TopLevelMoovScan scan;
+  if (!ScanTopLevelMoovBox(video_source, &scan)) {
+    return false;
+  }
+  const size_t moov_offset = scan.moov_offset;
+  const size_t moov_size = scan.moov_size;
+  const size_t moov_header_size = scan.moov_header_size;
+  prepared->patch_open_tail_box = scan.patch_open_tail_box;
+  prepared->open_tail_box_offset = scan.open_tail_box_offset;
+  prepared->open_tail_box_size = scan.open_tail_box_size;
 
   std::vector<uint8_t> raw_moov(moov_size);
   if (!video_source.ReadAt(moov_offset, moov_size, raw_moov.data())) {
@@ -946,6 +998,161 @@ bool WriteMp4WithMettToSink(const MediaSource& video_source,
 
   return output_sink->Write(prepared.appended_mdat_box.data(),
                             prepared.appended_mdat_box.size());
+}
+
+bool PrepareMp4MettStrip(const MediaSource& video_source,
+                         PreparedMp4MettStrip* prepared) {
+  if (prepared == nullptr) {
+    return false;
+  }
+  *prepared = PreparedMp4MettStrip();
+
+  const size_t source_size = video_source.GetSize();
+  TopLevelMoovScan scan;
+  if (!ScanTopLevelMoovBox(video_source, &scan)) {
+    return false;
+  }
+  const size_t moov_offset = scan.moov_offset;
+  const size_t moov_size = scan.moov_size;
+  const size_t moov_header_size = scan.moov_header_size;
+
+  std::vector<uint8_t> raw_moov(moov_size);
+  if (!video_source.ReadAt(moov_offset, moov_size, raw_moov.data())) {
+    return false;
+  }
+
+  std::vector<MoovChildInfo> children;
+  MvhdInfo mvhd_info;
+  size_t surviving_trak_count = 0;
+  size_t stripped_trak_count = 0;
+
+  size_t child_pos = moov_header_size;
+  while (child_pos < moov_size) {
+    MoovChildInfo child_info;
+    if (!ReadBoxSlice(raw_moov.data(), child_pos, moov_size, &child_info.box)) {
+      return false;
+    }
+    if (child_info.box.TypeView() == "mvhd") {
+      if (mvhd_info.found ||
+          !ParseMvhdBox(raw_moov.data(), child_info.box, &mvhd_info)) {
+        return false;
+      }
+      child_info.is_mvhd = true;
+    } else if (child_info.box.TypeView() == "trak") {
+      child_info.is_trak = true;
+      if (!InspectTrakBox(raw_moov.data(), child_info.box, &child_info.track_id,
+                          &child_info.strip_trak)) {
+        return false;
+      }
+      if (child_info.strip_trak) {
+        ++stripped_trak_count;
+      } else {
+        ++surviving_trak_count;
+      }
+    }
+    child_pos += child_info.box.size;
+    children.push_back(child_info);
+  }
+
+  if (child_pos != moov_size || !mvhd_info.found || surviving_trak_count == 0) {
+    return false;
+  }
+
+  prepared->moov_offset = moov_offset;
+  prepared->moov_size = moov_size;
+  prepared->moov_at_end = (moov_offset + moov_size == source_size);
+
+  if (stripped_trak_count == 0) {
+    prepared->has_changes = false;
+    prepared->output_video_size = source_size;
+    return true;
+  }
+
+  prepared->has_changes = true;
+  if (prepared->moov_at_end) {
+    if (!BuildStrippedMoov(raw_moov, children, /*shift_offsets=*/false,
+                           moov_size, /*delta_moov=*/0,
+                           &prepared->rebuilt_moov)) {
+      return false;
+    }
+    if (moov_offset > SIZE_MAX - prepared->rebuilt_moov.size()) {
+      return false;
+    }
+    prepared->output_video_size = moov_offset + prepared->rebuilt_moov.size();
+    return true;
+  }
+
+  const size_t old_moov_end = moov_offset + moov_size;
+  const size_t suffix_size = source_size - old_moov_end;
+  int64_t delta_moov = 0;
+  bool converged = false;
+  for (int pass = 0; pass < 5; ++pass) {
+    if (!BuildStrippedMoov(raw_moov, children, /*shift_offsets=*/true,
+                           old_moov_end, delta_moov, &prepared->rebuilt_moov)) {
+      return false;
+    }
+    int64_t actual_delta = static_cast<int64_t>(prepared->rebuilt_moov.size()) -
+                           static_cast<int64_t>(moov_size);
+    if (actual_delta == delta_moov) {
+      converged = true;
+      break;
+    }
+    delta_moov = actual_delta;
+  }
+  if (!converged) {
+    return false;
+  }
+
+  if (moov_offset > SIZE_MAX - prepared->rebuilt_moov.size()) {
+    return false;
+  }
+  size_t accum = moov_offset + prepared->rebuilt_moov.size();
+  if (suffix_size > SIZE_MAX - accum) {
+    return false;
+  }
+  prepared->output_video_size = accum + suffix_size;
+  return true;
+}
+
+bool WriteMp4WithoutMettToSink(const MediaSource& video_source,
+                               const PreparedMp4MettStrip& prepared,
+                               DataSink* output_sink) {
+  if (output_sink == nullptr) {
+    return false;
+  }
+  if (video_source.GetFd() >= 0 &&
+      video_source.GetFd() == output_sink->GetFd()) {
+    return false;
+  }
+
+  const size_t source_size = video_source.GetSize();
+  if (!prepared.has_changes) {
+    if (prepared.output_video_size != source_size) {
+      return false;
+    }
+    return output_sink->TransferFrom(video_source, 0, source_size);
+  }
+
+  if (prepared.rebuilt_moov.empty() || prepared.moov_offset > source_size ||
+      prepared.moov_size > source_size - prepared.moov_offset) {
+    return false;
+  }
+
+  if (!output_sink->TransferFrom(video_source, 0, prepared.moov_offset)) {
+    return false;
+  }
+  if (!output_sink->Write(prepared.rebuilt_moov.data(),
+                          prepared.rebuilt_moov.size())) {
+    return false;
+  }
+  if (!prepared.moov_at_end) {
+    const size_t old_moov_end = prepared.moov_offset + prepared.moov_size;
+    if (!output_sink->TransferFrom(video_source, old_moov_end,
+                                   source_size - old_moov_end)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 }  // namespace motion_photo

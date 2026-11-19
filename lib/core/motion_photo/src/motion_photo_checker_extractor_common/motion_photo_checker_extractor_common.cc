@@ -354,33 +354,6 @@ bool ParseAndCheckXmpMetadata(DataSource* data_source, size_t file_size,
 
 namespace {
 
-bool ReadDataRangeToBytes(DataSource* data_source, size_t begin, size_t end,
-                          std::vector<uint8_t>* out) {
-  if (data_source == nullptr || out == nullptr || begin >= end) {
-    return false;
-  }
-  out->clear();
-  out->reserve(end - begin);
-  size_t pos = begin;
-  while (pos < end) {
-    std::shared_ptr<DataSegment> seg =
-        data_source->GetDataSegment(pos, end - pos);
-    if (!seg || !seg->Contains(pos)) {
-      out->clear();
-      return false;
-    }
-    size_t avail = std::min(end, seg->GetEnd()) - pos;
-    const uint8_t* ptr = seg->GetBuffer(pos);
-    if (avail == 0 || ptr == nullptr) {
-      out->clear();
-      return false;
-    }
-    out->insert(out->end(), ptr, ptr + avail);
-    pos += avail;
-  }
-  return true;
-}
-
 bool CheckDecodedVideoMetadata(const MotionPhotoMp4FileReader& mp4_reader,
                                MotionPhoto* motion_photo,
                                MotionPhotoReader* motion_photo_reader,

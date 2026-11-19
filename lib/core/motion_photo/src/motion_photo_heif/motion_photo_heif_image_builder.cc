@@ -16,12 +16,19 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <fstream>
+#include <ios>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "image_io/base/data_range.h"
+#include "image_io/base/data_segment.h"
+#include "image_io/base/data_segment_data_source.h"
 #include "image_io/utils/file_utils.h"
+#include "motion_photo/container_splitter.h"
 #include "motion_photo/motion_photo_source.h"
+#include "motion_photo/motion_photo_utils.h"
 #include "motion_photo/mpvd_box.h"
 #include "motion_photo_heif/heif_iso_meta_editor.h"
 
@@ -114,6 +121,102 @@ bool MotionPhotoHeifImageBuilder::AddPaddingFromMpvdBox(
   output_file->write(reinterpret_cast<const char*>(padding.data()),
                      padding.size() * sizeof(Byte));
   return true;
+}
+
+bool MotionPhotoHeifImageBuilder::StripToStillImageFromMemory(
+    const uint8_t* data, size_t size, size_t trailing_image_size,
+    std::string_view fallback_xmp, const std::string& output_path,
+    image_io::MessageHandler* message_handler) {
+  if (data == nullptr || size == 0 || output_path.empty()) {
+    return false;
+  }
+  const bool has_trailing_boundary =
+      trailing_image_size > 0 && trailing_image_size <= size;
+  const size_t still_size = has_trailing_boundary ? trailing_image_size : size;
+
+  auto data_segment = ::photos_editing_formats::image_io::DataSegment::Create(
+      ::photos_editing_formats::image_io::DataRange(0, still_size),
+      const_cast<uint8_t*>(data),
+      ::photos_editing_formats::image_io::DataSegment::BufferDispositionPolicy::
+          kDontDelete);
+  ::photos_editing_formats::image_io::DataSegmentDataSource data_source(
+      data_segment);
+  std::vector<::photos_editing_formats::image_io::DataRange> xmp_ranges =
+      FindHeifPrimaryXmpRanges(&data_source, still_size);
+
+  std::string stripped_xmp;
+  std::string original_xmp;
+  if (!xmp_ranges.empty() &&
+      ReadDataRangesToString(&data_source, xmp_ranges, &original_xmp)) {
+    stripped_xmp = StripMotionPhotoMetadata(original_xmp);
+  } else {
+    stripped_xmp.assign(fallback_xmp);
+  }
+
+  // Fast path: overwrite single-extent XMP in place when no bytes follow
+  // `still_size` and the stripped packet does not grow.
+  if (has_trailing_boundary && xmp_ranges.size() == 1 &&
+      xmp_ranges.front().GetEnd() <= still_size &&
+      stripped_xmp.size() <= xmp_ranges.front().GetLength()) {
+    const size_t xmp_begin = xmp_ranges.front().GetBegin();
+    const size_t xmp_len = xmp_ranges.front().GetLength();
+    const size_t xmp_end = xmp_ranges.front().GetEnd();
+    std::string padded = stripped_xmp;
+    padded.append(xmp_len - padded.size(), ' ');
+    std::ofstream out(output_path, std::ios::binary);
+    if (out.is_open()) {
+      out.write(reinterpret_cast<const char*>(data),
+                static_cast<std::streamsize>(xmp_begin));
+      out.write(padded.data(), static_cast<std::streamsize>(padded.size()));
+      out.write(reinterpret_cast<const char*>(data + xmp_end),
+                static_cast<std::streamsize>(still_size - xmp_end));
+      if (out.good()) {
+        return true;
+      }
+    }
+  }
+
+  if (stripped_xmp.empty()) {
+    stripped_xmp = "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"/>";
+  }
+  std::vector<uint8_t> rebuilt;
+  std::string error;
+  if (!HeifIsoMetaEditor::SetPrimaryXmp(data, still_size, stripped_xmp,
+                                        &rebuilt, &error)) {
+    if (message_handler != nullptr) {
+      message_handler->ReportMessage(
+          Message::kDecodingError, "Failed to set HEIF primary XMP: " + error);
+    }
+    return false;
+  }
+  std::ofstream out(output_path, std::ios::binary);
+  if (!out.is_open()) {
+    return false;
+  }
+  out.write(reinterpret_cast<const char*>(rebuilt.data()),
+            static_cast<std::streamsize>(rebuilt.size()));
+  return out.good();
+}
+
+bool MotionPhotoHeifImageBuilder::StripToStillImageFromDataSource(
+    image_io::DataSource* data_source, size_t source_size,
+    bool mpvd_is_trailing, size_t trailing_image_size,
+    std::string_view fallback_xmp, const std::string& output_path,
+    image_io::MessageHandler* message_handler) {
+  if (data_source == nullptr || source_size == 0 || output_path.empty()) {
+    return false;
+  }
+  const size_t read_size = (mpvd_is_trailing && trailing_image_size > 0 &&
+                            trailing_image_size <= source_size)
+                               ? trailing_image_size
+                               : source_size;
+  std::vector<uint8_t> buffer;
+  if (!ReadDataRangeToBytes(data_source, 0, read_size, &buffer)) {
+    return false;
+  }
+  return StripToStillImageFromMemory(
+      buffer.data(), buffer.size(), mpvd_is_trailing ? buffer.size() : 0,
+      fallback_xmp, output_path, message_handler);
 }
 
 }  // namespace motion_photo

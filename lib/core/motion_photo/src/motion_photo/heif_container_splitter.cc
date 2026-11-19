@@ -32,6 +32,8 @@
 #include "image_io/base/data_source.h"
 #include "motion_photo/container_splitter.h"
 #include "motion_photo/metadata_block.h"
+#include "motion_photo/metadata_value.h"
+#include "motion_photo/motion_photo_utils.h"
 #include "motion_photo/mpvd_box.h"
 
 namespace libmotionphoto {
@@ -51,38 +53,13 @@ constexpr uint64_t kMaxItemExtents = 256;
 // ISO/IEC 23008-12 stores XMP as a 'mime' item with this content type.
 constexpr std::string_view kXmpContentType = "application/rdf+xml";
 
-// Copies `length` bytes at file offset `start` into `out`. Returns false if the
-// data source cannot supply the whole range.
-bool ReadFromDataSource(image_io::DataSource* data_source, size_t start,
-                        size_t length, uint8_t* out) {
-  size_t copied = 0;
-  while (copied < length) {
-    const size_t chunk_start = start + copied;
-    std::shared_ptr<image_io::DataSegment> segment =
-        data_source->GetDataSegment(chunk_start, length - copied);
-    if (segment == nullptr) {
-      return false;
-    }
-    // A non-null buffer means `chunk_start` lies inside the segment, so each
-    // iteration copies at least one byte.
-    const uint8_t* buffer = segment->GetBuffer(chunk_start);
-    if (buffer == nullptr) {
-      return false;
-    }
-    const size_t chunk_size =
-        std::min(length - copied, segment->GetEnd() - chunk_start);
-    std::copy(buffer, buffer + chunk_size, out + copied);
-    copied += chunk_size;
-  }
-  return true;
-}
-
 // Appends `length` bytes at file offset `start` to `out`.
 bool AppendFromDataSource(image_io::DataSource* data_source, size_t start,
                           size_t length, std::vector<uint8_t>* out) {
+  if (out == nullptr) return false;
   const size_t old_size = out->size();
   out->resize(old_size + length);
-  return ReadFromDataSource(data_source, start, length, out->data() + old_size);
+  return ReadDataRange(data_source, start, length, out->data() + old_size);
 }
 
 // A bounds-checked big-endian reader over an in-memory byte range. Reading past
@@ -232,8 +209,8 @@ std::optional<BoxLocation> FindTopLevelBox(image_io::DataSource* data_source,
     std::array<uint8_t, 16> header_bytes;
     const size_t header_length =
         std::min(header_bytes.size(), file_size - position);
-    if (!ReadFromDataSource(data_source, position, header_length,
-                            header_bytes.data())) {
+    if (!ReadDataRange(data_source, position, header_length,
+                       header_bytes.data())) {
       return std::nullopt;
     }
     BoxReader reader(header_bytes.data(), header_length);
@@ -307,17 +284,6 @@ std::optional<uint32_t> ParsePrimaryItemId(ByteRange pitm) {
     return std::nullopt;
   }
   return static_cast<uint32_t>(item_id);
-}
-
-bool EqualsIgnoreCase(std::string_view a, std::string_view b) {
-  if (a.size() != b.size()) return false;
-  for (size_t i = 0; i < a.size(); ++i) {
-    char ca = a[i], cb = b[i];
-    if (ca >= 'A' && ca <= 'Z') ca = static_cast<char>(ca - 'A' + 'a');
-    if (cb >= 'A' && cb <= 'Z') cb = static_cast<char>(cb - 'A' + 'a');
-    if (ca != cb) return false;
-  }
-  return true;
 }
 
 // Returns the item ID from an 'infe' payload if the item holds uncompressed XMP.

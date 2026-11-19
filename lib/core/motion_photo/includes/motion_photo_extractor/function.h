@@ -28,6 +28,7 @@ struct MotionPhotoExtractorParams {
   std::string primary_image_file_name_output;
   std::string video_file_name_output;
   std::string metadata_file_name_output;
+  bool strip_video_metadata_track_on_trailer = false;
 };
 
 int ExtractMotionPhoto(const MotionPhotoExtractorParams& params,

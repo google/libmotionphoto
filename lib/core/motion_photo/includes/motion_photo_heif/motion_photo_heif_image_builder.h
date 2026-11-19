@@ -15,6 +15,8 @@
 #ifndef MOTION_PHOTO_HEIF_MOTION_PHOTO_HEIF_IMAGE_BUILDER_H_
 #define MOTION_PHOTO_HEIF_MOTION_PHOTO_HEIF_IMAGE_BUILDER_H_
 
+#include <cstddef>
+#include <cstdint>
 #include <string>
 #include <string_view>
 
@@ -46,6 +48,26 @@ class MotionPhotoHeifImageBuilder {
 
   /// @param mpvd_box The mpvd_box used to generate the padding.
   bool AddPaddingFromMpvdBox(const MpvdBox& mpvd_box);
+
+  /// Strips MotionPhoto XMP and trailing motion photo video boxes from an
+  /// in-memory HEIF container [data, data + size) and writes a still image to
+  /// @p output_path. When @p trailing_image_size > 0 && <= @p size, assumes a
+  /// trailing 'mpvd' box starts at @p trailing_image_size and patches single-
+  /// extent XMP in place when it fits; otherwise rebuilds losslessly via
+  /// HeifIsoMetaEditor.
+  static bool StripToStillImageFromMemory(
+      const uint8_t* data, size_t size, size_t trailing_image_size,
+      std::string_view fallback_xmp, const std::string& output_path,
+      image_io::MessageHandler* message_handler = nullptr);
+
+  /// Reads at most [0, trailing_image_size) when @p mpvd_is_trailing is true
+  /// (avoiding reading trailing video bytes) and writes a stripped still HEIF
+  /// image to @p output_path.
+  static bool StripToStillImageFromDataSource(
+      image_io::DataSource* data_source, size_t source_size,
+      bool mpvd_is_trailing, size_t trailing_image_size,
+      std::string_view fallback_xmp, const std::string& output_path,
+      image_io::MessageHandler* message_handler = nullptr);
 
  private:
   image_io::MessageHandler* message_handler_;

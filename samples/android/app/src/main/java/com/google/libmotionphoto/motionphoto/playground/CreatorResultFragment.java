@@ -541,49 +541,57 @@ public class CreatorResultFragment extends Fragment {
             }
 
             viewModel.appendCreatorLog("Copying input files to temp directory...");
-            String imagePath =
-                StorageUtils.copyUriToTempFile(context, imageUri, "input_image", ".jpg");
-            String videoPath =
-                StorageUtils.copyUriToTempFile(context, videoUri, "input_video", ".mp4");
+            String imagePath = null;
+            String videoPath = null;
+            try {
+              imagePath =
+                  StorageUtils.copyUriToTempFile(context, imageUri, "input_image", ".jpg");
+              videoPath =
+                  StorageUtils.copyUriToTempFile(context, videoUri, "input_video", ".mp4");
 
-            if (imagePath == null || videoPath == null) {
-              viewModel.appendCreatorLog("Failed to copy input files.");
-              return;
+              if (imagePath == null || videoPath == null) {
+                viewModel.appendCreatorLog("Failed to copy input files.");
+                return;
+              }
+
+              String ext = StorageUtils.getFileExtension(imagePath, ".jpg");
+              File outputFile =
+                  new File(context.getExternalFilesDir(null), "output_motion_photo" + ext);
+              viewModel.appendCreatorLog("Output file will be: " + outputFile.getAbsolutePath());
+
+              viewModel.appendCreatorLog("Calling Sandboxed MotionPhotoBuilderService...");
+              int result = -1;
+              if (isBuilderBound && builderService != null) {
+                result =
+                    builderService.buildMotionPhoto(
+                        imagePath,
+                        videoPath,
+                        null,
+                        null,
+                        timestampUs,
+                        outputFile.getAbsolutePath());
+              } else {
+                viewModel.appendCreatorLog(
+                    "Builder service not bound, cannot build motion photo.");
+              }
+
+              viewModel.appendCreatorLog("Builder returned: " + result);
+              if (result == 0) {
+                viewModel.appendCreatorLog(
+                    "SUCCESS! Motion photo created at " + outputFile.getAbsolutePath());
+                viewModel.setBuiltMotionPhotoFile(outputFile);
+                prepareResultPreview(context, outputFile);
+              } else {
+                viewModel.appendCreatorLog("FAILED! Check logs above.");
+              }
+            } finally {
+              if (imagePath != null) {
+                new File(imagePath).delete();
+              }
+              if (videoPath != null) {
+                new File(videoPath).delete();
+              }
             }
-
-            String ext = StorageUtils.getFileExtension(imagePath, ".jpg");
-            File outputFile =
-                new File(context.getExternalFilesDir(null), "output_motion_photo" + ext);
-            viewModel.appendCreatorLog("Output file will be: " + outputFile.getAbsolutePath());
-
-            viewModel.appendCreatorLog("Calling Sandboxed MotionPhotoBuilderService...");
-            int result = -1;
-            if (isBuilderBound && builderService != null) {
-              result =
-                  builderService.buildMotionPhoto(
-                      imagePath,
-                      videoPath,
-                      null,
-                      null,
-                      timestampUs,
-                      outputFile.getAbsolutePath());
-            } else {
-              viewModel.appendCreatorLog("Builder service not bound, cannot build motion photo.");
-            }
-
-            viewModel.appendCreatorLog("Builder returned: " + result);
-            if (result == 0) {
-              viewModel.appendCreatorLog(
-                  "SUCCESS! Motion photo created at " + outputFile.getAbsolutePath());
-              viewModel.setBuiltMotionPhotoFile(outputFile);
-              prepareResultPreview(context, outputFile);
-            } else {
-              viewModel.appendCreatorLog("FAILED! Check logs above.");
-            }
-
-            // Clean up temp files
-            new File(imagePath).delete();
-            new File(videoPath).delete();
 
           } catch (IOException e) {
             viewModel.appendCreatorLog("IOException: " + e.getMessage());

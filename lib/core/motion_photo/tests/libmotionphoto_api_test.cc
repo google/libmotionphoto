@@ -27,6 +27,7 @@
 #include <string>
 #include <vector>
 
+#include "motion_photo/motion_photo_utils.h"
 #include "motion_photo/tests/test_framework.h"
 
 namespace libmotionphoto {
@@ -1042,6 +1043,26 @@ TEST(LibMotionPhotoApiTest, BuildsParsesChecksAndExtractsAvifAndMultiExtent) {
   }
   ASSERT_TRUE(ExtractPrimaryImageFromMemory(multi_heic.data(),
                                             multi_heic.size(), multi_still));
+  const std::string multi_still_fd =
+      (test_dir / "multi_still_fd.heic").string();
+  const std::string multi_still_file =
+      (test_dir / "multi_still_file.heic").string();
+  multi_fd = open(multi_path.c_str(), O_RDONLY);
+  ASSERT_TRUE(multi_fd >= 0);
+  ASSERT_TRUE(ExtractPrimaryImageFromFd(
+      multi_fd, 0, static_cast<int64_t>(multi_heic.size()), multi_still_fd));
+  close(multi_fd);
+  ASSERT_TRUE(ExtractPrimaryImageFromFile(multi_path, multi_still_file));
+  {
+    auto read_all = [](const std::string& p) {
+      std::ifstream in(p, std::ios::binary);
+      return std::string((std::istreambuf_iterator<char>(in)),
+                         std::istreambuf_iterator<char>());
+    };
+    const std::string mem_bytes = read_all(multi_still);
+    EXPECT_EQ(mem_bytes, read_all(multi_still_fd));
+    EXPECT_EQ(mem_bytes, read_all(multi_still_file));
+  }
   MotionPhotoMetadata multi_still_meta;
   EXPECT_FALSE(ParseMotionPhotoFromFile(multi_still, &multi_still_meta) &&
                multi_still_meta.is_motion_photo);
@@ -1249,15 +1270,15 @@ TEST(LibMotionPhotoApiTest, LargeFdOverreadXmlLangAndParityRegression) {
   ExtractorParams p_file{ref_heic,
                          (test_dir / "out_file.heic").string(),
                          (test_dir / "out_file.mp4").string(),
-                         ""};
+                         (test_dir / "out_file.xml").string()};
   ExtractorParams p_fd{ref_heic,
                        (test_dir / "out_fd.heic").string(),
                        (test_dir / "out_fd.mp4").string(),
-                       ""};
+                       (test_dir / "out_fd.xml").string()};
   ExtractorParams p_mem{ref_heic,
                         (test_dir / "out_mem.heic").string(),
                         (test_dir / "out_mem.mp4").string(),
-                        ""};
+                        (test_dir / "out_mem.xml").string()};
   ASSERT_TRUE(ExtractMotionPhotoFromFile(p_file));
   int ref_fd = open(ref_heic.c_str(), O_RDONLY);
   ASSERT_TRUE(ref_fd >= 0);
@@ -1274,6 +1295,83 @@ TEST(LibMotionPhotoApiTest, LargeFdOverreadXmlLangAndParityRegression) {
             read_bytes(p_fd.video_output_path));
   EXPECT_EQ(read_bytes(p_fd.video_output_path),
             read_bytes(p_mem.video_output_path));
+  EXPECT_EQ(read_bytes(p_file.metadata_output_path),
+            read_bytes(p_fd.metadata_output_path));
+  EXPECT_EQ(read_bytes(p_fd.metadata_output_path),
+            read_bytes(p_mem.metadata_output_path));
+
+  // JPEG ExtractMotionPhoto File/Fd/Memory parity (single StripMetadataTrack).
+  const std::string ref_jpg =
+      "lib/core/motion_photo/testdata/motion_photo_single_video_track.MP.jpg";
+  const size_t jpg_size = fs::file_size(ref_jpg);
+  std::ifstream jpg_in(ref_jpg, std::ios::binary);
+  std::vector<uint8_t> jpg_buf(jpg_size);
+  ASSERT_TRUE(jpg_in.read(reinterpret_cast<char*>(jpg_buf.data()), jpg_size));
+  ExtractorParams jp_file{ref_jpg,
+                          (test_dir / "jpg_file.jpg").string(),
+                          (test_dir / "jpg_file.mp4").string(),
+                          ""};
+  ExtractorParams jp_fd{ref_jpg,
+                        (test_dir / "jpg_fd.jpg").string(),
+                        (test_dir / "jpg_fd.mp4").string(),
+                        ""};
+  ExtractorParams jp_mem{ref_jpg,
+                         (test_dir / "jpg_mem.jpg").string(),
+                         (test_dir / "jpg_mem.mp4").string(),
+                         ""};
+  ASSERT_TRUE(ExtractMotionPhotoFromFile(jp_file));
+  int jpg_fd = open(ref_jpg.c_str(), O_RDONLY);
+  ASSERT_TRUE(jpg_fd >= 0);
+  ASSERT_TRUE(ExtractMotionPhotoFromFd(jpg_fd, 0, jpg_size, jp_fd));
+  close(jpg_fd);
+  ASSERT_TRUE(
+      ExtractMotionPhotoFromMemory(jpg_buf.data(), jpg_buf.size(), jp_mem));
+  EXPECT_EQ(read_bytes(jp_file.primary_image_output_path),
+            read_bytes(jp_fd.primary_image_output_path));
+  EXPECT_EQ(read_bytes(jp_fd.primary_image_output_path),
+            read_bytes(jp_mem.primary_image_output_path));
+  EXPECT_EQ(read_bytes(jp_file.video_output_path),
+            read_bytes(jp_fd.video_output_path));
+  EXPECT_EQ(read_bytes(jp_fd.video_output_path),
+            read_bytes(jp_mem.video_output_path));
+
+  // SniffFileType must not scan past a truncated non-zero 'ftyp' box_size < 16.
+  const uint8_t truncated_mif1[] = {0, 0, 0, 12, 'f', 't', 'y', 'p',
+                                    'm', 'i', 'f', '1', 0, 0, 0, 0,
+                                    'a', 'v', 'i', 'f'};
+  EXPECT_EQ(
+      static_cast<int>(
+          motion_photo::SniffFileType(truncated_mif1, sizeof(truncated_mif1))),
+      static_cast<int>(motion_photo::FileType::kHeic));
+
+  // PopulateNativeMetadata selects semantic MotionPhoto item even when GainMap
+  // precedes it in Container:Directory.
+  const std::string gainmap_first_xmp =
+      "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">"
+      "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">"
+      "<rdf:Description rdf:about=\"\" "
+      "xmlns:Camera=\"http://ns.google.com/photos/1.0/camera/\" "
+      "xmlns:Container=\"http://ns.google.com/photos/1.0/container/\" "
+      "xmlns:Item=\"http://ns.google.com/photos/1.0/container/item/\" "
+      "Camera:MotionPhoto=\"1\" Camera:MotionPhotoVersion=\"1\" "
+      "Camera:MotionPhotoPresentationTimestampUs=\"100\">"
+      "<Container:Directory><rdf:Seq>"
+      "<rdf:li><Container:Item Item:Semantic=\"Primary\" "
+      "Item:Mime=\"image/heic\" Item:Padding=\"8\"/></rdf:li>"
+      "<rdf:li><Container:Item Item:Semantic=\"GainMap\" "
+      "Item:Mime=\"image/jpeg\" Item:Length=\"123\"/></rdf:li>"
+      "<rdf:li><Container:Item Item:Semantic=\"MotionPhoto\" "
+      "Item:Mime=\"video/mp4\" Item:Length=\"" +
+      std::to_string(vid_bytes.size()) +
+      "\"/></rdf:li>"
+      "</rdf:Seq></Container:Directory>"
+      "</rdf:Description></rdf:RDF></x:xmpmeta>";
+  std::vector<uint8_t> gainmap_first = build_large_heic(gainmap_first_xmp);
+  MotionPhotoMetadata gm_meta;
+  ASSERT_TRUE(ParseMotionPhotoFromMemory(gainmap_first.data(),
+                                         gainmap_first.size(), &gm_meta));
+  EXPECT_EQ(gm_meta.video_mime, "video/mp4");
+  EXPECT_EQ(gm_meta.video_length, static_cast<int64_t>(vid_bytes.size()));
 
   fs::remove_all(test_dir);
 }

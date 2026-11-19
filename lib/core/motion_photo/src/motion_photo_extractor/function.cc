@@ -20,7 +20,6 @@
 #include <ios>
 #include <memory>
 #include <ostream>
-#include <regex>
 #include <sstream>
 #include <string>
 #include <tuple>
@@ -192,54 +191,6 @@ string String(const T& value) {
   return ss.str();
 }
 
-// Strips MotionPhoto metadata from XMP using StripMotionPhotoMetadata() in
-// motion_photo_utils.h.
-
-// Writes an extracted HEIF/AVIF still image with MotionPhoto metadata stripped
-// and the trailing 'mpvd' box removed. Uses the fast in-place overwrite when
-// XMP is a single contiguous range inside [0, trailing_image_size) before a
-// trailing 'mpvd' box; otherwise rebuilds 'meta' cleanly via
-// MotionPhotoHeifImageBuilder.
-bool WriteStrippedHeifStillImage(
-    const std::string& motion_photo_file_name, image_io::DataSource* data_source,
-    const std::vector<image_io::DataRange>& xmp_ranges, bool mpvd_is_trailing,
-    size_t trailing_image_size, const std::string& fallback_stripped_xmp,
-    const std::string& output_image_path,
-    image_io::MessageHandler* message_handler) {
-  std::string stripped_xmp;
-  std::string original_xmp;
-  if (ReadDataRangesToString(data_source, xmp_ranges, &original_xmp)) {
-    stripped_xmp = StripMotionPhotoMetadata(original_xmp);
-    if (mpvd_is_trailing && trailing_image_size > 0 && xmp_ranges.size() == 1 &&
-        xmp_ranges.front().GetEnd() <= trailing_image_size &&
-        stripped_xmp.size() <= xmp_ranges.front().GetLength()) {
-      if (WriteToOutput(motion_photo_file_name, output_image_path, 0,
-                        trailing_image_size)) {
-        std::string padded = stripped_xmp;
-        padded.append(xmp_ranges.front().GetLength() - padded.size(), ' ');
-        std::fstream out_heic(output_image_path,
-                              std::ios::in | std::ios::out | std::ios::binary);
-        if (out_heic.is_open() &&
-            out_heic.seekp(
-                static_cast<std::streamoff>(xmp_ranges.front().GetBegin())) &&
-            out_heic.write(padded.data(),
-                           static_cast<std::streamsize>(padded.size())) &&
-            out_heic.flush()) {
-          return true;
-        }
-      }
-    }
-  } else {
-    stripped_xmp = fallback_stripped_xmp;
-  }
-  if (stripped_xmp.empty()) {
-    stripped_xmp = "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"/>";
-  }
-  MotionPhotoHeifImageBuilder image_builder(output_image_path, message_handler);
-  return image_builder.AddImageFileAndMetadata(motion_photo_file_name,
-                                               stripped_xmp);
-}
-
 }  // namespace
 
 int ExtractMotionPhoto(const MotionPhotoExtractorParams& params,
@@ -324,14 +275,16 @@ int ExtractMotionPhoto(const MotionPhotoExtractorParams& params,
                          video_offset + video_length)) {
         return 1;
       }
+      if (params.strip_video_metadata_track_on_trailer) {
+        // Best-effort for MP4 payloads (leaves non-MP4 3P payloads intact).
+        MotionPhotoMp4FileBuilder::StripMetadataTrack(
+            params.video_file_name_output, &message_handler);
+      }
     }
     if (!params.primary_image_file_name_output.empty() && image_size > 0) {
       if (IsHeif(file_type)) {
-        MotionPhotoHeifInfoBuilder info_builder(&message_handler);
-        info_builder.Build(data_source.get(), file_size);
-        if (!WriteStrippedHeifStillImage(
-                params.motion_photo_file_name, data_source.get(),
-                info_builder.GetXmpStringRanges(), mpvd_is_trailing,
+        if (!MotionPhotoHeifImageBuilder::StripToStillImageFromDataSource(
+                data_source.get(), file_size, mpvd_is_trailing,
                 static_cast<size_t>(image_size), "",
                 params.primary_image_file_name_output, &message_handler)) {
           return 1;
@@ -418,10 +371,11 @@ int ExtractMotionPhoto(const MotionPhotoExtractorParams& params,
       const bool std_mpvd_trailing =
           mpvd_box.IsValid() && mpvd_box.GetStartIndex() > 0 &&
           mpvd_box.GetStartIndex() + mpvd_box.GetLength() == file_size;
-      build_success = WriteStrippedHeifStillImage(
-          params.motion_photo_file_name, data_source.get(), xmp_ranges,
-          std_mpvd_trailing, mpvd_box.GetStartIndex(), fallback_metadata,
-          params.primary_image_file_name_output, &message_handler);
+      build_success =
+          MotionPhotoHeifImageBuilder::StripToStillImageFromDataSource(
+              data_source.get(), file_size, std_mpvd_trailing,
+              mpvd_box.GetStartIndex(), fallback_metadata,
+              params.primary_image_file_name_output, &message_handler);
     }
 
     if (!build_success) {

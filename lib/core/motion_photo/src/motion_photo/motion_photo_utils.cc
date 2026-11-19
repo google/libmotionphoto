@@ -18,17 +18,21 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <initializer_list>
+#include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "image_io/base/data_destination.h"
 #include "image_io/base/data_segment.h"
 #include "image_io/base/data_source.h"
+#include "image_io/base/types.h"
 #include "motion_photo/motion_photo.h"
 
 namespace libmotionphoto {
@@ -91,7 +95,7 @@ FileType SniffFileType(const uint8_t* data, size_t size) {
                         (static_cast<uint32_t>(data[1]) << 16) |
                         (static_cast<uint32_t>(data[2]) << 8) |
                         static_cast<uint32_t>(data[3]);
-    size_t scan_end = box_size >= 16 ? std::min<size_t>(size, box_size) : size;
+    size_t scan_end = (box_size == 0) ? size : std::min<size_t>(size, box_size);
     for (size_t off = 16; off + 4 <= scan_end; off += 4) {
       if (IsAvifBrand(data + off)) {
         return FileType::kAvif;
@@ -121,6 +125,167 @@ const char* GetPrimaryImageMimeType(FileType file_type) {
   }
 }
 
+FdDataSource::FdDataSource(int fd, int64_t base_offset, int64_t total_length,
+                           bool owns_fd)
+    : fd_(fd),
+      base_offset_(base_offset),
+      total_length_(total_length),
+      owns_fd_(owns_fd) {}
+
+FdDataSource::~FdDataSource() {
+  if (owns_fd_ && fd_ >= 0) {
+    close(fd_);
+    fd_ = -1;
+  }
+}
+
+void FdDataSource::Reset() { current_data_segment_.reset(); }
+
+std::shared_ptr<image_io::DataSegment> FdDataSource::GetDataSegment(
+    size_t begin, size_t min_size) {
+  if (current_data_segment_ && current_data_segment_->Contains(begin)) {
+    size_t remaining = current_data_segment_->GetEnd() - begin;
+    if (remaining >= min_size) {
+      return current_data_segment_;
+    }
+  }
+  current_data_segment_ = Read(begin, min_size);
+  return current_data_segment_;
+}
+
+FdDataSource::TransferDataResult FdDataSource::TransferData(
+    const image_io::DataRange& data_range, size_t best_size,
+    image_io::DataDestination* data_destination) {
+  bool data_transferred = false;
+  image_io::DataDestination::TransferStatus status =
+      image_io::DataDestination::kTransferDone;
+  if (data_destination && data_range.IsValid() && fd_ >= 0) {
+    size_t min_size = std::min(data_range.GetLength(), best_size);
+    if (current_data_segment_ &&
+        current_data_segment_->GetLength() >= min_size &&
+        current_data_segment_->GetDataRange().Contains(data_range)) {
+      status = data_destination->Transfer(data_range, *current_data_segment_);
+      data_transferred = true;
+    } else {
+      size_t chunk_size = std::max(min_size, static_cast<size_t>(64 * 1024));
+      size_t pos = data_range.GetBegin();
+      while (pos < data_range.GetEnd()) {
+        size_t end = pos + std::min(data_range.GetEnd() - pos, chunk_size);
+        auto data_segment = Read(pos, end - pos);
+        if (!data_segment) {
+          break;
+        }
+        auto transfer_range = data_segment->GetDataRange().GetIntersection(
+            image_io::DataRange(pos, end));
+        if (!transfer_range.IsValid() || transfer_range.GetEnd() <= pos) {
+          break;
+        }
+        status = data_destination->Transfer(transfer_range, *data_segment);
+        data_transferred = true;
+        pos = transfer_range.GetEnd();
+        if (status != image_io::DataDestination::kTransferOk) {
+          break;
+        }
+      }
+    }
+  }
+  if (data_transferred) {
+    return status == image_io::DataDestination::kTransferError
+               ? kTransferDataError
+               : kTransferDataSuccess;
+  }
+  return data_destination ? kTransferDataNone : kTransferDataError;
+}
+
+std::shared_ptr<image_io::DataSegment> FdDataSource::Read(size_t begin,
+                                                          size_t min_size) {
+  if (fd_ < 0 || total_length_ <= 0 ||
+      begin >= static_cast<size_t>(total_length_)) {
+    return nullptr;
+  }
+  const size_t total = static_cast<size_t>(total_length_);
+  const size_t default_chunk = (begin < 256 * 1024)
+                                   ? static_cast<size_t>(64 * 1024)
+                                   : static_cast<size_t>(4 * 1024);
+  size_t chunk_size = std::max(min_size, default_chunk);
+  size_t read_begin = begin;
+  size_t to_read = std::min(chunk_size, total - begin);
+  if (begin >= 256 * 1024 && total - begin < chunk_size) {
+    read_begin = (total > chunk_size) ? (total - chunk_size) : 0;
+    to_read = total - read_begin;
+  }
+  if (to_read == 0) {
+    return nullptr;
+  }
+
+  auto buffer = std::make_shared<std::vector<image_io::Byte>>(to_read);
+  size_t total_bytes_read = 0;
+  while (total_bytes_read < to_read) {
+    ssize_t bytes =
+        pread(fd_, buffer->data() + total_bytes_read, to_read - total_bytes_read,
+              static_cast<off_t>(base_offset_ + read_begin + total_bytes_read));
+    if (bytes <= 0) {
+      if (bytes < 0 && errno == EINTR) continue;
+      break;
+    }
+    total_bytes_read += static_cast<size_t>(bytes);
+  }
+
+  if (total_bytes_read <= (begin - read_begin)) {
+    return nullptr;
+  }
+
+  auto segment = image_io::DataSegment::Create(
+      image_io::DataRange(read_begin, read_begin + total_bytes_read),
+      buffer->data(),
+      image_io::DataSegment::BufferDispositionPolicy::kDontDelete);
+  return std::shared_ptr<image_io::DataSegment>(
+      segment.get(), [segment, buffer](image_io::DataSegment*) {});
+}
+
+bool ReadDataRange(image_io::DataSource* data_source, size_t start,
+                   size_t length, uint8_t* out) {
+  if (length == 0) {
+    return data_source != nullptr;
+  }
+  if (data_source == nullptr || out == nullptr ||
+      length > std::numeric_limits<size_t>::max() - start) {
+    return false;
+  }
+  size_t copied = 0;
+  while (copied < length) {
+    const size_t chunk_start = start + copied;
+    std::shared_ptr<image_io::DataSegment> segment =
+        data_source->GetDataSegment(chunk_start, length - copied);
+    if (!segment || !segment->Contains(chunk_start)) {
+      return false;
+    }
+    const size_t avail =
+        std::min(length - copied, segment->GetEnd() - chunk_start);
+    const uint8_t* buffer = segment->GetBuffer(chunk_start);
+    if (avail == 0 || buffer == nullptr) {
+      return false;
+    }
+    std::memcpy(out + copied, buffer, avail);
+    copied += avail;
+  }
+  return true;
+}
+
+bool ReadDataRangeToBytes(image_io::DataSource* data_source, size_t begin,
+                          size_t end, std::vector<uint8_t>* out) {
+  if (data_source == nullptr || out == nullptr || begin >= end) {
+    return false;
+  }
+  const size_t len = end - begin;
+  out->resize(len);
+  if (!ReadDataRange(data_source, begin, len, out->data())) {
+    out->clear();
+    return false;
+  }
+  return true;
+}
+
 bool ReadDataRangesToString(image_io::DataSource* data_source,
                             const std::vector<image_io::DataRange>& ranges,
                             std::string* out) {
@@ -133,27 +298,13 @@ bool ReadDataRangesToString(image_io::DataSource* data_source,
       out->clear();
       return false;
     }
-    size_t pos = range.GetBegin();
-    const size_t end = range.GetEnd();
-    while (pos < end) {
-      std::shared_ptr<image_io::DataSegment> segment =
-          data_source->GetDataSegment(pos, end - pos);
-      if (!segment || !segment->Contains(pos)) {
-        out->clear();
-        return false;
-      }
-      const size_t avail = std::min(end, segment->GetEnd()) - pos;
-      if (avail == 0) {
-        out->clear();
-        return false;
-      }
-      const uint8_t* ptr = segment->GetBuffer(pos);
-      if (ptr == nullptr) {
-        out->clear();
-        return false;
-      }
-      out->append(reinterpret_cast<const char*>(ptr), avail);
-      pos += avail;
+    const size_t old_size = out->size();
+    const size_t len = range.GetLength();
+    out->resize(old_size + len);
+    if (!ReadDataRange(data_source, range.GetBegin(), len,
+                       reinterpret_cast<uint8_t*>(&(*out)[old_size]))) {
+      out->clear();
+      return false;
     }
   }
   return !out->empty();

@@ -297,8 +297,16 @@ TEST(LibMotionPhotoApiTest, BuildMotionPhotoFromMemoryTimestampPropagates) {
                                    std::istreambuf_iterator<char>());
   ASSERT_FALSE(video_bytes.empty());
 
+  const char* test_tmpdir = std::getenv("TEST_TMPDIR");
+  fs::path base_dir = (test_tmpdir != nullptr && test_tmpdir[0] != '\0')
+                          ? fs::path(test_tmpdir)
+                          : fs::temp_directory_path();
+  fs::path test_dir = base_dir / "BuildMotionPhotoFromMemoryWithTimestamp";
+  fs::create_directories(test_dir);
+
   // 1. Explicit presentation timestamp is recorded in both XMP and MP4 'meta'.
-  std::string explicit_out = "/tmp/built_motion_photo_mem_ts_explicit.jpg";
+  std::string explicit_out =
+      (test_dir / "built_motion_photo_mem_ts_explicit.jpg").string();
   if (fs::exists(explicit_out)) fs::remove(explicit_out);
   EXPECT_EQ(BuildMotionPhotoFromMemory(image_bytes.data(), image_bytes.size(),
                                        video_bytes.data(), video_bytes.size(),
@@ -312,7 +320,8 @@ TEST(LibMotionPhotoApiTest, BuildMotionPhotoFromMemoryTimestampPropagates) {
   fs::remove(explicit_out);
 
   // 2. Default (-1) timestamp remains valid and spec-compliant.
-  std::string default_out = "/tmp/built_motion_photo_mem_ts_default.jpg";
+  std::string default_out =
+      (test_dir / "built_motion_photo_mem_ts_default.jpg").string();
   if (fs::exists(default_out)) fs::remove(default_out);
   EXPECT_EQ(BuildMotionPhotoFromMemory(image_bytes.data(), image_bytes.size(),
                                        video_bytes.data(), video_bytes.size(),
@@ -322,7 +331,7 @@ TEST(LibMotionPhotoApiTest, BuildMotionPhotoFromMemoryTimestampPropagates) {
   EXPECT_TRUE(ParseMotionPhotoFromFile(default_out, &default_meta));
   EXPECT_TRUE(default_meta.is_motion_photo);
   EXPECT_EQ(CheckMotionPhotoFromFile(default_out), 0);
-  fs::remove(default_out);
+  fs::remove_all(test_dir);
 }
 
 // 7. Test GetLibMotionPhotoVersion

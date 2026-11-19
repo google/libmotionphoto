@@ -63,15 +63,10 @@ using libmotionphoto::jni::ScopedUtfChars;
 using libmotionphoto::jni::ThrowOutOfMemoryError;
 using libmotionphoto::jni::ThrowRuntimeException;
 
-// Returns kHeic for ISO BMFF images, which start with an 'ftyp' box, and kJpeg
-// otherwise. The metadata engine parses HEIC and AVIF the same way.
+// Sniffs container file type from header bytes, falling back to kJpeg.
 libmotionphoto::motion_photo::FileType SniffFileType(const uint8_t* data,
                                                      size_t size) {
-  if (data != nullptr && size >= 8 && data[4] == 'f' && data[5] == 't' &&
-      data[6] == 'y' && data[7] == 'p') {
-    return libmotionphoto::motion_photo::FileType::kHeic;
-  }
-  return libmotionphoto::motion_photo::FileType::kJpeg;
+  return libmotionphoto::motion_photo::SniffFileTypeOrDefaultJpeg(data, size);
 }
 
 // Lazy random-access DataSource backed by pread() on an open file descriptor.
@@ -238,7 +233,7 @@ jbyteArray ParseMetadataFromFd(JNIEnv* env, int fd, int64_t offset,
 
   mp::FileType file_type = mp::FileType::kJpeg;
   if (std::shared_ptr<ii::DataSegment> header_segment =
-          data_source.GetDataSegment(0, 8)) {
+          data_source.GetDataSegment(0, 64)) {
     file_type = SniffFileType(header_segment->GetBuffer(0),
                               header_segment->GetLength());
   }

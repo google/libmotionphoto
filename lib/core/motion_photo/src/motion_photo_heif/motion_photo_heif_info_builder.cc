@@ -31,6 +31,9 @@ MotionPhotoHeifInfoBuilder::MotionPhotoHeifInfoBuilder(
 
 bool MotionPhotoHeifInfoBuilder::Build(DataSource* data_source,
                                        size_t data_source_length) {
+  xmp_string_range_ = image_io::DataRange();
+  xmp_string_ranges_.clear();
+  mpvd_box_ = MpvdBox();
   if (data_source == nullptr || data_source_length == 0) {
     return false;
   }
@@ -40,13 +43,16 @@ bool MotionPhotoHeifInfoBuilder::Build(DataSource* data_source,
   MpvdBoxScanReceiver receiver(mpvd_box_);
   MpvdBox::Scan(data_source, 0, receiver);
 
-  xmp_string_range_ = FindHeifPrimaryXmpRange(data_source, data_source_length);
-  if (!xmp_string_range_.IsValid()) {
+  xmp_string_ranges_ = FindHeifPrimaryXmpRanges(data_source, data_source_length);
+  if (xmp_string_ranges_.empty()) {
     if (message_handler_ != nullptr) {
       message_handler_->ReportMessage(Message::kDecodingError,
                                       "Xmp not found in heif metadata");
     }
     return false;
+  }
+  if (xmp_string_ranges_.size() == 1) {
+    xmp_string_range_ = xmp_string_ranges_.front();
   }
 
   if (!mpvd_box_.IsValid()) {
@@ -57,7 +63,7 @@ bool MotionPhotoHeifInfoBuilder::Build(DataSource* data_source,
     return false;
   }
 
-  return xmp_string_range_.IsValid() && mpvd_box_.IsValid();
+  return !xmp_string_ranges_.empty() && mpvd_box_.IsValid();
 }
 
 }  // namespace motion_photo

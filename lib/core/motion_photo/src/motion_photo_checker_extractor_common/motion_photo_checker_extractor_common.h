@@ -38,27 +38,33 @@ bool WriteToOutput(const std::string& inputFilePath,
                    std::streamoff beginOffset,
                    std::streamoff endOffset);
 
+// Writes one or more byte ranges sequentially from an input file to an output file.
+bool WriteRangesToOutput(const std::string& inputFilePath,
+                         const std::string& outputFilePath,
+                         const std::vector<image_io::DataRange>& ranges);
+
 // Reads a file into a data source.
 std::tuple<std::unique_ptr<image_io::DataSource>, size_t> ReadFile(
     const std::string& file_name,
     const image_io::StringOutputter& outputter,
     image_io::MessageHandler* message_handler);
 
-// Gets the primary image size and XMP range.
+// Gets the primary image size and XMP ranges.
 // Optionally writes the primary image to primary_image_file_name_output.
-std::tuple<size_t, image_io::DataRange, MpvdBox> GetImageSizeAndXmpRange(
-    image_io::DataSource* data_source, size_t data_source_length,
-    FileType file_type, const std::string& motion_photo_file_name,
-    const std::string& primary_image_file_name_output,
-    const image_io::StringOutputter& outputter,
-    image_io::MessageHandler* message_handler);
+std::tuple<size_t, std::vector<image_io::DataRange>, MpvdBox>
+GetImageSizeAndXmpRanges(image_io::DataSource* data_source,
+                         size_t data_source_length, FileType file_type,
+                         const std::string& motion_photo_file_name,
+                         const std::string& primary_image_file_name_output,
+                         const image_io::StringOutputter& outputter,
+                         image_io::MessageHandler* message_handler);
 
 // Parses the XMP metadata without running MotionPhotoChecker validations.
 // Optionally writes the metadata to metadata_file_name_output.
 bool ParseXmpMetadata(
     image_io::DataSource* data_source,
     const std::string& motion_photo_file_name,
-    const image_io::DataRange& xmp_range,
+    const std::vector<image_io::DataRange>& xmp_ranges,
     const std::string& metadata_file_name_output,
     MotionPhotoReader* motion_photo_reader,
     const image_io::StringOutputter& outputter);
@@ -68,7 +74,7 @@ bool ParseXmpMetadata(
 bool ParseAndCheckXmpMetadata(
     image_io::DataSource* data_source, size_t file_size, FileType file_type,
     const std::string& motion_photo_file_name,
-    const image_io::DataRange& xmp_range, size_t image_size,
+    const std::vector<image_io::DataRange>& xmp_ranges, size_t image_size,
     const std::string& metadata_file_name_output, MotionPhoto* motion_photo,
     MotionPhotoReader* motion_photo_reader,
     MotionPhotoChecker* motion_photo_checker,

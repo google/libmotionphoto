@@ -195,6 +195,51 @@ string String(const T& value) {
 // Strips MotionPhoto metadata from XMP using StripMotionPhotoMetadata() in
 // motion_photo_utils.h.
 
+// Writes an extracted HEIF/AVIF still image with MotionPhoto metadata stripped
+// and the trailing 'mpvd' box removed. Uses the fast in-place overwrite when
+// XMP is a single contiguous range inside [0, trailing_image_size) before a
+// trailing 'mpvd' box; otherwise rebuilds 'meta' cleanly via
+// MotionPhotoHeifImageBuilder.
+bool WriteStrippedHeifStillImage(
+    const std::string& motion_photo_file_name, image_io::DataSource* data_source,
+    const std::vector<image_io::DataRange>& xmp_ranges, bool mpvd_is_trailing,
+    size_t trailing_image_size, const std::string& fallback_stripped_xmp,
+    const std::string& output_image_path,
+    image_io::MessageHandler* message_handler) {
+  std::string stripped_xmp;
+  std::string original_xmp;
+  if (ReadDataRangesToString(data_source, xmp_ranges, &original_xmp)) {
+    stripped_xmp = StripMotionPhotoMetadata(original_xmp);
+    if (mpvd_is_trailing && trailing_image_size > 0 && xmp_ranges.size() == 1 &&
+        xmp_ranges.front().GetEnd() <= trailing_image_size &&
+        stripped_xmp.size() <= xmp_ranges.front().GetLength()) {
+      if (WriteToOutput(motion_photo_file_name, output_image_path, 0,
+                        trailing_image_size)) {
+        std::string padded = stripped_xmp;
+        padded.append(xmp_ranges.front().GetLength() - padded.size(), ' ');
+        std::fstream out_heic(output_image_path,
+                              std::ios::in | std::ios::out | std::ios::binary);
+        if (out_heic.is_open() &&
+            out_heic.seekp(
+                static_cast<std::streamoff>(xmp_ranges.front().GetBegin())) &&
+            out_heic.write(padded.data(),
+                           static_cast<std::streamsize>(padded.size())) &&
+            out_heic.flush()) {
+          return true;
+        }
+      }
+    }
+  } else {
+    stripped_xmp = fallback_stripped_xmp;
+  }
+  if (stripped_xmp.empty()) {
+    stripped_xmp = "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"/>";
+  }
+  MotionPhotoHeifImageBuilder image_builder(output_image_path, message_handler);
+  return image_builder.AddImageFileAndMetadata(motion_photo_file_name,
+                                               stripped_xmp);
+}
+
 }  // namespace
 
 int ExtractMotionPhoto(const MotionPhotoExtractorParams& params,
@@ -282,55 +327,14 @@ int ExtractMotionPhoto(const MotionPhotoExtractorParams& params,
     }
     if (!params.primary_image_file_name_output.empty() && image_size > 0) {
       if (IsHeif(file_type)) {
-        std::string stripped_xmp;
-        bool in_place_ok = false;
         MotionPhotoHeifInfoBuilder info_builder(&message_handler);
-        if (info_builder.Build(data_source.get(), file_size)) {
-          DataRange xmp_range = info_builder.GetXmpStringRange();
-          std::shared_ptr<DataSegment> xmp_segment =
-              xmp_range.IsValid()
-                  ? data_source->GetDataSegment(xmp_range.GetBegin(),
-                                                xmp_range.GetLength())
-                  : nullptr;
-          if (xmp_segment) {
-            std::string original_xmp(
-                reinterpret_cast<const char*>(
-                    xmp_segment->GetBuffer(xmp_range.GetBegin())),
-                xmp_range.GetLength());
-            stripped_xmp = StripMotionPhotoMetadata(original_xmp);
-            if (mpvd_is_trailing &&
-                xmp_range.GetEnd() <= static_cast<size_t>(image_size) &&
-                stripped_xmp.size() <= xmp_range.GetLength()) {
-              if (WriteToOutput(params.motion_photo_file_name,
-                                params.primary_image_file_name_output, 0,
-                                image_size)) {
-                std::string padded = stripped_xmp;
-                padded.append(xmp_range.GetLength() - padded.size(), ' ');
-                std::fstream out_heic(
-                    params.primary_image_file_name_output,
-                    std::ios::in | std::ios::out | std::ios::binary);
-                if (out_heic.is_open() &&
-                    out_heic.seekp(
-                        static_cast<std::streamoff>(xmp_range.GetBegin())) &&
-                    out_heic.write(padded.data(), static_cast<std::streamsize>(
-                                                      padded.size())) &&
-                    out_heic.flush()) {
-                  in_place_ok = true;
-                }
-              }
-            }
-          }
-        }
-        if (!in_place_ok) {
-          if (stripped_xmp.empty()) {
-            stripped_xmp = "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"/>";
-          }
-          MotionPhotoHeifImageBuilder image_builder(
-              params.primary_image_file_name_output, &message_handler);
-          if (!image_builder.AddImageFileAndMetadata(
-                  params.motion_photo_file_name, stripped_xmp)) {
-            return 1;
-          }
+        info_builder.Build(data_source.get(), file_size);
+        if (!WriteStrippedHeifStillImage(
+                params.motion_photo_file_name, data_source.get(),
+                info_builder.GetXmpStringRanges(), mpvd_is_trailing,
+                static_cast<size_t>(image_size), "",
+                params.primary_image_file_name_output, &message_handler)) {
+          return 1;
         }
       } else if (!WriteToOutput(params.motion_photo_file_name,
                                 params.primary_image_file_name_output, 0,
@@ -344,12 +348,12 @@ int ExtractMotionPhoto(const MotionPhotoExtractorParams& params,
   // Get the primary image size and the location in the data source of the
   // primary XMP segment string.
   size_t std_image_size = 0;
-  DataRange xmp_range;
+  std::vector<DataRange> xmp_ranges;
   MpvdBox mpvd_box;
-  tie(std_image_size, xmp_range, mpvd_box) = GetImageSizeAndXmpRange(
+  tie(std_image_size, xmp_ranges, mpvd_box) = GetImageSizeAndXmpRanges(
       data_source.get(), file_size, file_type, params.motion_photo_file_name,
       "", outputter, &message_handler);
-  if ((std_image_size == 0) || !xmp_range.IsValid()) {
+  if ((std_image_size == 0) || xmp_ranges.empty()) {
     return 1;
   }
   motion_photo.SetMpvdBox(mpvd_box);
@@ -357,7 +361,7 @@ int ExtractMotionPhoto(const MotionPhotoExtractorParams& params,
   // Parse the XMP metadata string without running strict MotionPhotoChecker
   // rules.
   if (!ParseXmpMetadata(data_source.get(), params.motion_photo_file_name,
-                        xmp_range, params.metadata_file_name_output,
+                        xmp_ranges, params.metadata_file_name_output,
                         &motion_photo_reader, outputter)) {
     return 1;
   }
@@ -391,62 +395,33 @@ int ExtractMotionPhoto(const MotionPhotoExtractorParams& params,
   }
 
   if (!params.primary_image_file_name_output.empty()) {
-    string image_metadata;
-    bool read_ok = false;
-    std::shared_ptr<image_io::DataSegment> xmp_segment =
-        data_source->GetDataSegment(xmp_range.GetBegin(),
-                                    xmp_range.GetLength());
-    if (xmp_segment) {
-      std::string original_xmp(
-          reinterpret_cast<const char*>(
-              xmp_segment->GetBuffer(xmp_range.GetBegin())),
-          xmp_range.GetLength());
-      image_metadata = StripMotionPhotoMetadata(original_xmp);
-      read_ok = true;
-    }
-
-    if (!read_ok) {
-      motion_photo.SetIsMotionPhoto(false);
-      MotionPhotoWriter motion_photo_writer(motion_photo);
-      motion_photo_writer.WriteImageMetadata(&image_metadata);
-    }
-
     bool build_success = false;
     if (file_type == FileType::kJpeg) {
+      string image_metadata;
+      string original_xmp;
+      if (ReadDataRangesToString(data_source.get(), xmp_ranges, &original_xmp)) {
+        image_metadata = StripMotionPhotoMetadata(original_xmp);
+      } else {
+        motion_photo.SetIsMotionPhoto(false);
+        MotionPhotoWriter motion_photo_writer(motion_photo);
+        motion_photo_writer.WriteImageMetadata(&image_metadata);
+      }
       MotionPhotoJpegImageBuilder image_builder(
           params.primary_image_file_name_output, &message_handler);
       build_success = image_builder.AddImageFileAndMetadata(
           params.motion_photo_file_name, image_metadata);
     } else if (IsHeif(file_type)) {
-      if (mpvd_box.IsValid() && mpvd_box.GetStartIndex() > 0 &&
-          mpvd_box.GetStartIndex() + mpvd_box.GetLength() == file_size &&
-          read_ok && xmp_range.IsValid() &&
-          xmp_range.GetEnd() <= mpvd_box.GetStartIndex() &&
-          image_metadata.size() <= xmp_range.GetLength()) {
-        build_success = WriteToOutput(params.motion_photo_file_name,
-                                      params.primary_image_file_name_output, 0,
-                                      mpvd_box.GetStartIndex());
-        if (build_success) {
-          std::string padded_xmp = image_metadata;
-          padded_xmp.append(xmp_range.GetLength() - padded_xmp.size(), ' ');
-          std::fstream out_heic(
-              params.primary_image_file_name_output,
-              std::ios::in | std::ios::out | std::ios::binary);
-          if (!out_heic.is_open() ||
-              !out_heic.seekp(
-                  static_cast<std::streamoff>(xmp_range.GetBegin())) ||
-              !out_heic.write(padded_xmp.data(), static_cast<std::streamsize>(
-                                                     padded_xmp.size())) ||
-              !out_heic.flush()) {
-            build_success = false;
-          }
-        }
-      } else {
-        MotionPhotoHeifImageBuilder image_builder(
-            params.primary_image_file_name_output, &message_handler);
-        build_success = image_builder.AddImageFileAndMetadata(
-            params.motion_photo_file_name, image_metadata);
-      }
+      motion_photo.SetIsMotionPhoto(false);
+      string fallback_metadata;
+      MotionPhotoWriter motion_photo_writer(motion_photo);
+      motion_photo_writer.WriteImageMetadata(&fallback_metadata);
+      const bool std_mpvd_trailing =
+          mpvd_box.IsValid() && mpvd_box.GetStartIndex() > 0 &&
+          mpvd_box.GetStartIndex() + mpvd_box.GetLength() == file_size;
+      build_success = WriteStrippedHeifStillImage(
+          params.motion_photo_file_name, data_source.get(), xmp_ranges,
+          std_mpvd_trailing, mpvd_box.GetStartIndex(), fallback_metadata,
+          params.primary_image_file_name_output, &message_handler);
     }
 
     if (!build_success) {

@@ -30,9 +30,11 @@
 
 #include "absl/strings/match.h"
 #include "image_io/base/byte_data.h"
+#include "image_io/base/data_destination.h"
 #include "image_io/base/data_range.h"
 #include "image_io/base/data_segment.h"
 #include "image_io/base/data_segment_data_source.h"
+#include "image_io/base/data_source.h"
 #include "image_io/base/message.h"
 #include "image_io/base/message_handler.h"
 #include "image_io/base/message_writer.h"
@@ -43,6 +45,7 @@
 #include "image_io/utils/string_outputter_message_writer.h"
 #include "image_io/xmp/xmp_container_metadata.h"
 #include "motion_photo/camera_metadata.h"
+#include "motion_photo/container_splitter.h"
 #include "motion_photo/motion_photo.h"
 #include "motion_photo/motion_photo_reader.h"
 #include "motion_photo/motion_photo_source.h"
@@ -302,30 +305,155 @@ void GetHexDump(const vector<uint8_t>& bytes, stringstream* ss) {
 }
 
 FileType DetectFileType(const MediaSource& source) {
-  if (source.GetSize() < 4) return FileType::kUnsupported;
-  uint8_t magic[12];
+  if (source.GetSize() < 2) return FileType::kUnsupported;
+  uint8_t magic[64];
   size_t read_len = std::min(source.GetSize(), sizeof(magic));
   if (!source.ReadAt(0, read_len, magic)) return FileType::kUnsupported;
+  return SniffFileType(magic, read_len);
+}
 
-  if (magic[0] == 0xFF && magic[1] == 0xD8) {
-    return FileType::kJpeg;
+// Random-access DataSource view backed by a MediaSource for zero-copy box/XMP
+// inspection without buffering the whole HEIC/AVIF pixel payload.
+class MediaSourceDataSource : public image_io::DataSource {
+ public:
+  explicit MediaSourceDataSource(const MediaSource& source) : source_(source) {}
+
+  void Reset() override { cached_.reset(); }
+
+  std::shared_ptr<DataSegment> GetDataSegment(size_t begin,
+                                              size_t min_size) override {
+    const size_t total = source_.GetSize();
+    if (begin >= total) return nullptr;
+    if (cached_ && cached_->Contains(begin) &&
+        cached_->GetEnd() - begin >= std::min(min_size, total - begin)) {
+      return cached_;
+    }
+    const size_t chunk_size =
+        std::min(total - begin, std::max<size_t>(min_size, 64 * 1024));
+    std::unique_ptr<Byte[]> buf(new Byte[chunk_size]);
+    if (!source_.ReadAt(begin, chunk_size, buf.get())) {
+      return nullptr;
+    }
+    cached_ = DataSegment::Create(DataRange(begin, begin + chunk_size),
+                                  buf.release(), DataSegment::kDelete);
+    return cached_;
   }
-  if (read_len >= 8 && magic[4] == 'f' && magic[5] == 't' &&
-      magic[6] == 'y' && magic[7] == 'p') {
-    if (read_len >= 12) {
-      if (magic[8] == 'a' && magic[9] == 'v' &&
-          magic[10] == 'i' && magic[11] == 'f') {
-        return FileType::kAvif;
+
+  TransferDataResult TransferData(
+      const DataRange& data_range, size_t best_size,
+      image_io::DataDestination* data_destination) override {
+    if (!data_destination) return kTransferDataError;
+    const size_t total = source_.GetSize();
+    DataRange clipped = data_range.GetIntersection(DataRange(0, total));
+    if (!clipped.IsValid()) return kTransferDataNone;
+    const size_t step = std::max<size_t>(best_size, 1);
+    bool transferred = false;
+    image_io::DataDestination::TransferStatus status =
+        image_io::DataDestination::kTransferDone;
+    for (size_t pos = clipped.GetBegin(); pos < clipped.GetEnd();) {
+      const size_t req = std::min(step, clipped.GetEnd() - pos);
+      std::shared_ptr<DataSegment> seg = GetDataSegment(pos, req);
+      if (!seg || !seg->GetDataRange().Contains(pos)) break;
+      const size_t seg_end = std::min(clipped.GetEnd(), seg->GetEnd());
+      status = data_destination->Transfer(DataRange(pos, seg_end), *seg);
+      transferred = true;
+      if (status != image_io::DataDestination::kTransferOk || seg_end <= pos) {
+        break;
+      }
+      pos = seg_end;
+    }
+    if (!transferred) return kTransferDataNone;
+    return status == image_io::DataDestination::kTransferError
+               ? kTransferDataError
+               : kTransferDataSuccess;
+  }
+
+ private:
+  const MediaSource& source_;
+  std::shared_ptr<DataSegment> cached_;
+};
+
+void InspectPrimaryImage(
+    const MediaSource& image_source, FileType file_type,
+    MotionPhoto* motion_photo, MessageHandler* message_handler,
+    std::unique_ptr<MotionPhotoJpegInfoBuilder>* out_jpeg_info_builder,
+    std::string* out_existing_xmp, bool* out_ok) {
+  *out_ok = true;
+  if (file_type == FileType::kJpeg) {
+    size_t image_size = image_source.GetSize();
+    if (image_size == 0) {
+      message_handler->ReportMessage(Message::kDecodingError,
+                                    "Empty primary image");
+      *out_ok = false;
+      return;
+    }
+    std::unique_ptr<Byte[]> img_buf(new Byte[image_size]);
+    if (!image_source.ReadAt(0, image_size, img_buf.get())) {
+      message_handler->ReportMessage(Message::kDecodingError,
+                                    "Failed to read primary image");
+      *out_ok = false;
+      return;
+    }
+    auto jpeg_segment = DataSegment::Create(DataRange(0, image_size),
+                                            img_buf.release(),
+                                            DataSegment::kDelete);
+    DataSegmentDataSource jpeg_source(jpeg_segment);
+    auto jpeg_info_builder =
+        std::make_unique<MotionPhotoJpegInfoBuilder>(message_handler);
+    jpeg_info_builder->Build(&jpeg_source);
+    const DataRange& xmp_range = jpeg_info_builder->GetPrimaryXmpStringRange();
+    if (xmp_range.IsValid()) {
+      size_t bytes_parsed = 0;
+      MotionPhotoReader image_reader(motion_photo, message_handler);
+      image_reader.ReadImageMetadata({xmp_range}, &jpeg_source, &bytes_parsed);
+      ReadDataRangesToString(&jpeg_source, {xmp_range}, out_existing_xmp);
+    }
+    motion_photo->SetIsMotionPhoto(true);
+
+    const auto& image_ranges = jpeg_info_builder->GetInfo().GetImageRanges();
+    ContainerMetadata container = motion_photo->GetContainerMetadata();
+    auto& items = container.items;
+    if (image_ranges.size() > 1) {
+      bool has_gainmap = false;
+      for (auto& item : items) {
+        if (item.semantic.WasAssigned() &&
+            item.semantic.GetValue() == kContainerItemSemanticGainMap) {
+          item.length = image_ranges[1].GetLength();
+          has_gainmap = true;
+          break;
+        }
+      }
+      if (!has_gainmap) {
+        ContainerItemMetadata gainmap_item;
+        gainmap_item.semantic = kContainerItemSemanticGainMap;
+        gainmap_item.mime = kContainerJpegImageItemMime;
+        gainmap_item.length = image_ranges[1].GetLength();
+        items.insert(items.begin() + 1, gainmap_item);
+      }
+    } else {
+      for (auto it = items.begin(); it != items.end(); ++it) {
+        if (it->semantic.WasAssigned() &&
+            it->semantic.GetValue() == kContainerItemSemanticGainMap) {
+          items.erase(it);
+          break;
+        }
       }
     }
-    return FileType::kHeic;
+    motion_photo->SetContainerMetadata(std::move(container));
+    *out_jpeg_info_builder = std::move(jpeg_info_builder);
+  } else if (IsHeif(file_type)) {
+    MediaSourceDataSource heif_source(image_source);
+    std::vector<DataRange> xmp_ranges =
+        FindHeifPrimaryXmpRanges(&heif_source, image_source.GetSize());
+    if (!xmp_ranges.empty()) {
+      ReadDataRangesToString(&heif_source, xmp_ranges, out_existing_xmp);
+    }
   }
-  return FileType::kUnsupported;
 }
 
 string MergeXmpMetadata(const string& original_xmp,
                         const MotionPhoto& motion_photo) {
-  string xmp = original_xmp;
+  string xmp = StripMotionPhotoMetadata(original_xmp);
 
   int64_t timestamp = 0;
   if (motion_photo.GetCameraMetadata()
@@ -334,62 +462,70 @@ string MergeXmpMetadata(const string& original_xmp,
                     .motion_photo_presentation_timestamp_us.GetValue();
   }
 
+  size_t image_padding = 0;
   size_t video_length = 0;
   size_t video_padding = 0;
   const auto& items = motion_photo.GetContainerMetadata().items;
   for (const auto& item : items) {
-    if (item.semantic.WasAssigned() &&
-        item.semantic.GetValue() == kContainerVideoItemSemantic) {
+    if (!item.semantic.WasAssigned()) continue;
+    if (item.semantic.GetValue() == kContainerImageItemSemantic &&
+        item.padding.WasAssigned() && item.padding.GetValue() > 0) {
+      image_padding = static_cast<size_t>(item.padding.GetValue());
+    } else if (item.semantic.GetValue() == kContainerVideoItemSemantic) {
       if (item.length.WasAssigned()) {
         video_length = item.length.GetValue();
       }
       if (item.padding.WasAssigned()) {
         video_padding = item.padding.GetValue();
       }
-      break;
     }
   }
 
   size_t desc_start = xmp.find("<rdf:Description");
-  if (desc_start != string::npos) {
-    size_t desc_end = xmp.find('>', desc_start);
-    if (desc_end != string::npos) {
-      if (desc_end > 0 && xmp[desc_end - 1] == '/') {
-        xmp.replace(desc_end - 1, 2, ">\n  </rdf:Description>");
-        desc_end = xmp.find('>', desc_start);
-      }
-      string desc_tag = xmp.substr(desc_start, desc_end - desc_start);
-      desc_tag = std::regex_replace(
-          desc_tag,
-          std::regex(R"(\bContainer:Version\s*=\s*("[^"]*"|'[^']*'))"), "");
-      desc_tag = std::regex_replace(
-          desc_tag,
-          std::regex(
-              R"(\bCamera:(MotionPhoto|MotionPhotoVersion|MotionPhotoPresentationTimestampUs)\s*=\s*("[^"]*"|'[^']*'))"),
-          "");
-
-      if (!absl::StrContains(desc_tag, "xmlns:Camera=")) {
-        desc_tag += " xmlns:Camera=\"http://ns.google.com/photos/1.0/camera/\"";
-      }
-      if (!absl::StrContains(desc_tag, "xmlns:Container=")) {
-        desc_tag +=
-            " xmlns:Container=\"http://ns.google.com/photos/1.0/container/\"";
-      }
-      if (!absl::StrContains(desc_tag, "xmlns:Item=")) {
-        desc_tag +=
-            " xmlns:Item=\"http://ns.google.com/photos/1.0/container/item/\"";
-      }
-
-      desc_tag += " Camera:MotionPhoto=\"1\"";
-      desc_tag += " Camera:MotionPhotoVersion=\"" +
-                  std::to_string(kMotionPhotoVersionValue) + "\"";
-      desc_tag += " Camera:MotionPhotoPresentationTimestampUs=\"" +
-                  std::to_string(timestamp) + "\"";
-      desc_tag += " Container:Version=\"" + string(kContainerVersion) + "\"";
-
-      xmp.replace(desc_start, desc_end - desc_start, desc_tag);
-    }
+  if (desc_start == string::npos) {
+    return "";
   }
+  size_t desc_end = xmp.find('>', desc_start);
+  if (desc_end == string::npos) {
+    return "";
+  }
+  if (desc_end > 0 && xmp[desc_end - 1] == '/') {
+    xmp.replace(desc_end - 1, 2, ">\n  </rdf:Description>");
+    desc_end = xmp.find('>', desc_start);
+  }
+  string desc_tag = xmp.substr(desc_start, desc_end - desc_start);
+  desc_tag = std::regex_replace(
+      desc_tag, std::regex(R"(\bContainer:Version\s*=\s*("[^"]*"|'[^']*'))"),
+      "");
+  desc_tag = std::regex_replace(
+      desc_tag,
+      std::regex(
+          R"(\b(?:GCamera|Camera):(?:MotionPhoto|MotionPhotoVersion|MotionPhotoPresentationTimestampUs)\s*=\s*("[^"]*"|'[^']*'))"),
+      "");
+
+  if (!absl::StrContains(desc_tag, "xmlns:Camera=")) {
+    desc_tag += " xmlns:Camera=\"http://ns.google.com/photos/1.0/camera/\"";
+  }
+  if (!absl::StrContains(desc_tag, "xmlns:Container=")) {
+    desc_tag +=
+        " xmlns:Container=\"http://ns.google.com/photos/1.0/container/\"";
+  }
+  if (!absl::StrContains(desc_tag, "xmlns:Item=")) {
+    desc_tag +=
+        " xmlns:Item=\"http://ns.google.com/photos/1.0/container/item/\"";
+  }
+
+  desc_tag += " Camera:MotionPhoto=\"1\"";
+  desc_tag += " Camera:MotionPhotoVersion=\"" +
+              std::to_string(kMotionPhotoVersionValue) + "\"";
+  desc_tag += " Camera:MotionPhotoPresentationTimestampUs=\"" +
+              std::to_string(timestamp) + "\"";
+  desc_tag += " Container:Version=\"" + string(kContainerVersion) + "\"";
+
+  xmp.replace(desc_start, desc_end - desc_start, desc_tag);
+
+  const char* mime_cstr = GetPrimaryImageMimeType(motion_photo.GetFileType());
+  string primary_mime = (mime_cstr[0] != '\0') ? mime_cstr : "image/jpeg";
 
   string video_item =
       "          <rdf:li rdf:parseType=\"Resource\">\n"
@@ -399,8 +535,8 @@ string MergeXmpMetadata(const string& original_xmp,
       "              Item:Length=\"" +
       std::to_string(video_length) + "\"";
   if (video_padding > 0) {
-    video_item += "\n              Item:Padding=\"" +
-                  std::to_string(video_padding) + "\"";
+    video_item +=
+        "\n              Item:Padding=\"" + std::to_string(video_padding) + "\"";
   }
   video_item += "/>\n          </rdf:li>\n";
 
@@ -417,7 +553,39 @@ string MergeXmpMetadata(const string& original_xmp,
       while (std::regex_search(search_iter, directory_part.cend(), match,
                                item_regex)) {
         std::string item_tag = match.str(0);
-        if (absl::StrContains(item_tag, "Item:Semantic=\"MotionPhoto\"")) {
+        if (absl::StrContains(item_tag, "Item:Semantic=\"Primary\"") ||
+            absl::StrContains(item_tag, "Item:Semantic='Primary'")) {
+          std::string updated_primary = std::regex_replace(
+              item_tag, std::regex(R"(Item:Mime\s*=\s*("[^"]*"|'[^']*'))"),
+              "Item:Mime=\"" + primary_mime + "\"");
+          if (image_padding > 0) {
+            if (absl::StrContains(updated_primary, "Item:Padding=")) {
+              updated_primary = std::regex_replace(
+                  updated_primary,
+                  std::regex(R"(Item:Padding\s*=\s*("[^"]*"|'[^']*'))"),
+                  "Item:Padding=\"" + std::to_string(image_padding) + "\"");
+            } else {
+              size_t close_idx = updated_primary.rfind("/>");
+              if (close_idx != string::npos) {
+                updated_primary.insert(
+                    close_idx, " Item:Padding=\"" +
+                                   std::to_string(image_padding) + "\"");
+              }
+            }
+          } else {
+            updated_primary = std::regex_replace(
+                updated_primary,
+                std::regex(R"(\s*\bItem:Padding\s*=\s*("[^"]*"|'[^']*'))"), "");
+          }
+          size_t offset_in_orig =
+              static_cast<size_t>(
+                  std::distance(directory_part.cbegin(), search_iter) +
+                  match.position(0)) +
+              (new_directory_part.size() - directory_part.size());
+          new_directory_part.replace(offset_in_orig, item_tag.length(),
+                                     updated_primary);
+        } else if (absl::StrContains(item_tag,
+                                     "Item:Semantic=\"MotionPhoto\"")) {
           found_motion_photo = true;
           std::string new_item_tag = std::regex_replace(
               item_tag, std::regex(R"(Item:Length\s*=\s*("[^"]*"|'[^']*'))"),
@@ -442,8 +610,10 @@ string MergeXmpMetadata(const string& original_xmp,
                 std::regex(R"(\bItem:Padding\s*=\s*("[^"]*"|'[^']*'))"), "");
           }
           size_t offset_in_orig =
-              std::distance(directory_part.cbegin(), search_iter) +
-              match.position(0);
+              static_cast<size_t>(
+                  std::distance(directory_part.cbegin(), search_iter) +
+                  match.position(0)) +
+              (new_directory_part.size() - directory_part.size());
           new_directory_part.replace(offset_in_orig, item_tag.length(),
                                      new_item_tag);
           break;
@@ -453,38 +623,53 @@ string MergeXmpMetadata(const string& original_xmp,
       if (found_motion_photo) {
         xmp.replace(dir_start, dir_end - dir_start, new_directory_part);
       } else {
-        size_t seq_end = directory_part.rfind("</rdf:Seq>");
+        size_t seq_end = new_directory_part.rfind("</rdf:Seq>");
         if (seq_end != string::npos) {
-          directory_part.insert(seq_end, video_item);
-          xmp.replace(dir_start, dir_end - dir_start, directory_part);
+          new_directory_part.insert(seq_end, video_item);
+          xmp.replace(dir_start, dir_end - dir_start, new_directory_part);
         }
       }
     }
   } else {
-    string primary_mime = (motion_photo.GetFileType() == FileType::kJpeg)
-                              ? "image/jpeg"
-                              : "image/heic";
-    string directory =
-        "      <Container:Directory>\n"
-        "        <rdf:Seq>\n"
+    string primary_item =
         "          <rdf:li rdf:parseType=\"Resource\">\n"
         "            <Container:Item\n"
         "              Item:Semantic=\"Primary\"\n"
         "              Item:Mime=\"" +
-        primary_mime +
-        "\"/>\n"
-        "          </rdf:li>\n" +
-        video_item +
+        primary_mime + "\"";
+    if (image_padding > 0) {
+      primary_item += "\n              Item:Padding=\"" +
+                      std::to_string(image_padding) + "\"";
+    }
+    primary_item += "/>\n          </rdf:li>\n";
+    string directory =
+        "      <Container:Directory>\n"
+        "        <rdf:Seq>\n" +
+        primary_item + video_item +
         "        </rdf:Seq>\n"
         "      </Container:Directory>\n";
 
-    size_t desc_end = xmp.find("</rdf:Description>");
-    if (desc_end != string::npos) {
-      xmp.insert(desc_end, directory);
+    size_t rdf_desc_end = xmp.find("</rdf:Description>");
+    if (rdf_desc_end != string::npos) {
+      xmp.insert(rdf_desc_end, directory);
     }
   }
 
   return xmp;
+}
+
+string BuildFinalImageXmp(const string& existing_xmp,
+                          const MotionPhoto& motion_photo) {
+  if (!existing_xmp.empty()) {
+    string merged = MergeXmpMetadata(existing_xmp, motion_photo);
+    if (!merged.empty()) {
+      return merged;
+    }
+  }
+  string generated;
+  MotionPhotoWriter writer(motion_photo);
+  writer.WriteImageMetadata(&generated);
+  return generated;
 }
 
 }  // namespace
@@ -513,68 +698,14 @@ int BuildMotionPhotoDirect(const MotionPhotoStreamParams& params,
 
   MotionPhoto motion_photo(file_type);
   MotionPhotoWriter motion_photo_writer(motion_photo);
-  std::shared_ptr<DataSegment> jpeg_segment;
-  std::unique_ptr<DataSegmentDataSource> jpeg_source;
   std::unique_ptr<MotionPhotoJpegInfoBuilder> jpeg_info_builder;
-
-  if (file_type == FileType::kJpeg) {
-    size_t image_size = params.primary_image->GetSize();
-    if (image_size == 0) {
-      message_handler.ReportMessage(Message::kDecodingError,
-                                    "Empty primary image stream");
-      return 1;
-    }
-    std::unique_ptr<Byte[]> img_buf(new Byte[image_size]);
-    if (!params.primary_image->ReadAt(0, image_size, img_buf.get())) {
-      message_handler.ReportMessage(Message::kDecodingError,
-                                    "Failed to read primary image stream");
-      return 1;
-    }
-    jpeg_segment = DataSegment::Create(DataRange(0, image_size),
-                                       img_buf.release(), DataSegment::kDelete);
-    jpeg_source = std::make_unique<DataSegmentDataSource>(jpeg_segment);
-    jpeg_info_builder =
-        std::make_unique<MotionPhotoJpegInfoBuilder>(&message_handler);
-    jpeg_info_builder->Build(jpeg_source.get());
-    if (jpeg_info_builder->GetPrimaryXmpStringRange().IsValid()) {
-      size_t bytes_parsed = 0;
-      MotionPhotoReader image_reader(&motion_photo, &message_handler);
-      image_reader.ReadImageMetadata(
-          {jpeg_info_builder->GetPrimaryXmpStringRange()}, jpeg_source.get(),
-          &bytes_parsed);
-    }
-    motion_photo.SetIsMotionPhoto(true);
-
-    const auto& image_ranges = jpeg_info_builder->GetInfo().GetImageRanges();
-    ContainerMetadata container = motion_photo.GetContainerMetadata();
-    auto& items = container.items;
-    if (image_ranges.size() > 1) {
-      bool has_gainmap = false;
-      for (auto& item : items) {
-        if (item.semantic.WasAssigned() &&
-            item.semantic.GetValue() == kContainerItemSemanticGainMap) {
-          item.length = image_ranges[1].GetLength();
-          has_gainmap = true;
-          break;
-        }
-      }
-      if (!has_gainmap) {
-        ContainerItemMetadata gainmap_item;
-        gainmap_item.semantic = kContainerItemSemanticGainMap;
-        gainmap_item.mime = kContainerJpegImageItemMime;
-        gainmap_item.length = image_ranges[1].GetLength();
-        items.insert(items.begin() + 1, gainmap_item);
-      }
-    } else {
-      for (auto it = items.begin(); it != items.end(); ++it) {
-        if (it->semantic.WasAssigned() &&
-            it->semantic.GetValue() == kContainerItemSemanticGainMap) {
-          items.erase(it);
-          break;
-        }
-      }
-    }
-    motion_photo.SetContainerMetadata(std::move(container));
+  std::string existing_xmp;
+  bool inspect_ok = false;
+  InspectPrimaryImage(*params.primary_image, file_type, &motion_photo,
+                      &message_handler, &jpeg_info_builder, &existing_xmp,
+                      &inspect_ok);
+  if (!inspect_ok) {
+    return 1;
   }
 
   bool has_video_xmp = false;
@@ -623,24 +754,7 @@ int BuildMotionPhotoDirect(const MotionPhotoStreamParams& params,
   }
   motion_photo.EnforceConsistentValues();
 
-  string image_metadata;
-  bool xmp_merged = false;
-  if (file_type == FileType::kJpeg && jpeg_info_builder != nullptr &&
-      jpeg_info_builder->GetPrimaryXmpStringRange().IsValid()) {
-    auto xmp_range = jpeg_info_builder->GetPrimaryXmpStringRange();
-    auto xmp_segment = jpeg_source->GetDataSegment(xmp_range.GetBegin(),
-                                                   xmp_range.GetLength());
-    if (xmp_segment) {
-      string original_xmp(reinterpret_cast<const char*>(
-                              xmp_segment->GetBuffer(xmp_range.GetBegin())),
-                          xmp_range.GetLength());
-      image_metadata = MergeXmpMetadata(original_xmp, motion_photo);
-      xmp_merged = true;
-    }
-  }
-  if (!xmp_merged) {
-    motion_photo_writer.WriteImageMetadata(&image_metadata);
-  }
+  string image_metadata = BuildFinalImageXmp(existing_xmp, motion_photo);
 
   // 1. Direct Image Build into output sink
   if (file_type == FileType::kJpeg) {
@@ -740,59 +854,18 @@ int BuildMotionPhoto(const MotionPhotoBuilderParams& params,
 
   MotionPhoto motion_photo(file_type);
   MotionPhotoWriter motion_photo_writer(motion_photo);
-  std::shared_ptr<DataSegment> jpeg_segment;
-  std::unique_ptr<DataSegmentDataSource> jpeg_source;
+  auto img_source = MediaSource::FromFile(local_params.primary_image_file_name,
+                                          &message_handler);
+  if (!img_source) {
+    return 1;
+  }
   std::unique_ptr<MotionPhotoJpegInfoBuilder> jpeg_info_builder;
-
-  if (file_type == FileType::kJpeg) {
-    jpeg_segment =
-        ReadEntireFile(local_params.primary_image_file_name, &message_handler);
-    if (!jpeg_segment) {
-      return 1;
-    }
-    jpeg_source = std::make_unique<DataSegmentDataSource>(jpeg_segment);
-    jpeg_info_builder =
-        std::make_unique<MotionPhotoJpegInfoBuilder>(&message_handler);
-    jpeg_info_builder->Build(jpeg_source.get());
-    if (jpeg_info_builder->GetPrimaryXmpStringRange().IsValid()) {
-      size_t bytes_parsed = 0;
-      MotionPhotoReader image_reader(&motion_photo, &message_handler);
-      image_reader.ReadImageMetadata(
-          {jpeg_info_builder->GetPrimaryXmpStringRange()}, jpeg_source.get(),
-          &bytes_parsed);
-    }
-    motion_photo.SetIsMotionPhoto(true);
-
-    const auto& image_ranges = jpeg_info_builder->GetInfo().GetImageRanges();
-    ContainerMetadata container = motion_photo.GetContainerMetadata();
-    auto& items = container.items;
-    if (image_ranges.size() > 1) {
-      bool has_gainmap = false;
-      for (auto& item : items) {
-        if (item.semantic.WasAssigned() &&
-            item.semantic.GetValue() == kContainerItemSemanticGainMap) {
-          item.length = image_ranges[1].GetLength();
-          has_gainmap = true;
-          break;
-        }
-      }
-      if (!has_gainmap) {
-        ContainerItemMetadata gainmap_item;
-        gainmap_item.semantic = kContainerItemSemanticGainMap;
-        gainmap_item.mime = kContainerJpegImageItemMime;
-        gainmap_item.length = image_ranges[1].GetLength();
-        items.insert(items.begin() + 1, gainmap_item);
-      }
-    } else {
-      for (auto it = items.begin(); it != items.end(); ++it) {
-        if (it->semantic.WasAssigned() &&
-            it->semantic.GetValue() == kContainerItemSemanticGainMap) {
-          items.erase(it);
-          break;
-        }
-      }
-    }
-    motion_photo.SetContainerMetadata(std::move(container));
+  std::string existing_xmp;
+  bool inspect_ok = false;
+  InspectPrimaryImage(*img_source, file_type, &motion_photo, &message_handler,
+                      &jpeg_info_builder, &existing_xmp, &inspect_ok);
+  if (!inspect_ok) {
+    return 1;
   }
 
   vector<uint8_t> video_metadata;
@@ -950,25 +1023,7 @@ int BuildMotionPhoto(const MotionPhotoBuilderParams& params,
   }
   motion_photo.EnforceConsistentValues();
 
-  string image_metadata;
-  bool xmp_merged = false;
-  if (file_type == FileType::kJpeg && jpeg_info_builder != nullptr &&
-      jpeg_info_builder->GetPrimaryXmpStringRange().IsValid()) {
-    auto xmp_range = jpeg_info_builder->GetPrimaryXmpStringRange();
-    auto xmp_segment = jpeg_source->GetDataSegment(xmp_range.GetBegin(),
-                                                   xmp_range.GetLength());
-    if (xmp_segment) {
-      string original_xmp(reinterpret_cast<const char*>(
-                              xmp_segment->GetBuffer(xmp_range.GetBegin())),
-                          xmp_range.GetLength());
-      image_metadata = MergeXmpMetadata(original_xmp, motion_photo);
-      xmp_merged = true;
-    }
-  }
-
-  if (!xmp_merged) {
-    motion_photo_writer.WriteImageMetadata(&image_metadata);
-  }
+  string image_metadata = BuildFinalImageXmp(existing_xmp, motion_photo);
 
   outputter("\nImage metadata:\n" + image_metadata);
   outputter("\nReading " + local_params.primary_image_file_name + "\n");
@@ -983,11 +1038,6 @@ int BuildMotionPhoto(const MotionPhotoBuilderParams& params,
     return message_stats->error_count == 0 ? 0 : 1;
   }
 
-  auto img_source = MediaSource::FromFile(local_params.primary_image_file_name,
-                                          &message_handler);
-  if (!img_source) {
-    return 1;
-  }
   std::unique_ptr<MediaSource> mp4_builder_vid_source;
   if (use_mp4_file_builder) {
     mp4_builder_vid_source =

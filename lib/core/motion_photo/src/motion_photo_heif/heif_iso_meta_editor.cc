@@ -266,6 +266,7 @@ std::vector<uint8_t> SerializeIloc(const Iloc& iloc, size_t offset_size,
       WriteUint(&out, extent.length, length_size);
     }
   }
+  if (!FitsIn(out.size(), 4)) return {};
   PatchUint32(&out, 0, static_cast<uint32_t>(out.size()));
   return out;
 }
@@ -344,6 +345,7 @@ std::vector<uint8_t> SerializeXmpInfe(uint32_t id) {
   out.push_back(0);  // item_name: empty
   out.insert(out.end(), kXmpContentType.begin(), kXmpContentType.end());
   out.push_back(0);
+  if (!FitsIn(out.size(), 4)) return {};
   PatchUint32(&out, 0, static_cast<uint32_t>(out.size()));
   return out;
 }
@@ -411,13 +413,16 @@ std::vector<uint8_t> SerializeIref(const Iref& iref) {
   WriteUint(&out, version, 1);
   WriteUint(&out, iref.flags, 3);
   for (const ItemReference& ref : iref.references) {
+    if (ref.to.size() > 0xFFFFu) return {};
     const size_t child_size = 8 + id_size + 2 + id_size * ref.to.size();
+    if (!FitsIn(child_size, 4)) return {};
     WriteUint(&out, child_size, 4);
     WriteUint(&out, ref.type, 4);
     WriteUint(&out, ref.from, id_size);
     WriteUint(&out, ref.to.size(), 2);
     for (uint32_t to : ref.to) WriteUint(&out, to, id_size);
   }
+  if (!FitsIn(out.size(), 4)) return {};
   PatchUint32(&out, 0, static_cast<uint32_t>(out.size()));
   return out;
 }
@@ -458,14 +463,22 @@ const Box* FindContainingBox(const std::vector<Box>& boxes, uint64_t offset,
 }
 
 bool ExtentsOverlap(const IlocExtent& a, const IlocExtent& b) {
-  return a.offset < b.offset + b.length && b.offset < a.offset + a.length;
+  if (a.length == 0 || b.length == 0) return false;
+  return a.offset < b.offset ? (b.offset - a.offset) < a.length
+                             : (a.offset - b.offset) < b.length;
 }
 
-// True if `extent` overlaps any file-offset extent of an item other than
-// `item_id`, i.e. the bytes are shared and must not be modified.
-bool IsShared(const Iloc& iloc, uint32_t item_id, const IlocExtent& extent) {
+// True if `extent` overlaps any extent of another item in the same address
+// space (`construction_method` and `data_reference_index`), i.e. shared bytes
+// that must not be modified.
+bool IsShared(const Iloc& iloc, const IlocItem& target,
+              const IlocExtent& extent) {
   for (const IlocItem& item : iloc.items) {
-    if (item.id == item_id || !item.IsFileOffset()) continue;
+    if (item.id == target.id ||
+        item.construction_method != target.construction_method ||
+        item.data_reference_index != target.data_reference_index) {
+      continue;
+    }
     for (const IlocExtent& other : item.extents) {
       if (ExtentsOverlap(extent, other)) return true;
     }
@@ -546,14 +559,26 @@ bool HeifIsoMetaEditor::SetPrimaryXmp(const uint8_t* data, size_t size,
   }
 
   // 3. Locate the XMP item describing the primary image.
+  bool has_any_cdsc = false;
+  for (const ItemReference& ref : iref.references) {
+    if (ref.type == kCdsc) {
+      has_any_cdsc = true;
+      break;
+    }
+  }
   std::optional<uint32_t> xmp_id;
   const InfeEntry* xmp_infe = nullptr;
+  const InfeEntry* unlinked_xmp_infe = nullptr;
+  bool needs_cdsc_ref = false;
   uint32_t max_id = 0;
   for (const InfeEntry& entry : iinf.entries) {
     max_id = std::max(max_id, entry.id);
     if (xmp_id.has_value() || entry.item_type != kMime ||
         !EqualsIgnoreCase(entry.content_type, kXmpContentType)) {
       continue;
+    }
+    if (unlinked_xmp_infe == nullptr) {
+      unlinked_xmp_infe = &entry;
     }
     for (const ItemReference& ref : iref.references) {
       if (ref.type == kCdsc && ref.from == entry.id &&
@@ -563,6 +588,13 @@ bool HeifIsoMetaEditor::SetPrimaryXmp(const uint8_t* data, size_t size,
         break;
       }
     }
+  }
+  // Only fall back to an unlinked XMP item when 'iref' contains zero 'cdsc'
+  // references; otherwise keep other items' XMP (e.g. GainMap hdrgm) intact.
+  if (!xmp_id.has_value() && !has_any_cdsc && unlinked_xmp_infe != nullptr) {
+    xmp_id = unlinked_xmp_infe->id;
+    xmp_infe = unlinked_xmp_infe;
+    needs_cdsc_ref = true;
   }
   for (const IlocItem& item : iloc.items) max_id = std::max(max_id, item.id);
   IlocItem* xmp_item = nullptr;
@@ -593,11 +625,12 @@ bool HeifIsoMetaEditor::SetPrimaryXmp(const uint8_t* data, size_t size,
   // fits and nothing in front of the image data has to move.
   if (xmp_item != nullptr && xmp_item->IsFileOffset() &&
       xmp_item->extents.size() == 1 && !removed_box_before_kept_box &&
-      xmp_infe != nullptr && xmp_infe->content_encoding.empty()) {
+      !needs_cdsc_ref && xmp_infe != nullptr &&
+      xmp_infe->content_encoding.empty()) {
     const IlocExtent& extent = xmp_item->extents[0];
     const Box* box = FindContainingBox(kept, extent.offset, extent.length);
     if (box != nullptr && box->type != kMeta && xmp.size() <= extent.length &&
-        !IsShared(iloc, xmp_item->id, extent)) {
+        !IsShared(iloc, *xmp_item, extent)) {
       const size_t end = kept.back().end();
       output->assign(data, data + end);
       std::memcpy(output->data() + extent.offset, xmp.data(), xmp.size());
@@ -620,14 +653,15 @@ bool HeifIsoMetaEditor::SetPrimaryXmp(const uint8_t* data, size_t size,
   std::vector<IlocExtent> orphaned_idat_extents;
   if (xmp_item != nullptr) {
     for (const IlocExtent& extent : xmp_item->extents) {
+      if (extent.length == 0) continue;
       if (xmp_item->IsFileOffset()) {
         const Box* box = FindContainingBox(kept, extent.offset, extent.length);
         if (box != nullptr && box->type != kMeta &&
-            !IsShared(iloc, xmp_item->id, extent)) {
+            !IsShared(iloc, *xmp_item, extent)) {
           orphaned_file_extents.push_back(extent);
         }
       } else if (xmp_item->construction_method == 1 &&
-                 !IsShared(iloc, xmp_item->id, extent)) {
+                 !IsShared(iloc, *xmp_item, extent)) {
         orphaned_idat_extents.push_back(extent);
       }
     }
@@ -643,9 +677,12 @@ bool HeifIsoMetaEditor::SetPrimaryXmp(const uint8_t* data, size_t size,
     item.id = new_xmp_id;
     iloc.items.push_back(item);
     xmp_item = &iloc.items.back();
+    needs_cdsc_ref = true;
+  }
+  if (needs_cdsc_ref) {
     ItemReference ref;
     ref.type = kCdsc;
-    ref.from = new_xmp_id;
+    ref.from = new_xmp_id != 0 ? new_xmp_id : xmp_item->id;
     ref.to.push_back(primary_id);
     iref.references.push_back(ref);
   }
@@ -659,6 +696,7 @@ bool HeifIsoMetaEditor::SetPrimaryXmp(const uint8_t* data, size_t size,
   std::vector<uint8_t> new_iinf;
   {
     const size_t count = iinf.entries.size() + (new_xmp_id != 0 ? 1 : 0);
+    if (count > 0xFFFFFFFFu) return Fail(error, "'iinf' entry count overflow");
     const uint8_t version = count > 0xFFFF ? 1 : iinf.version;
     WriteUint(&new_iinf, 0, 4);
     WriteUint(&new_iinf, kIinf, 4);
@@ -669,6 +707,7 @@ bool HeifIsoMetaEditor::SetPrimaryXmp(const uint8_t* data, size_t size,
       if (xmp_id.has_value() && entry.id == *xmp_id &&
           !entry.content_encoding.empty()) {
         std::vector<uint8_t> rewritten = SerializeXmpInfe(entry.id);
+        if (rewritten.empty()) return Fail(error, "'infe' too large");
         new_iinf.insert(new_iinf.end(), rewritten.begin(), rewritten.end());
       } else {
         new_iinf.insert(new_iinf.end(), data + entry.offset,
@@ -677,12 +716,14 @@ bool HeifIsoMetaEditor::SetPrimaryXmp(const uint8_t* data, size_t size,
     }
     if (new_xmp_id != 0) {
       std::vector<uint8_t> infe = SerializeXmpInfe(new_xmp_id);
+      if (infe.empty()) return Fail(error, "'infe' too large");
       new_iinf.insert(new_iinf.end(), infe.begin(), infe.end());
     }
     if (!FitsIn(new_iinf.size(), 4)) return Fail(error, "'iinf' too large");
     PatchUint32(&new_iinf, 0, static_cast<uint32_t>(new_iinf.size()));
   }
   const std::vector<uint8_t> new_iref = SerializeIref(iref);
+  if (new_iref.empty()) return Fail(error, "'iref' too large");
 
   // Pick iloc field sizes so the 'meta' size does not depend on offsets.
   uint64_t max_length = xmp.size();
@@ -692,7 +733,9 @@ bool HeifIsoMetaEditor::SetPrimaryXmp(const uint8_t* data, size_t size,
     }
   }
   const size_t length_size = FitsIn(max_length, 4) ? 4 : 8;
-  const size_t iloc_size_wide = SerializeIloc(iloc, 8, length_size).size();
+  const std::vector<uint8_t> iloc_wide = SerializeIloc(iloc, 8, length_size);
+  if (iloc_wide.empty()) return Fail(error, "'iloc' too large");
+  const size_t iloc_size_wide = iloc_wide.size();
   uint64_t meta_upper_bound =
       meta_box.size + new_iinf.size() + new_iref.size() + iloc_size_wide + 16;
   const uint64_t total_upper_bound =
@@ -706,8 +749,10 @@ bool HeifIsoMetaEditor::SetPrimaryXmp(const uint8_t* data, size_t size,
       }
     }
   }
-  const size_t new_iloc_size =
-      SerializeIloc(iloc, offset_size, length_size).size();
+  const std::vector<uint8_t> iloc_sized =
+      SerializeIloc(iloc, offset_size, length_size);
+  if (iloc_sized.empty()) return Fail(error, "'iloc' too large");
+  const size_t new_iloc_size = iloc_sized.size();
 
   // New 'meta' size.
   size_t meta_payload = 4;  // version + flags
@@ -734,7 +779,7 @@ bool HeifIsoMetaEditor::SetPrimaryXmp(const uint8_t* data, size_t size,
     new_offsets[i] = cursor;
     const size_t box_size =
         kept[i].type == kMeta ? new_meta_size : kept[i].size;
-    if (kept[i].size_was_zero &&
+    if (kept[i].type != kMeta && kept[i].size_was_zero &&
         (!FitsIn(kept[i].size, 4) || kept[i].header != 8)) {
       return Fail(error, "Unsupported box size");
     }

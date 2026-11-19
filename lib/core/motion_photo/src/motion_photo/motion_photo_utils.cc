@@ -19,16 +19,34 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
+#include <memory>
 #include <regex>
 #include <string>
 
+#include "image_io/base/data_segment.h"
+#include "image_io/base/data_source.h"
 #include "motion_photo/motion_photo.h"
 
 namespace libmotionphoto {
 namespace motion_photo {
 
 namespace {
+bool MatchesFourCc(const uint8_t* bytes, const char (&tag)[5]) {
+  return std::memcmp(bytes, tag, 4) == 0;
+}
+
+bool IsAvifBrand(const uint8_t* brand) {
+  return MatchesFourCc(brand, "avif") || MatchesFourCc(brand, "avis");
+}
+
+bool IsHeicBrand(const uint8_t* brand) {
+  return MatchesFourCc(brand, "heic") || MatchesFourCc(brand, "heix") ||
+         MatchesFourCc(brand, "hevc") || MatchesFourCc(brand, "hevx") ||
+         MatchesFourCc(brand, "mif1") || MatchesFourCc(brand, "msf1");
+}
+
 FileType GetFileTypeFromFileExtension(const std::string& file_name) {
   size_t start_extension_pos = file_name.find_last_of('.');
 
@@ -52,6 +70,93 @@ FileType GetFileTypeFromFileExtension(const std::string& file_name) {
 }
 }  // namespace
 
+FileType SniffFileType(const uint8_t* data, size_t size) {
+  if (data == nullptr || size < 2) {
+    return FileType::kUnsupported;
+  }
+  if (data[0] == 0xFF && data[1] == 0xD8) {
+    return FileType::kJpeg;
+  }
+  if (size < 12 || !MatchesFourCc(data + 4, "ftyp")) {
+    return FileType::kUnsupported;
+  }
+  const uint8_t* major_brand = data + 8;
+  if (IsAvifBrand(major_brand)) {
+    return FileType::kAvif;
+  }
+  if (MatchesFourCc(major_brand, "mif1") || MatchesFourCc(major_brand, "msf1")) {
+    uint32_t box_size = (static_cast<uint32_t>(data[0]) << 24) |
+                        (static_cast<uint32_t>(data[1]) << 16) |
+                        (static_cast<uint32_t>(data[2]) << 8) |
+                        static_cast<uint32_t>(data[3]);
+    size_t scan_end = box_size >= 16 ? std::min<size_t>(size, box_size) : size;
+    for (size_t off = 16; off + 4 <= scan_end; off += 4) {
+      if (IsAvifBrand(data + off)) {
+        return FileType::kAvif;
+      }
+    }
+    return FileType::kHeic;
+  }
+  if (IsHeicBrand(major_brand) || MatchesFourCc(major_brand, "heif") ||
+      MatchesFourCc(major_brand, "heim") ||
+      MatchesFourCc(major_brand, "heis")) {
+    return FileType::kHeic;
+  }
+  return FileType::kUnsupported;
+}
+
+const char* GetPrimaryImageMimeType(FileType file_type) {
+  switch (file_type) {
+    case FileType::kJpeg:
+      return kContainerJpegImageItemMime;
+    case FileType::kHeic:
+      return kContainerHeicImageItemMime;
+    case FileType::kAvif:
+      return kContainerAvifImageItemMime;
+    case FileType::kUnsupported:
+    default:
+      return "";
+  }
+}
+
+bool ReadDataRangesToString(image_io::DataSource* data_source,
+                            const std::vector<image_io::DataRange>& ranges,
+                            std::string* out) {
+  if (data_source == nullptr || out == nullptr || ranges.empty()) {
+    return false;
+  }
+  out->clear();
+  for (const auto& range : ranges) {
+    if (!range.IsValid() || range.GetLength() == 0) {
+      out->clear();
+      return false;
+    }
+    size_t pos = range.GetBegin();
+    const size_t end = range.GetEnd();
+    while (pos < end) {
+      std::shared_ptr<image_io::DataSegment> segment =
+          data_source->GetDataSegment(pos, end - pos);
+      if (!segment || !segment->Contains(pos)) {
+        out->clear();
+        return false;
+      }
+      const size_t avail = std::min(end, segment->GetEnd()) - pos;
+      if (avail == 0) {
+        out->clear();
+        return false;
+      }
+      const uint8_t* ptr = segment->GetBuffer(pos);
+      if (ptr == nullptr) {
+        out->clear();
+        return false;
+      }
+      out->append(reinterpret_cast<const char*>(ptr), avail);
+      pos += avail;
+    }
+  }
+  return !out->empty();
+}
+
 //   file_name: The name of the file.
 // Returns the type of the file based on the extension.
 FileType GetFileTypeFromFileName(const std::string& file_name) {
@@ -69,8 +174,8 @@ FileType GetFileTypeFromFileName(const std::string& file_name) {
     return GetFileTypeFromFileExtension(file_name);
   }
 
-  char header[12];
-  file.read(header, 12);
+  char header[64];
+  file.read(header, sizeof(header));
   std::streamsize bytes_read = file.gcount();
   file.close();
 
@@ -78,19 +183,11 @@ FileType GetFileTypeFromFileName(const std::string& file_name) {
     lseek(fd, 0, SEEK_SET);
   }
 
-  if (bytes_read >= 2 && static_cast<uint8_t>(header[0]) == 0xFF &&
-      static_cast<uint8_t>(header[1]) == 0xD8) {
-    return FileType::kJpeg;
-  }
-
-  if (bytes_read >= 12 && header[4] == 'f' && header[5] == 't' &&
-      header[6] == 'y' && header[7] == 'p') {
-    std::string brand(header + 8, 4);
-    if (brand == "heic" || brand == "heix" || brand == "mif1" ||
-        brand == "msf1") {
-      return FileType::kHeic;
-    } else if (brand == "avif" || brand == "avis") {
-      return FileType::kAvif;
+  if (bytes_read > 0) {
+    FileType sniffed = SniffFileType(reinterpret_cast<const uint8_t*>(header),
+                                     static_cast<size_t>(bytes_read));
+    if (sniffed != FileType::kUnsupported) {
+      return sniffed;
     }
   }
 

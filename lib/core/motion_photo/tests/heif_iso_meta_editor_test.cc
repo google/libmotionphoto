@@ -670,5 +670,201 @@ TEST(HeifIsoMetaEditorTest, RejectsMoovConsistentlyAcrossShrinkAndGrow) {
                                                 MakeXmp(400), &output, &error));
 }
 
+TEST(HeifIsoMetaEditorTest,
+     PreservesGainMapHdrgmTmapAndColrWhenAddingPrimaryXmp) {
+  auto infe_mime = [](uint16_t id) {
+    Bytes p;
+    Put(&p, id, 2);
+    Put(&p, 0, 2);
+    PutStr(&p, "mime");
+    p.push_back(0);
+    PutStr(&p, "application/rdf+xml");
+    p.push_back(0);
+    return MakeFullBox("infe", 2, 0, p);
+  };
+  const std::string primary_img = "PRIMARY_HEVC_DATA";
+  const std::string gm_img = "GAINMAP_HEVC_DATA";
+  const std::string gm_xmp =
+      "<x:xmpmeta><rdf:Description hdrgm:Version=\"1.0\"/></x:xmpmeta>";
+  Bytes mdat_payload;
+  mdat_payload.insert(mdat_payload.end(), primary_img.begin(), primary_img.end());
+  mdat_payload.insert(mdat_payload.end(), gm_img.begin(), gm_img.end());
+  mdat_payload.insert(mdat_payload.end(), gm_xmp.begin(), gm_xmp.end());
+
+  // iprp -> ipco -> colr (nclx) to verify color properties survive.
+  Bytes colr_p;
+  PutStr(&colr_p, "nclx");
+  Put(&colr_p, 9, 2);
+  Put(&colr_p, 16, 2);
+  Put(&colr_p, 9, 2);
+  colr_p.push_back(0x80);
+  Bytes iprp = MakeBox("iprp", MakeBox("ipco", MakeBox("colr", colr_p)));
+
+  Bytes dimg;
+  Put(&dimg, 4, 2);
+  Put(&dimg, 2, 2);
+  Put(&dimg, 1, 2);
+  Put(&dimg, 3, 2);
+  Bytes cdsc;
+  Put(&cdsc, 5, 2);
+  Put(&cdsc, 1, 2);
+  Put(&cdsc, 3, 2);
+  Bytes iref = MakeFullBox("iref", 0, 0, Cat({MakeBox("dimg", dimg), MakeBox("cdsc", cdsc)}));
+
+  auto build = [&](uint32_t mdat_off) {
+    return Cat(
+        {Ftyp(),
+         Meta({Hdlr(), Pitm(1),
+               Iinf({Infe(1, "hvc1"), Infe(3, "hvc1"), Infe(4, "tmap"),
+                     infe_mime(5)}),
+               iref, iprp,
+               IlocV1({{1, 0, mdat_off, 0,
+                        static_cast<uint32_t>(primary_img.size())},
+                       {3, 0, mdat_off,
+                        static_cast<uint32_t>(primary_img.size()),
+                        static_cast<uint32_t>(gm_img.size())},
+                       {5, 0, mdat_off,
+                        static_cast<uint32_t>(primary_img.size() +
+                                              gm_img.size()),
+                        static_cast<uint32_t>(gm_xmp.size())}})}),
+         MakeBox("mdat", mdat_payload)});
+  };
+  Bytes probe = build(0);
+  Bytes input = build(static_cast<uint32_t>(probe.size() - mdat_payload.size()));
+  std::optional<Parsed> before = Parse(input);
+  ASSERT_TRUE(before.has_value());
+
+  const std::string primary_xmp = MakeXmp(250);
+  Bytes output;
+  std::string error;
+  ASSERT_TRUE(HeifIsoMetaEditor::SetPrimaryXmp(input.data(), input.size(),
+                                               primary_xmp, &output, &error));
+  std::optional<Parsed> after = Parse(output);
+  ASSERT_TRUE(after.has_value());
+  // GainMap XMP item 5 must remain intact, NOT overwritten by Primary XMP.
+  EXPECT_EQ(std::string(after->item_data[5].begin(), after->item_data[5].end()),
+            gm_xmp);
+  EXPECT_EQ(after->item_types[4], "tmap");
+  ExpectImageItemsUnchanged(*before, *after, /*xmp_id=*/0);
+  std::string out_str(output.begin(), output.end());
+  EXPECT_NE(out_str.find("colr"), std::string::npos);
+  EXPECT_EQ(RTrim(PrimaryXmpViaSplitter(output)), primary_xmp);
+}
+
+TEST(HeifIsoMetaEditorTest, DoesNotBlankSharedIdatBytesWhenItemOverlaps) {
+  auto infe_mime = [](uint16_t id) {
+    Bytes p;
+    Put(&p, id, 2);
+    Put(&p, 0, 2);
+    PutStr(&p, "mime");
+    p.push_back(0);
+    PutStr(&p, "application/rdf+xml");
+    p.push_back(0);
+    return MakeFullBox("infe", 2, 0, p);
+  };
+  const std::string shared_prefix = "SHARED_IDAT_BYTES";
+  const std::string old_xmp = shared_prefix + std::string(64, ' ');
+  Bytes idat_payload(old_xmp.begin(), old_xmp.end());
+  Bytes input = Cat(
+      {Ftyp(),
+       Meta({Hdlr(), Pitm(1),
+             Iinf({Infe(1, "hvc1"), infe_mime(2), Infe(3, "Exif")}),
+             IrefCdsc(2, 1),
+             IlocV1({{2, 1, 0, 0, static_cast<uint32_t>(old_xmp.size())},
+                     {3, 1, 0, 0, static_cast<uint32_t>(shared_prefix.size())}}),
+             MakeBox("idat", idat_payload)}),
+       MakeBox("mdat", Bytes(16, 0xAA))});
+  std::optional<Parsed> before = Parse(input);
+  ASSERT_TRUE(before.has_value());
+
+  const std::string new_xmp = MakeXmp(300);  // Outgrows idat -> moves to mdat.
+  Bytes output;
+  ASSERT_TRUE(HeifIsoMetaEditor::SetPrimaryXmp(input.data(), input.size(),
+                                               new_xmp, &output));
+  std::optional<Parsed> after = Parse(output);
+  ASSERT_TRUE(after.has_value());
+  EXPECT_EQ(std::string(after->item_data[3].begin(), after->item_data[3].end()),
+            shared_prefix);
+  EXPECT_EQ(RTrim(PrimaryXmpViaSplitter(output)), new_xmp);
+}
+
+TEST(HeifIsoMetaEditorTest, EditsAvifAndSupports64BitIlocOffsets) {
+  auto avif_ftyp = []() {
+    Bytes p;
+    PutStr(&p, "avif");
+    Put(&p, 0, 4);
+    PutStr(&p, "mif1avif");
+    return MakeBox("ftyp", p);
+  };
+  const std::string img = "AV1_PIXEL_BYTES";
+  const std::string xmp_v1 = MakeXmp(120);
+  // 8-byte offset/length iloc v1 (offset_size=8, length_size=8).
+  auto make_iloc64 = [&](uint64_t off1, uint64_t len1, uint64_t off2,
+                         uint64_t len2) {
+    Bytes p;
+    Put(&p, 0x88, 1);  // offset_size=8, length_size=8
+    Put(&p, 0x00, 1);  // base_offset_size=0, index_size=0
+    Put(&p, 2, 2);
+    Put(&p, 1, 2);
+    Put(&p, 0, 2);
+    Put(&p, 0, 2);
+    Put(&p, 1, 2);
+    Put(&p, off1, 8);
+    Put(&p, len1, 8);
+    Put(&p, 2, 2);
+    Put(&p, 0, 2);
+    Put(&p, 0, 2);
+    Put(&p, 1, 2);
+    Put(&p, off2, 8);
+    Put(&p, len2, 8);
+    return MakeFullBox("iloc", 1, 0, p);
+  };
+  Bytes mdat_p;
+  mdat_p.insert(mdat_p.end(), img.begin(), img.end());
+  mdat_p.insert(mdat_p.end(), xmp_v1.begin(), xmp_v1.end());
+  Bytes infe2_p;
+  Put(&infe2_p, 2, 2);
+  Put(&infe2_p, 0, 2);
+  PutStr(&infe2_p, "mime");
+  infe2_p.push_back(0);
+  PutStr(&infe2_p, "application/rdf+xml");
+  infe2_p.push_back(0);
+
+  auto build = [&](uint64_t mdat_off) {
+    return Cat({avif_ftyp(),
+                Meta({Hdlr(), Pitm(1),
+                      Iinf({Infe(1, "av01"), MakeFullBox("infe", 2, 0, infe2_p)}),
+                      IrefCdsc(2, 1),
+                      make_iloc64(mdat_off, img.size(), mdat_off + img.size(),
+                                  xmp_v1.size())}),
+                MakeBox("mdat", mdat_p), MakeBox("mpvd", Bytes(12, 0x55))});
+  };
+  Bytes probe = build(0);
+  Bytes input = build(probe.size() - mdat_p.size() - 20);
+  const std::string xmp_v2 = MakeXmp(400);
+  Bytes grown;
+  ASSERT_TRUE(HeifIsoMetaEditor::SetPrimaryXmp(input.data(), input.size(), xmp_v2,
+                                               &grown));
+  EXPECT_EQ(std::string(grown.begin() + 8, grown.begin() + 12), "avif");
+  EXPECT_EQ(RTrim(PrimaryXmpViaSplitter(grown)), xmp_v2);
+
+  // Empty XMP is rejected; shrinking to minimal XMP succeeds and drops 'mpvd'.
+  Bytes stripped;
+  EXPECT_FALSE(
+      HeifIsoMetaEditor::SetPrimaryXmp(grown.data(), grown.size(), "", &stripped));
+  const std::string small_xmp = "<x:xmpmeta/>";
+  ASSERT_TRUE(HeifIsoMetaEditor::SetPrimaryXmp(grown.data(), grown.size(),
+                                               small_xmp, &stripped));
+  EXPECT_EQ(RTrim(PrimaryXmpViaSplitter(stripped)), small_xmp);
+  std::optional<Parsed> parsed = Parse(stripped);
+  ASSERT_TRUE(parsed.has_value());
+  for (const std::string& box : parsed->top_level) {
+    EXPECT_NE(box, "mpvd");
+  }
+  EXPECT_EQ(std::string(parsed->item_data[1].begin(),
+                        parsed->item_data[1].end()),
+            img);
+}
+
 }  // namespace motion_photo
 }  // namespace libmotionphoto

@@ -423,12 +423,26 @@ bool MotionPhotoChecker::CheckMpvdBox(size_t file_size) {
   const size_t kErrorCount = error_count_;
   auto mpvd_video_length = box.GetVideoLength();
   int64_t xmp_video_length = 0;
+  int64_t xmp_image_padding = 0;
   const auto& items = motion_photo_.GetContainerMetadata().items;
-  if (items.size() > kContainerVideoItemIndex) {
-    const auto& xmp_video_length_attribute = items[kContainerVideoItemIndex].length;
-    if (xmp_video_length_attribute.WasAssigned()) {
-      xmp_video_length = xmp_video_length_attribute.GetValue();
+  const ContainerItemMetadata* video_item = nullptr;
+  const ContainerItemMetadata* image_item = nullptr;
+  for (const auto& item : items) {
+    if (!item.semantic.WasAssigned()) continue;
+    if (EqualsIgnoreCase(item.semantic, kContainerVideoItemSemantic)) {
+      video_item = &item;
+    } else if (EqualsIgnoreCase(item.semantic, kContainerImageItemSemantic)) {
+      image_item = &item;
     }
+  }
+  if (video_item == nullptr && items.size() > kContainerVideoItemIndex) {
+    video_item = &items[kContainerVideoItemIndex];
+  }
+  if (image_item == nullptr && items.size() > kContainerImageItemIndex) {
+    image_item = &items[kContainerImageItemIndex];
+  }
+  if (video_item != nullptr && video_item->length.WasAssigned()) {
+    xmp_video_length = video_item->length.GetValue();
   }
   if (mpvd_video_length != xmp_video_length) {
     std::stringstream ss;
@@ -438,12 +452,8 @@ bool MotionPhotoChecker::CheckMpvdBox(size_t file_size) {
   }
 
   // Check the XMP padding value
-  int64_t xmp_image_padding = 0;
-  if (items.size() > kContainerImageItemIndex) {
-    const auto& xmp_image_padding_attribute = items[kContainerImageItemIndex].padding;
-    if (xmp_image_padding_attribute.WasAssigned()) {
-      xmp_image_padding = xmp_image_padding_attribute.GetValue();
-    }
+  if (image_item != nullptr && image_item->padding.WasAssigned()) {
+    xmp_image_padding = image_item->padding.GetValue();
   }
   if (xmp_image_padding != box.GetHeaderLength()) {
     std::stringstream ss;

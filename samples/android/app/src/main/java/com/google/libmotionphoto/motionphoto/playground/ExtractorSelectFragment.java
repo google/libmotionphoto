@@ -118,12 +118,29 @@ public class ExtractorSelectFragment extends Fragment {
   }
 
   private void useDefaultExtractPhoto() {
-    File generatedPhoto =
-        new File(requireContext().getExternalFilesDir(null), "output_motion_photo.jpg");
-    File defaultPhoto =
-        (generatedPhoto.exists() && generatedPhoto.length() > 0)
-            ? generatedPhoto
-            : ((MainActivity) requireActivity()).copyAssetToCache("motion_photo.MP.jpg");
+    File externalDir = requireContext().getExternalFilesDir(null);
+    File defaultPhoto = null;
+    File latestBuilt = viewModel.getBuiltMotionPhotoFile().getValue();
+    if (latestBuilt != null && latestBuilt.exists() && latestBuilt.length() > 0) {
+      defaultPhoto = latestBuilt;
+    } else if (externalDir != null) {
+      long newestModified = Long.MIN_VALUE;
+      for (String candidateName :
+          new String[] {
+            "output_motion_photo.heic", "output_motion_photo.avif", "output_motion_photo.jpg"
+          }) {
+        File candidate = new File(externalDir, candidateName);
+        if (candidate.exists()
+            && candidate.length() > 0
+            && candidate.lastModified() >= newestModified) {
+          newestModified = candidate.lastModified();
+          defaultPhoto = candidate;
+        }
+      }
+    }
+    if (defaultPhoto == null) {
+      defaultPhoto = ((MainActivity) requireActivity()).copyAssetToCache("motion_photo.MP.jpg");
+    }
     if (defaultPhoto != null) {
       clearPreviousExtraction();
       viewModel.setExtractPhotoUri(Uri.fromFile(defaultPhoto));

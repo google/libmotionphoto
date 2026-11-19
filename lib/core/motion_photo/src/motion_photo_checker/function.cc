@@ -159,19 +159,19 @@ int CheckMotionPhoto(const string& motion_photo_file_name,
   // Get the primary image size and the location in the data source of the
   // primary XMP segment string.
   size_t image_size = 0;
-  DataRange xmp_range;
+  std::vector<DataRange> xmp_ranges;
   MpvdBox mpvd_box;
-  tie(image_size, xmp_range, mpvd_box) = GetImageSizeAndXmpRange(
-      data_source.get(), file_size, file_type, motion_photo_file_name, "", outputter,
-      &message_handler);
-  if ((image_size == 0) || !xmp_range.IsValid()) {
+  tie(image_size, xmp_ranges, mpvd_box) = GetImageSizeAndXmpRanges(
+      data_source.get(), file_size, file_type, motion_photo_file_name, "",
+      outputter, &message_handler);
+  if ((image_size == 0) || xmp_ranges.empty()) {
     return 1;
   }
   motion_photo.SetMpvdBox(mpvd_box);
 
   // Parse the XMP metadata string from the data source and check the values.
   if (!ParseAndCheckXmpMetadata(data_source.get(), file_size, file_type,
-                                motion_photo_file_name, xmp_range, image_size,
+                                motion_photo_file_name, xmp_ranges, image_size,
                                 "", &motion_photo, &motion_photo_reader,
                                 &motion_photo_checker, outputter)) {
     return 1;

@@ -51,9 +51,16 @@ std::unique_ptr<ContainerSplitter> CreateHeifContainerSplitter();
 // Locates the primary image's XMP DataRange in a HEIF (HEIC/AVIF) container
 // directly from ISO BMFF 'meta' ('pitm', 'iinf', 'iref', 'iloc', 'idat') boxes
 // without requiring libheif. Returns an invalid DataRange if no primary XMP
-// item is found.
+// item is found or if its extents are non-contiguous.
 image_io::DataRange FindHeifPrimaryXmpRange(image_io::DataSource* data_source,
                                             size_t file_size);
+
+// Locates all file-offset DataRanges forming the primary image's XMP item in
+// a HEIF (HEIC/AVIF) container (supporting both single-extent and non-contiguous
+// multi-extent XMP, as well as 'idat'-stored XMP). Adjacent ranges are merged.
+// Returns an empty vector if no primary XMP item is found or extents are invalid.
+std::vector<image_io::DataRange> FindHeifPrimaryXmpRanges(
+    image_io::DataSource* data_source, size_t file_size);
 
 }  // namespace motion_photo
 }  // namespace libmotionphoto

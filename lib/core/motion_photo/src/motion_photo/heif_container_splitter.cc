@@ -309,7 +309,18 @@ std::optional<uint32_t> ParsePrimaryItemId(ByteRange pitm) {
   return static_cast<uint32_t>(item_id);
 }
 
-// Returns the item ID from an 'infe' payload if the item holds XMP.
+bool EqualsIgnoreCase(std::string_view a, std::string_view b) {
+  if (a.size() != b.size()) return false;
+  for (size_t i = 0; i < a.size(); ++i) {
+    char ca = a[i], cb = b[i];
+    if (ca >= 'A' && ca <= 'Z') ca = static_cast<char>(ca - 'A' + 'a');
+    if (cb >= 'A' && cb <= 'Z') cb = static_cast<char>(cb - 'A' + 'a');
+    if (ca != cb) return false;
+  }
+  return true;
+}
+
+// Returns the item ID from an 'infe' payload if the item holds uncompressed XMP.
 std::optional<uint32_t> ParseXmpItemId(const uint8_t* data, size_t size) {
   BoxReader reader(data, size);
   const uint64_t version = reader.ReadFullBoxVersion();
@@ -329,8 +340,14 @@ std::optional<uint32_t> ParseXmpItemId(const uint8_t* data, size_t size) {
   }
   reader.ReadCString();  // item_name
   const std::string_view content_type = reader.ReadCString();
-  if (!reader.ok() || content_type != kXmpContentType) {
+  if (!reader.ok() || !EqualsIgnoreCase(content_type, kXmpContentType)) {
     return std::nullopt;
+  }
+  if (reader.remaining() > 0) {
+    const std::string_view content_encoding = reader.ReadCString();
+    if (!reader.ok() || !content_encoding.empty()) {
+      return std::nullopt;
+    }
   }
   return static_cast<uint32_t>(item_id);
 }
@@ -360,15 +377,16 @@ std::vector<uint32_t> FindXmpItemIds(ByteRange iinf) {
   return xmp_item_ids;
 }
 
-// Returns the IDs of the items that have a 'cdsc' (content describes) reference
-// to `described_item_id` in an 'iref' payload.
-std::vector<uint32_t> FindItemsDescribing(ByteRange iref,
-                                          uint32_t described_item_id) {
-  std::vector<uint32_t> item_ids;
+// Scans an 'iref' payload for 'cdsc' (content describes) references. Returns
+// true if any 'cdsc' reference box was present, and appends all item IDs that
+// describe `described_item_id` into `out_descriptors`.
+bool FindCdscDescriptors(ByteRange iref, uint32_t described_item_id,
+                         std::vector<uint32_t>* out_descriptors) {
+  bool has_any_cdsc = false;
   BoxReader reader(iref.data, iref.size);
   const size_t item_id_size = reader.ReadFullBoxVersion() == 0 ? 2 : 4;
   if (!reader.ok()) {
-    return item_ids;
+    return false;
   }
   ForEachBox(
       reader.current(), reader.remaining(),
@@ -376,6 +394,7 @@ std::vector<uint32_t> FindItemsDescribing(ByteRange iref,
         if (type != "cdsc") {
           return true;
         }
+        has_any_cdsc = true;
         BoxReader reference(payload, payload_size);
         const uint64_t from_item_id = reference.ReadUInt(item_id_size);
         const uint64_t reference_count = reference.ReadUInt(2);
@@ -385,30 +404,38 @@ std::vector<uint32_t> FindItemsDescribing(ByteRange iref,
             break;
           }
           if (to_item_id == described_item_id) {
-            item_ids.push_back(static_cast<uint32_t>(from_item_id));
+            out_descriptors->push_back(static_cast<uint32_t>(from_item_id));
             break;
           }
         }
         return true;
       });
-  return item_ids;
+  return has_any_cdsc;
 }
 
-// Returns the XMP item that describes the primary item, falling back to the
-// first XMP item when no 'cdsc' reference links one to the primary item.
-uint32_t ChooseXmpItemId(const MetaBoxes& boxes,
-                         const std::vector<uint32_t>& xmp_item_ids) {
-  if (boxes.pitm.found() && boxes.iref.found()) {
-    std::optional<uint32_t> primary_item_id = ParsePrimaryItemId(boxes.pitm);
+// Returns the XMP item that describes the primary item. Only falls back to the
+// first XMP item when 'iref' is absent or contains zero 'cdsc' references; if
+// 'cdsc' references exist (e.g. a GainMap's hdrgm XMP) and none describes the
+// primary item, returns std::nullopt instead of misattributing another item's
+// XMP.
+std::optional<uint32_t> ChooseXmpItemId(
+    const MetaBoxes& boxes, const std::vector<uint32_t>& xmp_item_ids) {
+  if (boxes.iref.found()) {
+    std::optional<uint32_t> primary_item_id =
+        boxes.pitm.found() ? ParsePrimaryItemId(boxes.pitm) : std::nullopt;
+    std::vector<uint32_t> primary_descriptors;
+    const bool has_any_cdsc = FindCdscDescriptors(
+        boxes.iref, primary_item_id.value_or(0), &primary_descriptors);
     if (primary_item_id.has_value()) {
-      const std::vector<uint32_t> primary_descriptors =
-          FindItemsDescribing(boxes.iref, *primary_item_id);
       for (uint32_t item_id : xmp_item_ids) {
         if (std::find(primary_descriptors.begin(), primary_descriptors.end(),
                       item_id) != primary_descriptors.end()) {
           return item_id;
         }
       }
+    }
+    if (has_any_cdsc) {
+      return std::nullopt;
     }
   }
   return xmp_item_ids.front();
@@ -478,64 +505,70 @@ std::optional<ItemLocation> FindItemLocation(ByteRange iloc, uint32_t item_id) {
   return std::nullopt;
 }
 
-// Copies the data of an item into `out` by following its extents. Extents are
-// file offsets for construction method 0 and offsets into the 'idat' payload
-// for construction method 1. Returns the file offset of the first extent, or
-// nullopt if the item is stored in an unsupported way, points outside the
-// file, or is larger than kMaxXmpItemSize.
-std::optional<size_t> ReadItemData(image_io::DataSource* data_source,
-                                   size_t file_size,
-                                   const ItemLocation& location, ByteRange idat,
-                                   size_t idat_file_offset,
-                                   std::vector<uint8_t>* out) {
+// Resolves the file-coordinate DataRanges for an item's 'iloc' extents and,
+// if `out_bytes` is non-null, appends the item's payload bytes into it.
+bool ResolveAndReadItemExtents(image_io::DataSource* data_source,
+                               size_t file_size, const ItemLocation& location,
+                               ByteRange idat, size_t idat_file_offset,
+                               std::vector<image_io::DataRange>* out_ranges,
+                               std::vector<uint8_t>* out_bytes) {
   // A non-zero data_reference_index points at data in another file.
   if (location.data_reference_index != 0 || location.construction_method > 1 ||
       location.extents.empty()) {
-    return std::nullopt;
+    return false;
   }
-  std::optional<size_t> first_extent_offset;
+  size_t total_size = 0;
   for (const auto& [extent_offset, extent_length] : location.extents) {
     // A zero length means "to the end of the data", which XMP never needs.
-    if (extent_length == 0 || extent_length > kMaxXmpItemSize - out->size() ||
+    if (extent_length == 0 || extent_length > kMaxXmpItemSize - total_size ||
         extent_offset >
             std::numeric_limits<uint64_t>::max() - location.base_offset) {
-      return std::nullopt;
+      return false;
     }
     const uint64_t start = location.base_offset + extent_offset;
     size_t extent_file_offset = 0;
+    const size_t len = static_cast<size_t>(extent_length);
     if (location.construction_method == 0) {
-      if (start > file_size || extent_length > file_size - start) {
-        return std::nullopt;
+      if (start > file_size || len > file_size - start) {
+        return false;
       }
       extent_file_offset = static_cast<size_t>(start);
-      if (!AppendFromDataSource(data_source, extent_file_offset,
-                                static_cast<size_t>(extent_length), out)) {
-        return std::nullopt;
+      if (out_bytes != nullptr &&
+          !AppendFromDataSource(data_source, extent_file_offset, len,
+                                out_bytes)) {
+        return false;
       }
     } else {
-      if (!idat.found() || start > idat.size ||
-          extent_length > idat.size - start) {
-        return std::nullopt;
+      if (!idat.found() || start > idat.size || len > idat.size - start) {
+        return false;
       }
-      const uint8_t* extent_data = idat.data + static_cast<size_t>(start);
-      out->insert(out->end(), extent_data,
-                  extent_data + static_cast<size_t>(extent_length));
+      if (out_bytes != nullptr) {
+        const uint8_t* extent_data = idat.data + static_cast<size_t>(start);
+        out_bytes->insert(out_bytes->end(), extent_data, extent_data + len);
+      }
       extent_file_offset = idat_file_offset + static_cast<size_t>(start);
     }
-    if (!first_extent_offset.has_value()) {
-      first_extent_offset = extent_file_offset;
+    total_size += len;
+    if (out_ranges != nullptr) {
+      const size_t extent_end = extent_file_offset + len;
+      if (!out_ranges->empty() &&
+          out_ranges->back().GetEnd() == extent_file_offset) {
+        out_ranges->back() =
+            image_io::DataRange(out_ranges->back().GetBegin(), extent_end);
+      } else {
+        out_ranges->emplace_back(extent_file_offset, extent_end);
+      }
     }
   }
-  return first_extent_offset;
+  return total_size > 0;
 }
 
-// Returns the XMP of the primary image as a "standard.xmp" block. If
-// `out_contiguous` is non-null, sets it to true only when all extents form a
-// single contiguous byte range in the file.
+// Extracts the primary image's XMP extents (and optionally payload bytes).
 std::optional<RawMetadataBlock> ExtractPrimaryXmp(
     image_io::DataSource* data_source, size_t file_size,
-    bool* out_contiguous = nullptr) {
-  if (out_contiguous != nullptr) *out_contiguous = false;
+    std::vector<image_io::DataRange>* out_ranges = nullptr,
+    bool read_bytes = true) {
+  if (out_ranges != nullptr) out_ranges->clear();
   std::optional<BoxLocation> meta =
       FindTopLevelBox(data_source, file_size, "meta");
   if (!meta.has_value() || meta->payload_size > kMaxMetaPayloadSize) {
@@ -554,8 +587,12 @@ std::optional<RawMetadataBlock> ExtractPrimaryXmp(
   if (xmp_item_ids.empty()) {
     return std::nullopt;
   }
+  const std::optional<uint32_t> chosen_id = ChooseXmpItemId(boxes, xmp_item_ids);
+  if (!chosen_id.has_value()) {
+    return std::nullopt;
+  }
   std::optional<ItemLocation> location =
-      FindItemLocation(boxes.iloc, ChooseXmpItemId(boxes, xmp_item_ids));
+      FindItemLocation(boxes.iloc, *chosen_id);
   if (!location.has_value()) {
     return std::nullopt;
   }
@@ -568,28 +605,17 @@ std::optional<RawMetadataBlock> ExtractPrimaryXmp(
   RawMetadataBlock block;
   block.type = "XMP";
   block.format_identifier = "standard.xmp";
-  std::optional<size_t> offset =
-      ReadItemData(data_source, file_size, *location, boxes.idat,
-                   idat_file_offset, &block.bytes);
-  if (!offset.has_value()) {
+  std::vector<image_io::DataRange> local_ranges;
+  std::vector<image_io::DataRange>* ranges_ptr =
+      out_ranges != nullptr ? out_ranges : &local_ranges;
+  if (!ResolveAndReadItemExtents(data_source, file_size, *location, boxes.idat,
+                                 idat_file_offset, ranges_ptr,
+                                 read_bytes ? &block.bytes : nullptr) ||
+      ranges_ptr->empty()) {
+    if (out_ranges != nullptr) out_ranges->clear();
     return std::nullopt;
   }
-  block.offset = *offset;
-  if (out_contiguous != nullptr) {
-    bool contiguous = !location->extents.empty();
-    uint64_t expected_next =
-        location->extents.empty()
-            ? 0
-            : location->base_offset + location->extents[0].first;
-    for (const auto& [ext_off, ext_len] : location->extents) {
-      if (location->base_offset + ext_off != expected_next) {
-        contiguous = false;
-        break;
-      }
-      expected_next += ext_len;
-    }
-    *out_contiguous = contiguous;
-  }
+  block.offset = ranges_ptr->front().GetBegin();
   return block;
 }
 
@@ -639,19 +665,28 @@ std::unique_ptr<ContainerSplitter> CreateHeifContainerSplitter() {
   return std::make_unique<HeifContainerSplitter>();
 }
 
+std::vector<image_io::DataRange> FindHeifPrimaryXmpRanges(
+    image_io::DataSource* data_source, size_t file_size) {
+  std::vector<image_io::DataRange> ranges;
+  if (data_source == nullptr || file_size == 0) {
+    return ranges;
+  }
+  if (!ExtractPrimaryXmp(data_source, file_size, &ranges,
+                         /*read_bytes=*/false)
+           .has_value()) {
+    ranges.clear();
+  }
+  return ranges;
+}
+
 image_io::DataRange FindHeifPrimaryXmpRange(image_io::DataSource* data_source,
                                             size_t file_size) {
-  if (data_source == nullptr || file_size == 0) {
+  std::vector<image_io::DataRange> ranges =
+      FindHeifPrimaryXmpRanges(data_source, file_size);
+  if (ranges.size() != 1) {
     return image_io::DataRange();
   }
-  bool contiguous = false;
-  std::optional<RawMetadataBlock> xmp_block =
-      ExtractPrimaryXmp(data_source, file_size, &contiguous);
-  if (!contiguous || !xmp_block.has_value() || xmp_block->bytes.empty()) {
-    return image_io::DataRange();
-  }
-  return image_io::DataRange(xmp_block->offset,
-                             xmp_block->offset + xmp_block->bytes.size());
+  return ranges.front();
 }
 
 }  // namespace motion_photo

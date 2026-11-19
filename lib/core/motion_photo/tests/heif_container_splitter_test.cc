@@ -492,6 +492,154 @@ TEST(HeifContainerSplitterTest, StripMotionPhotoMetadata_EdgeCases) {
   EXPECT_EQ(stripped_no_gm.find("xmlns:Item"), std::string::npos);
 }
 
+TEST(HeifContainerSplitterTest,
+     DoesNotMisattributeGainMapXmpWhenPrimaryHasNone) {
+  auto make_CustomInfe = [](uint16_t id, std::string_view type,
+                            std::string_view mime, std::string_view enc) {
+    Bytes p;
+    AppendUInt(id, 2, &p);
+    AppendUInt(0, 2, &p);
+    AppendString(type, &p);
+    AppendCString("", &p);
+    if (type == "mime") {
+      AppendCString(mime, &p);
+      if (!enc.empty()) AppendCString(enc, &p);
+    }
+    return MakeFullBox("infe", 2, p);
+  };
+  const std::string_view gainmap_xmp =
+      "<x:xmpmeta><rdf:Description hdrgm:Version=\"1.0\"/></x:xmpmeta>";
+  Bytes idat;
+  AppendString(gainmap_xmp, &idat);
+  const IdatItem gm_loc = {4, 0, static_cast<uint32_t>(gainmap_xmp.size()), 0};
+
+  // Primary=1, GainMap=3, GainMap XMP=4 ('cdsc' 4->3), NO Primary XMP.
+  const Bytes file_no_primary_xmp = Concat(
+      {MakeFtypBox(),
+       MakeFullBox("meta", 0,
+                   Concat({MakePitmV0(1),
+                           MakeIinfV0({make_CustomInfe(1, "hvc1", "", ""),
+                                       make_CustomInfe(3, "hvc1", "", ""),
+                                       make_CustomInfe(4, "mime",
+                                                       kXmpContentType, "")}),
+                           MakeCdscIrefV0({{4, 3}}), MakeIdatIlocV1({gm_loc}),
+                           MakeBox("idat", idat)})),
+       MakeMpvdBox()});
+  EXPECT_TRUE(SplitHeif(file_no_primary_xmp).empty());
+
+  auto segment = image_io::DataSegment::Create(
+      image_io::DataRange(0, file_no_primary_xmp.size()),
+      file_no_primary_xmp.data(), image_io::DataSegment::kDontDelete);
+  image_io::DataSegmentDataSource source(segment);
+  EXPECT_TRUE(
+      FindHeifPrimaryXmpRanges(&source, file_no_primary_xmp.size()).empty());
+}
+
+TEST(HeifContainerSplitterTest,
+     FallsBackToUnlinkedXmpOnlyWhenZeroCdscRefsExist) {
+  const std::string_view unlinked_xmp = "<x:xmpmeta>unlinked</x:xmpmeta>";
+  Bytes idat;
+  AppendString(unlinked_xmp, &idat);
+  const IdatItem xmp_loc = {2, 0, static_cast<uint32_t>(unlinked_xmp.size()), 0};
+
+  // 'iref' exists with a non-'cdsc' ('dimg') reference, zero 'cdsc' refs.
+  Bytes dimg;
+  AppendUInt(3, 2, &dimg);
+  AppendUInt(1, 2, &dimg);
+  AppendUInt(1, 2, &dimg);
+  const Bytes file = Concat(
+      {MakeFtypBox(),
+       MakeFullBox("meta", 0,
+                   Concat({MakePitmV0(1),
+                           MakeIinfV0({MakeInfeV2(1, "hvc1", ""),
+                                       MakeInfeV2(2, "mime", kXmpContentType),
+                                       MakeInfeV2(3, "tmap", "")}),
+                           MakeFullBox("iref", 0, MakeBox("dimg", dimg)),
+                           MakeIdatIlocV1({xmp_loc}), MakeBox("idat", idat)})),
+       MakeMpvdBox()});
+  std::vector<RawMetadataBlock> blocks = SplitHeif(file);
+  ASSERT_EQ(blocks.size(), 1u);
+  EXPECT_EQ(AsString(blocks[0].bytes), std::string(unlinked_xmp));
+}
+
+TEST(HeifContainerSplitterTest,
+     SupportsMultiExtentCaseInsensitiveMimeAndSkipsGzipXmp) {
+  auto make_encoded_infe = [](uint16_t id, std::string_view mime,
+                              std::string_view enc) {
+    Bytes p;
+    AppendUInt(id, 2, &p);
+    AppendUInt(0, 2, &p);
+    AppendString("mime", &p);
+    AppendCString("", &p);
+    AppendCString(mime, &p);
+    AppendCString(enc, &p);
+    return MakeFullBox("infe", 2, p);
+  };
+  const std::string ext1 = "<x:xmpmeta>PART1_";
+  const std::string gap = "IMAGE_BYTES_GAP";
+  const std::string ext2 = "PART2</x:xmpmeta>";
+  Bytes mdat_payload;
+  AppendString(ext1, &mdat_payload);
+  AppendString(gap, &mdat_payload);
+  AppendString(ext2, &mdat_payload);
+
+  auto build = [&](uint32_t mdat_data_off) {
+    Bytes iloc_p;
+    AppendUInt(0x4400, 2, &iloc_p);
+    AppendUInt(2, 2, &iloc_p);  // item 2 (gzipped) + item 3 (multi-extent)
+    // Item 2: gzipped XMP (should be skipped even though linked to primary)
+    AppendUInt(2, 2, &iloc_p);
+    AppendUInt(0, 2, &iloc_p);
+    AppendUInt(0, 2, &iloc_p);
+    AppendUInt(1, 2, &iloc_p);
+    AppendUInt(mdat_data_off, 4, &iloc_p);
+    AppendUInt(4, 4, &iloc_p);
+    // Item 3: valid case-insensitive XMP in 2 non-contiguous extents
+    AppendUInt(3, 2, &iloc_p);
+    AppendUInt(0, 2, &iloc_p);
+    AppendUInt(0, 2, &iloc_p);
+    AppendUInt(2, 2, &iloc_p);
+    AppendUInt(mdat_data_off, 4, &iloc_p);
+    AppendUInt(static_cast<uint32_t>(ext1.size()), 4, &iloc_p);
+    AppendUInt(mdat_data_off + static_cast<uint32_t>(ext1.size() + gap.size()),
+               4, &iloc_p);
+    AppendUInt(static_cast<uint32_t>(ext2.size()), 4, &iloc_p);
+
+    return Concat(
+        {MakeFtypBox(),
+         MakeFullBox("meta", 0,
+                     Concat({MakePitmV0(1),
+                             MakeIinfV0({MakeInfeV2(1, "hvc1", ""),
+                                         make_encoded_infe(2, kXmpContentType,
+                                                           "gzip"),
+                                         MakeInfeV2(3, "mime",
+                                                    "Application/RDF+XML")}),
+                             MakeCdscIrefV0({{2, 1}, {3, 1}}),
+                             MakeFullBox("iloc", 1, iloc_p)})),
+         MakeBox("mdat", mdat_payload), MakeMpvdBox()});
+  };
+  Bytes probe = build(0);
+  uint32_t mdat_off = static_cast<uint32_t>(
+      probe.size() - MakeMpvdBox().size() - mdat_payload.size());
+  Bytes file = build(mdat_off);
+
+  auto segment = image_io::DataSegment::Create(
+      image_io::DataRange(0, file.size()), file.data(),
+      image_io::DataSegment::kDontDelete);
+  image_io::DataSegmentDataSource source(segment);
+  std::vector<image_io::DataRange> ranges =
+      FindHeifPrimaryXmpRanges(&source, file.size());
+  ASSERT_EQ(ranges.size(), 2u);
+  EXPECT_EQ(ranges[0].GetBegin(), mdat_off);
+  EXPECT_EQ(ranges[0].GetLength(), ext1.size());
+  EXPECT_EQ(ranges[1].GetBegin(), mdat_off + ext1.size() + gap.size());
+  EXPECT_EQ(ranges[1].GetLength(), ext2.size());
+
+  std::vector<RawMetadataBlock> blocks = SplitHeif(file);
+  ASSERT_EQ(blocks.size(), 1u);
+  EXPECT_EQ(AsString(blocks[0].bytes), ext1 + ext2);
+}
+
 }  // namespace
 }  // namespace motion_photo
 }  // namespace libmotionphoto

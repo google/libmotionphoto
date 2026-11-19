@@ -251,6 +251,95 @@ class FdDataSource : public ::photos_editing_formats::image_io::DataSource {
 // 1. Parsing & Inspection (Decoding / Metadata Extraction)
 // =========================================================================
 
+namespace {
+
+::libmotionphoto::motion_photo::FileType SniffFileTypeFromFd(int fd,
+                                                             int64_t offset) {
+  uint8_t header_buf[64];
+  ssize_t header_read = pread(fd, header_buf, sizeof(header_buf), offset);
+  if (header_read <= 0) {
+    return ::libmotionphoto::motion_photo::FileType::kJpeg;
+  }
+  return ::libmotionphoto::motion_photo::SniffFileTypeOrDefaultJpeg(
+      header_buf, static_cast<size_t>(header_read));
+}
+
+bool ParseMotionPhotoFromSource(
+    ::photos_editing_formats::image_io::DataSource* data_source, size_t size,
+    ::libmotionphoto::motion_photo::FileType file_type,
+    MotionPhotoMetadata* out_metadata,
+    ::photos_editing_formats::image_io::MessageHandler* message_handler,
+    const HandlerOptions& options) {
+  ::libmotionphoto::motion_photo::MetadataEngine engine(message_handler);
+  ::libmotionphoto::motion_photo::HandlerOptions engine_options;
+  engine_options.disable_3p_plugins = options.disable_3p_plugins;
+  engine_options.enabled_3p_plugins = options.enabled_3p_plugins;
+  ::libmotionphoto::motion_photo::MetadataCollection collection =
+      engine.Parse(data_source, size, file_type, engine_options);
+  bool is_mp = engine.IsMotionPhoto(collection, engine_options);
+
+  if (out_metadata == nullptr) {
+    return is_mp;
+  }
+
+  out_metadata->is_motion_photo = is_mp;
+  ::libmotionphoto::motion_photo::MotionPhoto photo;
+  ::libmotionphoto::motion_photo::MotionPhotoParser parser(message_handler);
+  size_t bytes_parsed = 0;
+
+  for (const auto& block : collection.blocks()) {
+    if (is_mp && block.has_video_length() && block.video_length() > 0) {
+      out_metadata->video_length = block.video_length();
+    }
+    if (block.type() == ::libmotionphoto::motion_photo::BLOCK_TYPE_XMP ||
+        block.format_identifier() == "XMP") {
+      std::string_view xml(block.raw_bytes().data(), block.raw_bytes().size());
+      if (parser.ParseXmpString(xml, &photo, &bytes_parsed)) {
+        PopulateNativeMetadata(photo, out_metadata);
+      }
+    }
+  }
+
+  if (::libmotionphoto::motion_photo::IsHeif(file_type)) {
+    ::libmotionphoto::motion_photo::MotionPhotoHeifInfoBuilder heif_builder(
+        message_handler);
+    if (heif_builder.Build(data_source, size)) {
+      const auto& xmp_ranges = heif_builder.GetXmpStringRanges();
+      if (!xmp_ranges.empty() &&
+          parser.ParseXmpRanges(xmp_ranges, data_source, &photo,
+                                &bytes_parsed)) {
+        PopulateNativeMetadata(photo, out_metadata);
+      }
+      if (heif_builder.GetMpvdBox().IsValid()) {
+        out_metadata->video_length = heif_builder.GetMpvdBox().GetVideoLength();
+        out_metadata->is_motion_photo = true;
+        is_mp = true;
+      }
+    }
+  }
+
+  if (out_metadata->primary_image_mime.empty()) {
+    const char* fallback_mime =
+        ::libmotionphoto::motion_photo::GetPrimaryImageMimeType(file_type);
+    out_metadata->primary_image_mime =
+        (fallback_mime[0] != '\0') ? fallback_mime : "image/jpeg";
+  }
+  if (out_metadata->video_mime.empty()) {
+    out_metadata->video_mime = "video/mp4";
+  }
+  if (out_metadata->container.items.empty() && is_mp) {
+    out_metadata->container.items.resize(2);
+    out_metadata->container.items[0].mime = out_metadata->primary_image_mime;
+    out_metadata->container.items[0].padding = out_metadata->image_padding;
+    out_metadata->container.items[1].mime = out_metadata->video_mime;
+    out_metadata->container.items[1].length = out_metadata->video_length;
+  }
+
+  return is_mp;
+}
+
+}  // namespace
+
 bool ParseMotionPhotoFromFile(const std::string& filepath,
                               MotionPhotoMetadata* out_metadata,
                               MessageCallback callback,
@@ -267,7 +356,6 @@ bool ParseMotionPhotoFromFile(const std::string& filepath,
                         }))));
   }
 
-  ::libmotionphoto::motion_photo::MetadataEngine engine(&message_handler);
   ::libmotionphoto::motion_photo::FileType file_type =
       ::libmotionphoto::motion_photo::GetFileTypeFromFileName(filepath);
 
@@ -283,81 +371,9 @@ bool ParseMotionPhotoFromFile(const std::string& filepath,
   int64_t file_size = st.st_size;
 
   FdDataSource data_source(fd, /*base_offset=*/0, file_size, /*owns_fd=*/true);
-  ::libmotionphoto::motion_photo::HandlerOptions engine_options;
-  engine_options.disable_3p_plugins = options.disable_3p_plugins;
-  engine_options.enabled_3p_plugins = options.enabled_3p_plugins;
-  ::libmotionphoto::motion_photo::MetadataCollection collection =
-      engine.Parse(&data_source, file_size, file_type, engine_options);
-  bool is_mp = engine.IsMotionPhoto(collection, engine_options);
-
-  if (out_metadata != nullptr) {
-    out_metadata->is_motion_photo = is_mp;
-
-    ::libmotionphoto::motion_photo::MotionPhoto photo;
-    ::libmotionphoto::motion_photo::MotionPhotoParser parser(&message_handler);
-    size_t bytes_parsed = 0;
-
-    for (const auto& block : collection.blocks()) {
-      if (is_mp && block.has_video_length() && block.video_length() > 0) {
-        out_metadata->video_length = block.video_length();
-      }
-      if (block.type() == ::libmotionphoto::motion_photo::BLOCK_TYPE_XMP ||
-          block.format_identifier() == "XMP") {
-        std::string_view xml(block.raw_bytes().data(),
-                             block.raw_bytes().size());
-        if (parser.ParseXmpString(xml, &photo, &bytes_parsed)) {
-          PopulateNativeMetadata(photo, out_metadata);
-        }
-      }
-    }
-
-    if (::libmotionphoto::motion_photo::IsHeif(file_type)) {
-      ::libmotionphoto::motion_photo::MotionPhotoHeifInfoBuilder heif_builder(
-          &message_handler);
-      if (heif_builder.Build(&data_source, file_size)) {
-        const auto& xmp_range = heif_builder.GetXmpStringRange();
-        if (xmp_range.GetLength() > 0) {
-          std::shared_ptr<::photos_editing_formats::image_io::DataSegment>
-              xmp_segment = data_source.GetDataSegment(xmp_range.GetBegin(),
-                                                       xmp_range.GetLength());
-          if (xmp_segment) {
-            std::string_view xml(
-                reinterpret_cast<const char*>(
-                    xmp_segment->GetBuffer(xmp_range.GetBegin())),
-                xmp_range.GetLength());
-            if (parser.ParseXmpString(xml, &photo, &bytes_parsed)) {
-              PopulateNativeMetadata(photo, out_metadata);
-            }
-          }
-        }
-        if (heif_builder.GetMpvdBox().IsValid()) {
-          out_metadata->video_length =
-              heif_builder.GetMpvdBox().GetVideoLength();
-          out_metadata->is_motion_photo = true;
-          is_mp = true;
-        }
-      }
-    }
-
-    if (out_metadata->primary_image_mime.empty()) {
-      out_metadata->primary_image_mime =
-          (file_type == ::libmotionphoto::motion_photo::FileType::kHeic)
-              ? "image/heic"
-              : "image/jpeg";
-    }
-    if (out_metadata->video_mime.empty()) {
-      out_metadata->video_mime = "video/mp4";
-    }
-    if (out_metadata->container.items.empty() && is_mp) {
-      out_metadata->container.items.resize(2);
-      out_metadata->container.items[0].mime = out_metadata->primary_image_mime;
-      out_metadata->container.items[0].padding = out_metadata->image_padding;
-      out_metadata->container.items[1].mime = out_metadata->video_mime;
-      out_metadata->container.items[1].length = out_metadata->video_length;
-    }
-  }
-
-  return is_mp;
+  return ParseMotionPhotoFromSource(&data_source, static_cast<size_t>(file_size),
+                                    file_type, out_metadata, &message_handler,
+                                    options);
 }
 
 bool ParseMotionPhotoFromFd(int fd, int64_t offset, int64_t length,
@@ -378,16 +394,8 @@ bool ParseMotionPhotoFromFd(int fd, int64_t offset, int64_t length,
     }
   }
 
-  // Read a small 12-byte header to sniff file type without buffering entire
-  // length.
   ::libmotionphoto::motion_photo::FileType file_type =
-      ::libmotionphoto::motion_photo::FileType::kJpeg;
-  char header_buf[12];
-  ssize_t header_read = pread(fd, header_buf, sizeof(header_buf), offset);
-  if (header_read >= 12 && header_buf[4] == 'f' && header_buf[5] == 't' &&
-      header_buf[6] == 'y' && header_buf[7] == 'p') {
-    file_type = ::libmotionphoto::motion_photo::FileType::kHeic;
-  }
+      SniffFileTypeFromFd(fd, offset);
 
   ::photos_editing_formats::image_io::MessageHandler message_handler;
   if (callback) {
@@ -401,85 +409,10 @@ bool ParseMotionPhotoFromFd(int fd, int64_t offset, int64_t length,
                         }))));
   }
 
-  ::libmotionphoto::motion_photo::MetadataEngine engine(&message_handler);
-
   FdDataSource data_source(fd, offset, length, /*owns_fd=*/false);
-
-  ::libmotionphoto::motion_photo::HandlerOptions engine_options;
-  engine_options.disable_3p_plugins = options.disable_3p_plugins;
-  engine_options.enabled_3p_plugins = options.enabled_3p_plugins;
-  ::libmotionphoto::motion_photo::MetadataCollection collection =
-      engine.Parse(&data_source, length, file_type, engine_options);
-  bool is_mp = engine.IsMotionPhoto(collection, engine_options);
-
-  if (out_metadata != nullptr) {
-    out_metadata->is_motion_photo = is_mp;
-
-    ::libmotionphoto::motion_photo::MotionPhoto photo;
-    ::libmotionphoto::motion_photo::MotionPhotoParser parser(&message_handler);
-    size_t bytes_parsed = 0;
-
-    for (const auto& block : collection.blocks()) {
-      if (is_mp && block.has_video_length() && block.video_length() > 0) {
-        out_metadata->video_length = block.video_length();
-      }
-      if (block.type() == ::libmotionphoto::motion_photo::BLOCK_TYPE_XMP ||
-          block.format_identifier() == "XMP") {
-        std::string_view xml(block.raw_bytes().data(),
-                             block.raw_bytes().size());
-        if (parser.ParseXmpString(xml, &photo, &bytes_parsed)) {
-          PopulateNativeMetadata(photo, out_metadata);
-        }
-      }
-    }
-
-    if (::libmotionphoto::motion_photo::IsHeif(file_type)) {
-      ::libmotionphoto::motion_photo::MotionPhotoHeifInfoBuilder heif_builder(
-          &message_handler);
-      if (heif_builder.Build(&data_source, length)) {
-        const auto& xmp_range = heif_builder.GetXmpStringRange();
-        if (xmp_range.GetLength() > 0) {
-          std::shared_ptr<::photos_editing_formats::image_io::DataSegment>
-              xmp_segment = data_source.GetDataSegment(xmp_range.GetBegin(),
-                                                       xmp_range.GetLength());
-          if (xmp_segment) {
-            std::string_view xml(
-                reinterpret_cast<const char*>(
-                    xmp_segment->GetBuffer(xmp_range.GetBegin())),
-                xmp_range.GetLength());
-            if (parser.ParseXmpString(xml, &photo, &bytes_parsed)) {
-              PopulateNativeMetadata(photo, out_metadata);
-            }
-          }
-        }
-        if (heif_builder.GetMpvdBox().IsValid()) {
-          out_metadata->video_length =
-              heif_builder.GetMpvdBox().GetVideoLength();
-          out_metadata->is_motion_photo = true;
-          is_mp = true;
-        }
-      }
-    }
-
-    if (out_metadata->primary_image_mime.empty()) {
-      out_metadata->primary_image_mime =
-          (file_type == ::libmotionphoto::motion_photo::FileType::kHeic)
-              ? "image/heic"
-              : "image/jpeg";
-    }
-    if (out_metadata->video_mime.empty()) {
-      out_metadata->video_mime = "video/mp4";
-    }
-    if (out_metadata->container.items.empty() && is_mp) {
-      out_metadata->container.items.resize(2);
-      out_metadata->container.items[0].mime = out_metadata->primary_image_mime;
-      out_metadata->container.items[0].padding = out_metadata->image_padding;
-      out_metadata->container.items[1].mime = out_metadata->video_mime;
-      out_metadata->container.items[1].length = out_metadata->video_length;
-    }
-  }
-
-  return is_mp;
+  return ParseMotionPhotoFromSource(&data_source, static_cast<size_t>(length),
+                                    file_type, out_metadata, &message_handler,
+                                    options);
 }
 
 bool ParseMotionPhotoFromMemory(const uint8_t* data, size_t size,
@@ -502,14 +435,8 @@ bool ParseMotionPhotoFromMemory(const uint8_t* data, size_t size,
                         }))));
   }
 
-  ::libmotionphoto::motion_photo::MetadataEngine engine(&message_handler);
-
   ::libmotionphoto::motion_photo::FileType file_type =
-      ::libmotionphoto::motion_photo::FileType::kJpeg;
-  if (size >= 12 && data[4] == 'f' && data[5] == 't' && data[6] == 'y' &&
-      data[7] == 'p') {
-    file_type = ::libmotionphoto::motion_photo::FileType::kHeic;
-  }
+      ::libmotionphoto::motion_photo::SniffFileTypeOrDefaultJpeg(data, size);
 
   auto data_segment = ::photos_editing_formats::image_io::DataSegment::Create(
       ::photos_editing_formats::image_io::DataRange(0, size), data,
@@ -517,82 +444,8 @@ bool ParseMotionPhotoFromMemory(const uint8_t* data, size_t size,
           kDontDelete);
   ::photos_editing_formats::image_io::DataSegmentDataSource data_source(
       data_segment);
-
-  ::libmotionphoto::motion_photo::HandlerOptions engine_options;
-  engine_options.disable_3p_plugins = options.disable_3p_plugins;
-  engine_options.enabled_3p_plugins = options.enabled_3p_plugins;
-  ::libmotionphoto::motion_photo::MetadataCollection collection =
-      engine.Parse(&data_source, size, file_type, engine_options);
-  bool is_mp = engine.IsMotionPhoto(collection, engine_options);
-
-  if (out_metadata != nullptr) {
-    out_metadata->is_motion_photo = is_mp;
-
-    ::libmotionphoto::motion_photo::MotionPhoto photo;
-    ::libmotionphoto::motion_photo::MotionPhotoParser parser(&message_handler);
-    size_t bytes_parsed = 0;
-
-    for (const auto& block : collection.blocks()) {
-      if (is_mp && block.has_video_length() && block.video_length() > 0) {
-        out_metadata->video_length = block.video_length();
-      }
-      if (block.type() == ::libmotionphoto::motion_photo::BLOCK_TYPE_XMP ||
-          block.format_identifier() == "XMP") {
-        std::string_view xml(block.raw_bytes().data(),
-                             block.raw_bytes().size());
-        if (parser.ParseXmpString(xml, &photo, &bytes_parsed)) {
-          PopulateNativeMetadata(photo, out_metadata);
-        }
-      }
-    }
-
-    if (::libmotionphoto::motion_photo::IsHeif(file_type)) {
-      ::libmotionphoto::motion_photo::MotionPhotoHeifInfoBuilder heif_builder(
-          &message_handler);
-      if (heif_builder.Build(&data_source, size)) {
-        const auto& xmp_range = heif_builder.GetXmpStringRange();
-        if (xmp_range.GetLength() > 0) {
-          std::shared_ptr<::photos_editing_formats::image_io::DataSegment>
-              xmp_segment = data_source.GetDataSegment(xmp_range.GetBegin(),
-                                                       xmp_range.GetLength());
-          if (xmp_segment) {
-            std::string_view xml(
-                reinterpret_cast<const char*>(
-                    xmp_segment->GetBuffer(xmp_range.GetBegin())),
-                xmp_range.GetLength());
-            if (parser.ParseXmpString(xml, &photo, &bytes_parsed)) {
-              PopulateNativeMetadata(photo, out_metadata);
-            }
-          }
-        }
-        if (heif_builder.GetMpvdBox().IsValid()) {
-          out_metadata->video_length =
-              heif_builder.GetMpvdBox().GetVideoLength();
-          out_metadata->is_motion_photo = true;
-          is_mp = true;
-        }
-      }
-    }
-
-    if (out_metadata->primary_image_mime.empty()) {
-      out_metadata->primary_image_mime =
-          (file_type == ::libmotionphoto::motion_photo::FileType::kHeic)
-              ? "image/heic"
-              : "image/jpeg";
-    }
-    if (out_metadata->video_mime.empty()) {
-      out_metadata->video_mime = "video/mp4";
-    }
-    if (out_metadata->container.items.empty() && is_mp) {
-      out_metadata->container.items.resize(2);
-      out_metadata->container.items[0].mime = out_metadata->primary_image_mime;
-      out_metadata->container.items[0].padding = out_metadata->image_padding;
-      out_metadata->container.items[1].mime = out_metadata->video_mime;
-      out_metadata->container.items[1].length = out_metadata->video_length;
-    }
-  }
-
-  return is_mp;
+  return ParseMotionPhotoFromSource(&data_source, size, file_type, out_metadata,
+                                    &message_handler, options);
 }
 
 // =========================================================================
@@ -633,8 +486,8 @@ int CheckMotionPhotoFromMemory(const uint8_t* data, size_t size,
 namespace {
 
 bool IsHeifHeader(const uint8_t* data, size_t size) {
-  return size >= 12 && data[4] == 'f' && data[5] == 't' && data[6] == 'y' &&
-         data[7] == 'p';
+  return ::libmotionphoto::motion_photo::IsHeif(
+      ::libmotionphoto::motion_photo::SniffFileType(data, size));
 }
 
 bool ScanHeifMpvdBox(
@@ -723,6 +576,26 @@ bool RebuildHeifPrimaryImageWithoutVideo(const uint8_t* data, size_t size,
   return WriteBufferToFile(output_image_path, rebuilt.data(), rebuilt.size());
 }
 
+bool WriteExtractedMetadataFromSource(
+    ::photos_editing_formats::image_io::DataSource* data_source, size_t size,
+    ::libmotionphoto::motion_photo::FileType file_type,
+    const std::string& output_path) {
+  ::photos_editing_formats::image_io::MessageHandler message_handler;
+  ::libmotionphoto::motion_photo::MetadataEngine engine(&message_handler);
+  ::libmotionphoto::motion_photo::MetadataCollection collection =
+      engine.Parse(data_source, size, file_type);
+  for (const auto& block : collection.blocks()) {
+    if (block.type() == ::libmotionphoto::motion_photo::BLOCK_TYPE_XMP &&
+        !block.raw_bytes().empty()) {
+      return WriteBufferToFile(
+          output_path,
+          reinterpret_cast<const uint8_t*>(block.raw_bytes().data()),
+          block.raw_bytes().size());
+    }
+  }
+  return false;
+}
+
 }  // namespace
 
 bool ExtractPrimaryImageFromFile(const std::string& input_filepath,
@@ -753,10 +626,8 @@ bool ExtractPrimaryImageFromFd(int fd, int64_t offset, int64_t length,
     return false;
   }
   int64_t image_length = length - metadata.video_length;
-  uint8_t header_buf[12];
-  ssize_t header_read = pread(fd, header_buf, sizeof(header_buf), offset);
   const bool is_heif =
-      header_read >= 12 && IsHeifHeader(header_buf, sizeof(header_buf));
+      ::libmotionphoto::motion_photo::IsHeif(SniffFileTypeFromFd(fd, offset));
   bool mpvd_is_trailing = false;
   if (is_heif) {
     FdDataSource data_source(fd, offset, length, /*owns_fd=*/false);
@@ -871,9 +742,7 @@ bool ExtractVideoTrackFromFd(int fd, int64_t offset, int64_t length,
   }
   int64_t video_offset = length - metadata.video_length;
   int64_t video_length = metadata.video_length;
-  uint8_t header_buf[12];
-  ssize_t header_read = pread(fd, header_buf, sizeof(header_buf), offset);
-  if (header_read >= 12 && IsHeifHeader(header_buf, sizeof(header_buf))) {
+  if (::libmotionphoto::motion_photo::IsHeif(SniffFileTypeFromFd(fd, offset))) {
     FdDataSource data_source(fd, offset, length, /*owns_fd=*/false);
     ::libmotionphoto::motion_photo::MpvdBox mpvd_box;
     if (!ScanHeifMpvdBox(&data_source, &mpvd_box) ||
@@ -981,31 +850,12 @@ bool ExtractMotionPhotoFromFd(int fd, int64_t offset, int64_t length,
                                            params.video_output_path, callback);
   }
   if (success && !params.metadata_output_path.empty()) {
-    ::photos_editing_formats::image_io::MessageHandler message_handler;
-    ::libmotionphoto::motion_photo::MetadataEngine engine(&message_handler);
     ::libmotionphoto::motion_photo::FileType file_type =
-        ::libmotionphoto::motion_photo::FileType::kJpeg;
-    char header_buf[12];
-    ssize_t header_read = pread(fd, header_buf, sizeof(header_buf), offset);
-    if (header_read >= 12 && header_buf[4] == 'f' && header_buf[5] == 't' &&
-        header_buf[6] == 'y' && header_buf[7] == 'p') {
-      file_type = ::libmotionphoto::motion_photo::FileType::kHeic;
-    }
+        SniffFileTypeFromFd(fd, offset);
     FdDataSource data_source(fd, offset, length, /*owns_fd=*/false);
-    ::libmotionphoto::motion_photo::MetadataCollection collection =
-        engine.Parse(&data_source, length, file_type);
-    bool wrote_meta = false;
-    for (const auto& block : collection.blocks()) {
-      if (block.type() == ::libmotionphoto::motion_photo::BLOCK_TYPE_XMP &&
-          !block.raw_bytes().empty()) {
-        wrote_meta = WriteBufferToFile(
-            params.metadata_output_path,
-            reinterpret_cast<const uint8_t*>(block.raw_bytes().data()),
-            block.raw_bytes().size());
-        break;
-      }
-    }
-    success = success && wrote_meta;
+    success = WriteExtractedMetadataFromSource(
+        &data_source, static_cast<size_t>(length), file_type,
+        params.metadata_output_path);
   }
   return success;
 }
@@ -1031,34 +881,16 @@ bool ExtractMotionPhotoFromMemory(const uint8_t* data, size_t size,
                              data, size, params.video_output_path, callback);
   }
   if (success && !params.metadata_output_path.empty()) {
-    ::photos_editing_formats::image_io::MessageHandler message_handler;
-    ::libmotionphoto::motion_photo::MetadataEngine engine(&message_handler);
     ::libmotionphoto::motion_photo::FileType file_type =
-        ::libmotionphoto::motion_photo::FileType::kJpeg;
-    if (size >= 12 && data[4] == 'f' && data[5] == 't' && data[6] == 'y' &&
-        data[7] == 'p') {
-      file_type = ::libmotionphoto::motion_photo::FileType::kHeic;
-    }
+        ::libmotionphoto::motion_photo::SniffFileTypeOrDefaultJpeg(data, size);
     auto data_segment = ::photos_editing_formats::image_io::DataSegment::Create(
         ::photos_editing_formats::image_io::DataRange(0, size), data,
         ::photos_editing_formats::image_io::DataSegment::
             BufferDispositionPolicy::kDontDelete);
     ::photos_editing_formats::image_io::DataSegmentDataSource data_source(
         data_segment);
-    ::libmotionphoto::motion_photo::MetadataCollection collection =
-        engine.Parse(&data_source, size, file_type);
-    bool wrote_meta = false;
-    for (const auto& block : collection.blocks()) {
-      if (block.type() == ::libmotionphoto::motion_photo::BLOCK_TYPE_XMP &&
-          !block.raw_bytes().empty()) {
-        wrote_meta = WriteBufferToFile(
-            params.metadata_output_path,
-            reinterpret_cast<const uint8_t*>(block.raw_bytes().data()),
-            block.raw_bytes().size());
-        break;
-      }
-    }
-    success = success && wrote_meta;
+    success = WriteExtractedMetadataFromSource(&data_source, size, file_type,
+                                               params.metadata_output_path);
   }
   return success;
 }

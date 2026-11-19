@@ -300,6 +300,10 @@ bool ReadDataRangesToString(image_io::DataSource* data_source,
     }
     const size_t old_size = out->size();
     const size_t len = range.GetLength();
+    if (len > std::numeric_limits<size_t>::max() - old_size) {
+      out->clear();
+      return false;
+    }
     out->resize(old_size + len);
     if (!ReadDataRange(data_source, range.GetBegin(), len,
                        reinterpret_cast<uint8_t*>(&(*out)[old_size]))) {
@@ -655,6 +659,9 @@ std::string StripMotionPhotoMetadata(const std::string& xmp) {
     }
   }
 
+  if (result.find_first_not_of(" \t\r\n") == std::string::npos) {
+    return "";
+  }
   return result;
 }
 

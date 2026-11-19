@@ -27,6 +27,7 @@
 #include <string>
 #include <vector>
 
+#include "image_io/base/data_segment_data_source.h"
 #include "motion_photo/motion_photo_utils.h"
 #include "motion_photo/tests/test_framework.h"
 
@@ -1372,6 +1373,22 @@ TEST(LibMotionPhotoApiTest, LargeFdOverreadXmlLangAndParityRegression) {
                                          gainmap_first.size(), &gm_meta));
   EXPECT_EQ(gm_meta.video_mime, "video/mp4");
   EXPECT_EQ(gm_meta.video_length, static_cast<int64_t>(vid_bytes.size()));
+
+  // ReadDataRangesToString rejects ranges whose total length overflows size_t.
+  {
+    const std::vector<uint8_t> small_bytes(8, 'x');
+    auto small_seg = image_io::DataSegment::Create(
+        image_io::DataRange(0, small_bytes.size()), small_bytes.data(),
+        image_io::DataSegment::BufferDispositionPolicy::kDontDelete);
+    image_io::DataSegmentDataSource small_ds(small_seg);
+    std::string combined = "stale";
+    EXPECT_FALSE(motion_photo::ReadDataRangesToString(
+        &small_ds,
+        {image_io::DataRange(0, 1),
+         image_io::DataRange(0, std::numeric_limits<size_t>::max())},
+        &combined));
+    EXPECT_TRUE(combined.empty());
+  }
 
   fs::remove_all(test_dir);
 }

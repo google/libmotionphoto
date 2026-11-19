@@ -16,6 +16,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <map>
@@ -29,6 +30,7 @@
 #include "image_io/base/data_segment_data_source.h"
 #include "motion_photo/container_splitter.h"
 #include "motion_photo/tests/test_framework.h"
+#include "motion_photo_heif/motion_photo_heif_image_builder.h"
 
 namespace libmotionphoto {
 namespace motion_photo {
@@ -869,6 +871,81 @@ TEST(HeifIsoMetaEditorTest, EditsAvifAndSupports64BitIlocOffsets) {
   EXPECT_EQ(std::string(parsed->item_data[1].begin(),
                         parsed->item_data[1].end()),
             img);
+}
+
+TEST(HeifIsoMetaEditorTest,
+     StripToStillImageFromMemoryAppliesEmptyFallbackBeforeFastPath) {
+  const std::filesystem::path test_dir =
+      std::filesystem::temp_directory_path() / "libmotionphoto_n1_strip_test";
+  std::filesystem::remove_all(test_dir);
+  std::filesystem::create_directories(test_dir);
+
+  Bytes infe2_p;
+  Put(&infe2_p, 2, 2);
+  Put(&infe2_p, 0, 2);
+  PutStr(&infe2_p, "mime");
+  infe2_p.push_back(0);
+  PutStr(&infe2_p, "application/rdf+xml");
+  infe2_p.push_back(0);
+  const std::string img = "HEVCIMAGEBYTES";
+
+  auto build = [&](const std::string& xmp_payload, size_t* mpvd_offset_out) {
+    Bytes mdat_p;
+    mdat_p.insert(mdat_p.end(), img.begin(), img.end());
+    mdat_p.insert(mdat_p.end(), xmp_payload.begin(), xmp_payload.end());
+    auto make_file = [&](uint32_t mdat_off) {
+      return Cat({Ftyp(),
+                  Meta({Hdlr(), Pitm(1),
+                        Iinf({Infe(1, "hvc1"), MakeFullBox("infe", 2, 0, infe2_p)}),
+                        IrefCdsc(2, 1),
+                        IlocV1({{1, 0, 0, mdat_off,
+                                 static_cast<uint32_t>(img.size())},
+                                {2, 0, 0,
+                                 static_cast<uint32_t>(mdat_off + img.size()),
+                                 static_cast<uint32_t>(xmp_payload.size())}})}),
+                  MakeBox("mdat", mdat_p)});
+    };
+    Bytes probe = make_file(0);
+    Bytes still_prefix =
+        make_file(static_cast<uint32_t>(probe.size() - mdat_p.size()));
+    *mpvd_offset_out = still_prefix.size();
+    return Cat({still_prefix, MakeBox("mpvd", Bytes(12, 0x33))});
+  };
+
+  const std::string kExpectedMinimalXmp =
+      "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"/>";
+
+  // Extent >= fallback size: fast path writes minimal XMP (not blank spaces).
+  {
+    const std::string xmp_42 = "Camera:MotionPhoto=\"1\"" + std::string(20, ' ');
+    size_t mpvd_off = 0;
+    Bytes input = build(xmp_42, &mpvd_off);
+    const std::string out_path = (test_dir / "fast.heic").string();
+    ASSERT_TRUE(MotionPhotoHeifImageBuilder::StripToStillImageFromMemory(
+        input.data(), input.size(), mpvd_off, "", out_path));
+    Bytes output = ReadFile(out_path);
+    EXPECT_EQ(output.size(), mpvd_off);
+    EXPECT_EQ(RTrim(PrimaryXmpViaSplitter(output)), kExpectedMinimalXmp);
+  }
+
+  // Extent < fallback size: fallback applied first forces editor rebuild.
+  {
+    const std::string xmp_22 = "Camera:MotionPhoto=\"1\"";
+    size_t mpvd_off = 0;
+    Bytes input = build(xmp_22, &mpvd_off);
+    const std::string out_path = (test_dir / "rebuild.heic").string();
+    ASSERT_TRUE(MotionPhotoHeifImageBuilder::StripToStillImageFromMemory(
+        input.data(), input.size(), mpvd_off, "", out_path));
+    Bytes output = ReadFile(out_path);
+    EXPECT_EQ(RTrim(PrimaryXmpViaSplitter(output)), kExpectedMinimalXmp);
+    std::optional<Parsed> parsed = Parse(output);
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(std::string(parsed->item_data[1].begin(),
+                          parsed->item_data[1].end()),
+              img);
+  }
+
+  std::filesystem::remove_all(test_dir);
 }
 
 }  // namespace motion_photo

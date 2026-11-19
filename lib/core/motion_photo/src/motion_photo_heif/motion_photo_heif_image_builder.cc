@@ -152,6 +152,9 @@ bool MotionPhotoHeifImageBuilder::StripToStillImageFromMemory(
   } else {
     stripped_xmp.assign(fallback_xmp);
   }
+  if (stripped_xmp.find_first_not_of(" \t\r\n") == std::string::npos) {
+    stripped_xmp = "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"/>";
+  }
 
   // Fast path: overwrite single-extent XMP in place when no bytes follow
   // `still_size` and the stripped packet does not grow.
@@ -176,9 +179,6 @@ bool MotionPhotoHeifImageBuilder::StripToStillImageFromMemory(
     }
   }
 
-  if (stripped_xmp.empty()) {
-    stripped_xmp = "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"/>";
-  }
   std::vector<uint8_t> rebuilt;
   std::string error;
   if (!HeifIsoMetaEditor::SetPrimaryXmp(data, still_size, stripped_xmp,

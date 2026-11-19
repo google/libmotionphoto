@@ -51,6 +51,7 @@
 #include "motion_photo_builder/function.h"
 #include "motion_photo_checker/function.h"
 #include "motion_photo_extractor/function.h"
+#include "motion_photo_heif/heif_iso_meta_editor.h"
 #include "motion_photo_heif/motion_photo_heif_info_builder.h"
 #include "motion_photo_metadata_engine/function.h"
 #include "motion_photo_mp4/motion_photo_mp4_file_builder.h"
@@ -61,7 +62,8 @@ namespace api {
 namespace {
 
 // Helper to write raw byte buffers to a disk file.
-bool WriteBufferToFile(const std::string& path, const uint8_t* data, size_t size) {
+bool WriteBufferToFile(const std::string& path, const uint8_t* data,
+                       size_t size) {
   std::ofstream out(path, std::ios::binary);
   if (!out.is_open()) return false;
   out.write(reinterpret_cast<const char*>(data), size);
@@ -76,7 +78,8 @@ void PopulateNativeMetadata(
   const auto& camera = photo.GetCameraMetadata();
   if (camera.motion_photo_presentation_timestamp_us.WasAssigned() &&
       camera.motion_photo_presentation_timestamp_us.IsValid()) {
-    out->presentation_timestamp_us = camera.motion_photo_presentation_timestamp_us.GetValue();
+    out->presentation_timestamp_us =
+        camera.motion_photo_presentation_timestamp_us.GetValue();
   }
   const auto& container = photo.GetContainerMetadata();
   if (!container.version.GetValue().empty()) {
@@ -256,10 +259,12 @@ bool ParseMotionPhotoFromFile(const std::string& filepath,
   if (callback) {
     message_handler.SetMessageWriter(
         std::unique_ptr<::photos_editing_formats::image_io::MessageWriter>(
-            new ::photos_editing_formats::image_io::StringOutputterMessageWriter(
-                ::photos_editing_formats::image_io::StringOutputter([callback](const std::string& msg) {
-                  callback(msg);
-                }))));
+            new ::photos_editing_formats::image_io::
+                StringOutputterMessageWriter(
+                    ::photos_editing_formats::image_io::StringOutputter(
+                        [callback](const std::string& msg) {
+                          callback(msg);
+                        }))));
   }
 
   ::libmotionphoto::motion_photo::MetadataEngine engine(&message_handler);
@@ -298,7 +303,8 @@ bool ParseMotionPhotoFromFile(const std::string& filepath,
       }
       if (block.type() == ::libmotionphoto::motion_photo::BLOCK_TYPE_XMP ||
           block.format_identifier() == "XMP") {
-        std::string_view xml(block.raw_bytes().data(), block.raw_bytes().size());
+        std::string_view xml(block.raw_bytes().data(),
+                             block.raw_bytes().size());
         if (parser.ParseXmpString(xml, &photo, &bytes_parsed)) {
           PopulateNativeMetadata(photo, out_metadata);
         }
@@ -306,15 +312,18 @@ bool ParseMotionPhotoFromFile(const std::string& filepath,
     }
 
     if (::libmotionphoto::motion_photo::IsHeif(file_type)) {
-      ::libmotionphoto::motion_photo::MotionPhotoHeifInfoBuilder heif_builder(&message_handler);
+      ::libmotionphoto::motion_photo::MotionPhotoHeifInfoBuilder heif_builder(
+          &message_handler);
       if (heif_builder.Build(&data_source, file_size)) {
         const auto& xmp_range = heif_builder.GetXmpStringRange();
         if (xmp_range.GetLength() > 0) {
-          std::shared_ptr<::photos_editing_formats::image_io::DataSegment> xmp_segment =
-              data_source.GetDataSegment(xmp_range.GetBegin(), xmp_range.GetLength());
+          std::shared_ptr<::photos_editing_formats::image_io::DataSegment>
+              xmp_segment = data_source.GetDataSegment(xmp_range.GetBegin(),
+                                                       xmp_range.GetLength());
           if (xmp_segment) {
             std::string_view xml(
-                reinterpret_cast<const char*>(xmp_segment->GetBuffer(xmp_range.GetBegin())),
+                reinterpret_cast<const char*>(
+                    xmp_segment->GetBuffer(xmp_range.GetBegin())),
                 xmp_range.GetLength());
             if (parser.ParseXmpString(xml, &photo, &bytes_parsed)) {
               PopulateNativeMetadata(photo, out_metadata);
@@ -322,7 +331,8 @@ bool ParseMotionPhotoFromFile(const std::string& filepath,
           }
         }
         if (heif_builder.GetMpvdBox().IsValid()) {
-          out_metadata->video_length = heif_builder.GetMpvdBox().GetVideoLength();
+          out_metadata->video_length =
+              heif_builder.GetMpvdBox().GetVideoLength();
           out_metadata->is_motion_photo = true;
           is_mp = true;
         }
@@ -383,10 +393,12 @@ bool ParseMotionPhotoFromFd(int fd, int64_t offset, int64_t length,
   if (callback) {
     message_handler.SetMessageWriter(
         std::unique_ptr<::photos_editing_formats::image_io::MessageWriter>(
-            new ::photos_editing_formats::image_io::StringOutputterMessageWriter(
-                ::photos_editing_formats::image_io::StringOutputter([callback](const std::string& msg) {
-                  callback(msg);
-                }))));
+            new ::photos_editing_formats::image_io::
+                StringOutputterMessageWriter(
+                    ::photos_editing_formats::image_io::StringOutputter(
+                        [callback](const std::string& msg) {
+                          callback(msg);
+                        }))));
   }
 
   ::libmotionphoto::motion_photo::MetadataEngine engine(&message_handler);
@@ -413,7 +425,8 @@ bool ParseMotionPhotoFromFd(int fd, int64_t offset, int64_t length,
       }
       if (block.type() == ::libmotionphoto::motion_photo::BLOCK_TYPE_XMP ||
           block.format_identifier() == "XMP") {
-        std::string_view xml(block.raw_bytes().data(), block.raw_bytes().size());
+        std::string_view xml(block.raw_bytes().data(),
+                             block.raw_bytes().size());
         if (parser.ParseXmpString(xml, &photo, &bytes_parsed)) {
           PopulateNativeMetadata(photo, out_metadata);
         }
@@ -421,15 +434,18 @@ bool ParseMotionPhotoFromFd(int fd, int64_t offset, int64_t length,
     }
 
     if (::libmotionphoto::motion_photo::IsHeif(file_type)) {
-      ::libmotionphoto::motion_photo::MotionPhotoHeifInfoBuilder heif_builder(&message_handler);
+      ::libmotionphoto::motion_photo::MotionPhotoHeifInfoBuilder heif_builder(
+          &message_handler);
       if (heif_builder.Build(&data_source, length)) {
         const auto& xmp_range = heif_builder.GetXmpStringRange();
         if (xmp_range.GetLength() > 0) {
-          std::shared_ptr<::photos_editing_formats::image_io::DataSegment> xmp_segment =
-              data_source.GetDataSegment(xmp_range.GetBegin(), xmp_range.GetLength());
+          std::shared_ptr<::photos_editing_formats::image_io::DataSegment>
+              xmp_segment = data_source.GetDataSegment(xmp_range.GetBegin(),
+                                                       xmp_range.GetLength());
           if (xmp_segment) {
             std::string_view xml(
-                reinterpret_cast<const char*>(xmp_segment->GetBuffer(xmp_range.GetBegin())),
+                reinterpret_cast<const char*>(
+                    xmp_segment->GetBuffer(xmp_range.GetBegin())),
                 xmp_range.GetLength());
             if (parser.ParseXmpString(xml, &photo, &bytes_parsed)) {
               PopulateNativeMetadata(photo, out_metadata);
@@ -437,7 +453,8 @@ bool ParseMotionPhotoFromFd(int fd, int64_t offset, int64_t length,
           }
         }
         if (heif_builder.GetMpvdBox().IsValid()) {
-          out_metadata->video_length = heif_builder.GetMpvdBox().GetVideoLength();
+          out_metadata->video_length =
+              heif_builder.GetMpvdBox().GetVideoLength();
           out_metadata->is_motion_photo = true;
           is_mp = true;
         }
@@ -477,10 +494,12 @@ bool ParseMotionPhotoFromMemory(const uint8_t* data, size_t size,
   if (callback) {
     message_handler.SetMessageWriter(
         std::unique_ptr<::photos_editing_formats::image_io::MessageWriter>(
-            new ::photos_editing_formats::image_io::StringOutputterMessageWriter(
-                ::photos_editing_formats::image_io::StringOutputter([callback](const std::string& msg) {
-                  callback(msg);
-                }))));
+            new ::photos_editing_formats::image_io::
+                StringOutputterMessageWriter(
+                    ::photos_editing_formats::image_io::StringOutputter(
+                        [callback](const std::string& msg) {
+                          callback(msg);
+                        }))));
   }
 
   ::libmotionphoto::motion_photo::MetadataEngine engine(&message_handler);
@@ -494,8 +513,10 @@ bool ParseMotionPhotoFromMemory(const uint8_t* data, size_t size,
 
   auto data_segment = ::photos_editing_formats::image_io::DataSegment::Create(
       ::photos_editing_formats::image_io::DataRange(0, size), data,
-      ::photos_editing_formats::image_io::DataSegment::BufferDispositionPolicy::kDontDelete);
-  ::photos_editing_formats::image_io::DataSegmentDataSource data_source(data_segment);
+      ::photos_editing_formats::image_io::DataSegment::BufferDispositionPolicy::
+          kDontDelete);
+  ::photos_editing_formats::image_io::DataSegmentDataSource data_source(
+      data_segment);
 
   ::libmotionphoto::motion_photo::HandlerOptions engine_options;
   engine_options.disable_3p_plugins = options.disable_3p_plugins;
@@ -517,7 +538,8 @@ bool ParseMotionPhotoFromMemory(const uint8_t* data, size_t size,
       }
       if (block.type() == ::libmotionphoto::motion_photo::BLOCK_TYPE_XMP ||
           block.format_identifier() == "XMP") {
-        std::string_view xml(block.raw_bytes().data(), block.raw_bytes().size());
+        std::string_view xml(block.raw_bytes().data(),
+                             block.raw_bytes().size());
         if (parser.ParseXmpString(xml, &photo, &bytes_parsed)) {
           PopulateNativeMetadata(photo, out_metadata);
         }
@@ -525,15 +547,18 @@ bool ParseMotionPhotoFromMemory(const uint8_t* data, size_t size,
     }
 
     if (::libmotionphoto::motion_photo::IsHeif(file_type)) {
-      ::libmotionphoto::motion_photo::MotionPhotoHeifInfoBuilder heif_builder(&message_handler);
+      ::libmotionphoto::motion_photo::MotionPhotoHeifInfoBuilder heif_builder(
+          &message_handler);
       if (heif_builder.Build(&data_source, size)) {
         const auto& xmp_range = heif_builder.GetXmpStringRange();
         if (xmp_range.GetLength() > 0) {
-          std::shared_ptr<::photos_editing_formats::image_io::DataSegment> xmp_segment =
-              data_source.GetDataSegment(xmp_range.GetBegin(), xmp_range.GetLength());
+          std::shared_ptr<::photos_editing_formats::image_io::DataSegment>
+              xmp_segment = data_source.GetDataSegment(xmp_range.GetBegin(),
+                                                       xmp_range.GetLength());
           if (xmp_segment) {
             std::string_view xml(
-                reinterpret_cast<const char*>(xmp_segment->GetBuffer(xmp_range.GetBegin())),
+                reinterpret_cast<const char*>(
+                    xmp_segment->GetBuffer(xmp_range.GetBegin())),
                 xmp_range.GetLength());
             if (parser.ParseXmpString(xml, &photo, &bytes_parsed)) {
               PopulateNativeMetadata(photo, out_metadata);
@@ -541,7 +566,8 @@ bool ParseMotionPhotoFromMemory(const uint8_t* data, size_t size,
           }
         }
         if (heif_builder.GetMpvdBox().IsValid()) {
-          out_metadata->video_length = heif_builder.GetMpvdBox().GetVideoLength();
+          out_metadata->video_length =
+              heif_builder.GetMpvdBox().GetVideoLength();
           out_metadata->is_motion_photo = true;
           is_mp = true;
         }
@@ -575,9 +601,10 @@ bool ParseMotionPhotoFromMemory(const uint8_t* data, size_t size,
 
 int CheckMotionPhotoFromFile(const std::string& filepath,
                              MessageCallback callback) {
-  ::photos_editing_formats::image_io::StringOutputter outputter([callback](const std::string& msg) {
-    if (callback) callback(msg);
-  });
+  ::photos_editing_formats::image_io::StringOutputter outputter(
+      [callback](const std::string& msg) {
+        if (callback) callback(msg);
+      });
   return ::libmotionphoto::motion_photo::CheckMotionPhoto(filepath, outputter);
 }
 
@@ -602,6 +629,101 @@ int CheckMotionPhotoFromMemory(const uint8_t* data, size_t size,
 // =========================================================================
 // 3. Media & Metadata Extraction
 // =========================================================================
+
+namespace {
+
+bool IsHeifHeader(const uint8_t* data, size_t size) {
+  return size >= 12 && data[4] == 'f' && data[5] == 't' && data[6] == 'y' &&
+         data[7] == 'p';
+}
+
+bool ScanHeifMpvdBox(
+    ::photos_editing_formats::image_io::DataSource* data_source,
+    ::libmotionphoto::motion_photo::MpvdBox* out_box) {
+  ::libmotionphoto::motion_photo::MpvdBoxScanReceiver receiver(*out_box);
+  ::libmotionphoto::motion_photo::MpvdBox::Scan(data_source, 0, receiver);
+  return out_box->IsValid();
+}
+
+bool ScanHeifMpvdBoxFromMemory(
+    const uint8_t* data, size_t size,
+    ::libmotionphoto::motion_photo::MpvdBox* out_box) {
+  auto data_segment = ::photos_editing_formats::image_io::DataSegment::Create(
+      ::photos_editing_formats::image_io::DataRange(0, size), data,
+      ::photos_editing_formats::image_io::DataSegment::BufferDispositionPolicy::
+          kDontDelete);
+  ::photos_editing_formats::image_io::DataSegmentDataSource data_source(
+      data_segment);
+  return ScanHeifMpvdBox(&data_source, out_box);
+}
+
+bool StripHeifMotionPhotoXmpInPlace(std::vector<uint8_t>* buffer) {
+  if (buffer == nullptr || !IsHeifHeader(buffer->data(), buffer->size())) {
+    return false;
+  }
+  auto data_segment = ::photos_editing_formats::image_io::DataSegment::Create(
+      ::photos_editing_formats::image_io::DataRange(0, buffer->size()),
+      buffer->data(),
+      ::photos_editing_formats::image_io::DataSegment::BufferDispositionPolicy::
+          kDontDelete);
+  ::photos_editing_formats::image_io::DataSegmentDataSource data_source(
+      data_segment);
+  ::photos_editing_formats::image_io::DataRange xmp_range =
+      ::libmotionphoto::motion_photo::FindHeifPrimaryXmpRange(&data_source,
+                                                              buffer->size());
+  if (!xmp_range.IsValid() || xmp_range.GetEnd() > buffer->size()) {
+    return false;
+  }
+  std::string original_xmp(
+      reinterpret_cast<const char*>(buffer->data() + xmp_range.GetBegin()),
+      xmp_range.GetLength());
+  std::string stripped_xmp =
+      ::libmotionphoto::motion_photo::StripMotionPhotoMetadata(original_xmp);
+  if (stripped_xmp.size() > xmp_range.GetLength()) {
+    return false;
+  }
+  stripped_xmp.append(xmp_range.GetLength() - stripped_xmp.size(), ' ');
+  std::memcpy(buffer->data() + xmp_range.GetBegin(), stripped_xmp.data(),
+              stripped_xmp.size());
+  return true;
+}
+
+bool RebuildHeifPrimaryImageWithoutVideo(const uint8_t* data, size_t size,
+                                         const std::string& output_image_path) {
+  auto data_segment = ::photos_editing_formats::image_io::DataSegment::Create(
+      ::photos_editing_formats::image_io::DataRange(0, size),
+      const_cast<uint8_t*>(data),
+      ::photos_editing_formats::image_io::DataSegment::BufferDispositionPolicy::
+          kDontDelete);
+  ::photos_editing_formats::image_io::DataSegmentDataSource data_source(
+      data_segment);
+  auto splitter = ::libmotionphoto::motion_photo::CreateHeifContainerSplitter();
+  std::vector<::libmotionphoto::motion_photo::RawMetadataBlock> blocks =
+      splitter->Split(&data_source, size);
+  std::string stripped_xmp;
+  for (const auto& block : blocks) {
+    if (block.type == "XMP" && !block.bytes.empty()) {
+      std::string original_xmp(
+          reinterpret_cast<const char*>(block.bytes.data()),
+          block.bytes.size());
+      stripped_xmp = ::libmotionphoto::motion_photo::StripMotionPhotoMetadata(
+          original_xmp);
+      break;
+    }
+  }
+  if (stripped_xmp.empty()) {
+    stripped_xmp = "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"/>";
+  }
+  std::vector<uint8_t> rebuilt;
+  std::string err;
+  if (!::libmotionphoto::motion_photo::HeifIsoMetaEditor::SetPrimaryXmp(
+          data, size, stripped_xmp, &rebuilt, &err)) {
+    return false;
+  }
+  return WriteBufferToFile(output_image_path, rebuilt.data(), rebuilt.size());
+}
+
+}  // namespace
 
 bool ExtractPrimaryImageFromFile(const std::string& input_filepath,
                                  const std::string& output_image_path,
@@ -631,31 +753,59 @@ bool ExtractPrimaryImageFromFd(int fd, int64_t offset, int64_t length,
     return false;
   }
   int64_t image_length = length - metadata.video_length;
-  char header_buf[12];
+  uint8_t header_buf[12];
   ssize_t header_read = pread(fd, header_buf, sizeof(header_buf), offset);
-  if (header_read >= 12 && header_buf[4] == 'f' && header_buf[5] == 't' &&
-      header_buf[6] == 'y' && header_buf[7] == 'p') {
+  const bool is_heif =
+      header_read >= 12 && IsHeifHeader(header_buf, sizeof(header_buf));
+  bool mpvd_is_trailing = false;
+  if (is_heif) {
     FdDataSource data_source(fd, offset, length, /*owns_fd=*/false);
     ::libmotionphoto::motion_photo::MpvdBox mpvd_box;
-    ::libmotionphoto::motion_photo::MpvdBoxScanReceiver receiver(mpvd_box);
-    ::libmotionphoto::motion_photo::MpvdBox::Scan(&data_source, 0, receiver);
-    if (!mpvd_box.IsValid() || mpvd_box.GetStartIndex() == 0) {
+    if (!ScanHeifMpvdBox(&data_source, &mpvd_box) ||
+        mpvd_box.GetStartIndex() == 0) {
       return false;
     }
-    image_length = static_cast<int64_t>(mpvd_box.GetStartIndex());
+    mpvd_is_trailing = (mpvd_box.GetStartIndex() + mpvd_box.GetLength() ==
+                        static_cast<size_t>(length));
+    if (mpvd_is_trailing) {
+      image_length = static_cast<int64_t>(mpvd_box.GetStartIndex());
+    } else {
+      image_length = length;
+    }
   }
   if (image_length <= 0 || image_length > length) return false;
   std::vector<uint8_t> buffer(image_length);
   size_t total_read = 0;
   while (total_read < static_cast<size_t>(image_length)) {
-    ssize_t bytes =
-        pread(fd, buffer.data() + total_read,
-              static_cast<size_t>(image_length) - total_read,
-              offset + static_cast<int64_t>(total_read));
+    ssize_t bytes = pread(fd, buffer.data() + total_read,
+                          static_cast<size_t>(image_length) - total_read,
+                          offset + static_cast<int64_t>(total_read));
     if (bytes <= 0) break;
     total_read += static_cast<size_t>(bytes);
   }
   if (total_read != static_cast<size_t>(image_length)) return false;
+  if (is_heif) {
+    if (mpvd_is_trailing && StripHeifMotionPhotoXmpInPlace(&buffer)) {
+      return WriteBufferToFile(output_image_path, buffer.data(), buffer.size());
+    }
+    if (mpvd_is_trailing) {
+      // Read the full container so HeifIsoMetaEditor can rebuild cleanly.
+      std::vector<uint8_t> full_buf(length);
+      size_t full_read = 0;
+      while (full_read < static_cast<size_t>(length)) {
+        ssize_t bytes = pread(fd, full_buf.data() + full_read,
+                              static_cast<size_t>(length) - full_read,
+                              offset + static_cast<int64_t>(full_read));
+        if (bytes <= 0) break;
+        full_read += static_cast<size_t>(bytes);
+      }
+      if (full_read != static_cast<size_t>(length)) return false;
+      return RebuildHeifPrimaryImageWithoutVideo(
+          full_buf.data(), full_buf.size(), output_image_path);
+    }
+    return RebuildHeifPrimaryImageWithoutVideo(buffer.data(), buffer.size(),
+                                               output_image_path);
+  }
   return WriteBufferToFile(output_image_path, buffer.data(), image_length);
 }
 
@@ -669,21 +819,24 @@ bool ExtractPrimaryImageFromMemory(const uint8_t* data, size_t size,
     return false;
   }
   size_t image_length = size - metadata.video_length;
-  if (size >= 12 && data[4] == 'f' && data[5] == 't' && data[6] == 'y' &&
-      data[7] == 'p') {
-    auto data_segment = ::photos_editing_formats::image_io::DataSegment::Create(
-        ::photos_editing_formats::image_io::DataRange(0, size), data,
-        ::photos_editing_formats::image_io::DataSegment::
-            BufferDispositionPolicy::kDontDelete);
-    ::photos_editing_formats::image_io::DataSegmentDataSource data_source(
-        data_segment);
+  const bool is_heif = IsHeifHeader(data, size);
+  if (is_heif) {
     ::libmotionphoto::motion_photo::MpvdBox mpvd_box;
-    ::libmotionphoto::motion_photo::MpvdBoxScanReceiver receiver(mpvd_box);
-    ::libmotionphoto::motion_photo::MpvdBox::Scan(&data_source, 0, receiver);
-    if (!mpvd_box.IsValid() || mpvd_box.GetStartIndex() == 0) {
+    if (!ScanHeifMpvdBoxFromMemory(data, size, &mpvd_box) ||
+        mpvd_box.GetStartIndex() == 0) {
       return false;
     }
-    image_length = mpvd_box.GetStartIndex();
+    const bool mpvd_is_trailing =
+        (mpvd_box.GetStartIndex() + mpvd_box.GetLength() == size);
+    if (mpvd_is_trailing) {
+      image_length = mpvd_box.GetStartIndex();
+      std::vector<uint8_t> buffer(data, data + image_length);
+      if (StripHeifMotionPhotoXmpInPlace(&buffer)) {
+        return WriteBufferToFile(output_image_path, buffer.data(),
+                                 buffer.size());
+      }
+    }
+    return RebuildHeifPrimaryImageWithoutVideo(data, size, output_image_path);
   }
   if (image_length == 0 || image_length > size) return false;
   return WriteBufferToFile(output_image_path, data, image_length);
@@ -718,15 +871,13 @@ bool ExtractVideoTrackFromFd(int fd, int64_t offset, int64_t length,
   }
   int64_t video_offset = length - metadata.video_length;
   int64_t video_length = metadata.video_length;
-  char header_buf[12];
+  uint8_t header_buf[12];
   ssize_t header_read = pread(fd, header_buf, sizeof(header_buf), offset);
-  if (header_read >= 12 && header_buf[4] == 'f' && header_buf[5] == 't' &&
-      header_buf[6] == 'y' && header_buf[7] == 'p') {
+  if (header_read >= 12 && IsHeifHeader(header_buf, sizeof(header_buf))) {
     FdDataSource data_source(fd, offset, length, /*owns_fd=*/false);
     ::libmotionphoto::motion_photo::MpvdBox mpvd_box;
-    ::libmotionphoto::motion_photo::MpvdBoxScanReceiver receiver(mpvd_box);
-    ::libmotionphoto::motion_photo::MpvdBox::Scan(&data_source, 0, receiver);
-    if (!mpvd_box.IsValid() || mpvd_box.GetVideoLength() == 0) {
+    if (!ScanHeifMpvdBox(&data_source, &mpvd_box) ||
+        mpvd_box.GetVideoLength() == 0) {
       return false;
     }
     video_offset = static_cast<int64_t>(mpvd_box.GetStartIndex() +
@@ -768,18 +919,10 @@ bool ExtractVideoTrackFromMemory(const uint8_t* data, size_t size,
   }
   size_t video_offset = size - metadata.video_length;
   size_t video_length = static_cast<size_t>(metadata.video_length);
-  if (size >= 12 && data[4] == 'f' && data[5] == 't' && data[6] == 'y' &&
-      data[7] == 'p') {
-    auto data_segment = ::photos_editing_formats::image_io::DataSegment::Create(
-        ::photos_editing_formats::image_io::DataRange(0, size), data,
-        ::photos_editing_formats::image_io::DataSegment::
-            BufferDispositionPolicy::kDontDelete);
-    ::photos_editing_formats::image_io::DataSegmentDataSource data_source(
-        data_segment);
+  if (IsHeifHeader(data, size)) {
     ::libmotionphoto::motion_photo::MpvdBox mpvd_box;
-    ::libmotionphoto::motion_photo::MpvdBoxScanReceiver receiver(mpvd_box);
-    ::libmotionphoto::motion_photo::MpvdBox::Scan(&data_source, 0, receiver);
-    if (!mpvd_box.IsValid() || mpvd_box.GetVideoLength() == 0) {
+    if (!ScanHeifMpvdBoxFromMemory(data, size, &mpvd_box) ||
+        mpvd_box.GetVideoLength() == 0) {
       return false;
     }
     video_offset = mpvd_box.GetStartIndex() + mpvd_box.GetHeaderLength();
@@ -803,13 +946,16 @@ bool ExtractMotionPhotoFromFile(const ExtractorParams& params,
                                 MessageCallback callback) {
   ::libmotionphoto::motion_photo::MotionPhotoExtractorParams internal_params;
   internal_params.motion_photo_file_name = params.motion_photo_filepath;
-  internal_params.primary_image_file_name_output = params.primary_image_output_path;
+  internal_params.primary_image_file_name_output =
+      params.primary_image_output_path;
   internal_params.video_file_name_output = params.video_output_path;
   internal_params.metadata_file_name_output = params.metadata_output_path;
-  ::photos_editing_formats::image_io::StringOutputter outputter([callback](const std::string& msg) {
-    if (callback) callback(msg);
-  });
-  int status = ::libmotionphoto::motion_photo::ExtractMotionPhoto(internal_params, outputter);
+  ::photos_editing_formats::image_io::StringOutputter outputter(
+      [callback](const std::string& msg) {
+        if (callback) callback(msg);
+      });
+  int status = ::libmotionphoto::motion_photo::ExtractMotionPhoto(
+      internal_params, outputter);
   return status == 0;
 }
 
@@ -820,20 +966,19 @@ bool ExtractMotionPhotoFromFd(int fd, int64_t offset, int64_t length,
     return false;
   }
   if (params.primary_image_output_path.empty() &&
-      params.video_output_path.empty() &&
-      params.metadata_output_path.empty()) {
+      params.video_output_path.empty() && params.metadata_output_path.empty()) {
     return false;
   }
   bool success = true;
   if (!params.primary_image_output_path.empty()) {
-    success = success &&
-              ExtractPrimaryImageFromFd(
-                  fd, offset, length, params.primary_image_output_path, callback);
+    success = success && ExtractPrimaryImageFromFd(
+                             fd, offset, length,
+                             params.primary_image_output_path, callback);
   }
   if (!params.video_output_path.empty()) {
-    success = success &&
-              ExtractVideoTrackFromFd(fd, offset, length,
-                                      params.video_output_path, callback);
+    success =
+        success && ExtractVideoTrackFromFd(fd, offset, length,
+                                           params.video_output_path, callback);
   }
   if (success && !params.metadata_output_path.empty()) {
     ::photos_editing_formats::image_io::MessageHandler message_handler;
@@ -872,8 +1017,7 @@ bool ExtractMotionPhotoFromMemory(const uint8_t* data, size_t size,
     return false;
   }
   if (params.primary_image_output_path.empty() &&
-      params.video_output_path.empty() &&
-      params.metadata_output_path.empty()) {
+      params.video_output_path.empty() && params.metadata_output_path.empty()) {
     return false;
   }
   bool success = true;
@@ -919,21 +1063,25 @@ bool ExtractMotionPhotoFromMemory(const uint8_t* data, size_t size,
   return success;
 }
 
-int ExtractAgtmFromFile(const std::string& filepath,
-                        MessageCallback callback) {
+int ExtractAgtmFromFile(const std::string& filepath, MessageCallback callback) {
   MotionPhotoMetadata metadata;
   if (!ParseMotionPhotoFromFile(filepath, &metadata, callback)) {
-    if (callback) callback("Error: Failed to parse motion photo metadata from file: " + filepath);
+    if (callback)
+      callback("Error: Failed to parse motion photo metadata from file: " +
+               filepath);
     return 1;
   }
-  int64_t target_ts = metadata.presentation_timestamp_us >= 0 ? metadata.presentation_timestamp_us : 0;
+  int64_t target_ts = metadata.presentation_timestamp_us >= 0
+                          ? metadata.presentation_timestamp_us
+                          : 0;
   ::libmotionphoto::motion_photo::MotionPhotoMetadataEngineParams params;
   params.motion_photo_file_name = filepath;
   params.extract_agtm = true;
   params.timestamp_us = target_ts;
-  ::photos_editing_formats::image_io::StringOutputter outputter([callback](const std::string& msg) {
-    if (callback) callback(msg);
-  });
+  ::photos_editing_formats::image_io::StringOutputter outputter(
+      [callback](const std::string& msg) {
+        if (callback) callback(msg);
+      });
   return ::libmotionphoto::motion_photo::RunMetadataEngine(params, outputter);
 }
 
@@ -942,10 +1090,13 @@ int ExtractAgtmFromFd(int fd, int64_t offset, int64_t length,
   if (fd < 0 || length <= 0) return 1;
   MotionPhotoMetadata metadata;
   if (!ParseMotionPhotoFromFd(fd, offset, length, &metadata, callback)) {
-    if (callback) callback("Error: Failed to parse motion photo metadata from fd");
+    if (callback)
+      callback("Error: Failed to parse motion photo metadata from fd");
     return 1;
   }
-  int64_t target_ts = metadata.presentation_timestamp_us >= 0 ? metadata.presentation_timestamp_us : 0;
+  int64_t target_ts = metadata.presentation_timestamp_us >= 0
+                          ? metadata.presentation_timestamp_us
+                          : 0;
   std::vector<uint8_t> buffer(length);
   if (lseek(fd, offset, SEEK_SET) < 0) return 1;
   ssize_t bytes_read = read(fd, buffer.data(), length);
@@ -961,18 +1112,24 @@ int ExtractAgtmFromMemory(const uint8_t* data, size_t size,
   }
   MotionPhotoMetadata metadata;
   if (!ParseMotionPhotoFromMemory(data, size, &metadata, callback)) {
-    if (callback) callback("Error: Failed to parse motion photo metadata from memory buffer");
+    if (callback)
+      callback(
+          "Error: Failed to parse motion photo metadata from memory buffer");
     return 1;
   }
-  int64_t target_ts = metadata.presentation_timestamp_us >= 0 ? metadata.presentation_timestamp_us : 0;
+  int64_t target_ts = metadata.presentation_timestamp_us >= 0
+                          ? metadata.presentation_timestamp_us
+                          : 0;
   ::photos_editing_formats::image_io::MessageHandler message_handler;
   if (callback) {
     message_handler.SetMessageWriter(
         std::unique_ptr<::photos_editing_formats::image_io::MessageWriter>(
-            new ::photos_editing_formats::image_io::StringOutputterMessageWriter(
-                ::photos_editing_formats::image_io::StringOutputter([callback](const std::string& msg) {
-                  callback(msg);
-                }))));
+            new ::photos_editing_formats::image_io::
+                StringOutputterMessageWriter(
+                    ::photos_editing_formats::image_io::StringOutputter(
+                        [callback](const std::string& msg) {
+                          callback(msg);
+                        }))));
   }
   ::libmotionphoto::motion_photo::MetadataEngine engine(&message_handler);
   std::string json = engine.ExtractAgtmAtTimestampMemory(data, size, target_ts);
@@ -996,14 +1153,16 @@ int BuildMotionPhotoFromFile(const std::string& image_path,
   params.primary_video_file_name = video_path;
   params.output_image_file_name = output_path;
   params.presentation_timestamp_us = presentation_timestamp_us;
-  ::photos_editing_formats::image_io::StringOutputter outputter([callback](const std::string& msg) {
-    if (callback) callback(msg);
-  });
+  ::photos_editing_formats::image_io::StringOutputter outputter(
+      [callback](const std::string& msg) {
+        if (callback) callback(msg);
+      });
   return ::libmotionphoto::motion_photo::BuildMotionPhoto(params, outputter);
 }
 
-int BuildMotionPhotoFromFd(int image_fd, int64_t image_offset, int64_t image_length,
-                           int video_fd, int64_t video_offset, int64_t video_length,
+int BuildMotionPhotoFromFd(int image_fd, int64_t image_offset,
+                           int64_t image_length, int video_fd,
+                           int64_t video_offset, int64_t video_length,
                            const std::string& output_path,
                            int64_t presentation_timestamp_us,
                            MessageCallback callback) {
@@ -1013,15 +1172,19 @@ int BuildMotionPhotoFromFd(int image_fd, int64_t image_offset, int64_t image_len
   }
   std::vector<uint8_t> image_bytes(image_length);
   if (lseek(image_fd, image_offset, SEEK_SET) < 0) return 1;
-  if (read(image_fd, image_bytes.data(), image_length) != static_cast<ssize_t>(image_length)) return 1;
+  if (read(image_fd, image_bytes.data(), image_length) !=
+      static_cast<ssize_t>(image_length))
+    return 1;
 
   std::vector<uint8_t> video_bytes(video_length);
   if (lseek(video_fd, video_offset, SEEK_SET) < 0) return 1;
-  if (read(video_fd, video_bytes.data(), video_length) != static_cast<ssize_t>(video_length)) return 1;
+  if (read(video_fd, video_bytes.data(), video_length) !=
+      static_cast<ssize_t>(video_length))
+    return 1;
 
-  return BuildMotionPhotoFromMemory(image_bytes.data(), image_length,
-                                    video_bytes.data(), video_length,
-                                    output_path, presentation_timestamp_us, callback);
+  return BuildMotionPhotoFromMemory(
+      image_bytes.data(), image_length, video_bytes.data(), video_length,
+      output_path, presentation_timestamp_us, callback);
 }
 
 int BuildMotionPhotoFromMemory(const uint8_t* image_bytes, size_t image_size,
@@ -1036,19 +1199,19 @@ int BuildMotionPhotoFromMemory(const uint8_t* image_bytes, size_t image_size,
   params.primary_video_size = video_size;
   params.output_image_file_name = output_path;
   params.presentation_timestamp_us = presentation_timestamp_us;
-  ::photos_editing_formats::image_io::StringOutputter outputter([callback](const std::string& msg) {
-    if (callback) callback(msg);
-  });
-  return ::libmotionphoto::motion_photo::BuildMotionPhotoFromMemory(params, outputter);
+  ::photos_editing_formats::image_io::StringOutputter outputter(
+      [callback](const std::string& msg) {
+        if (callback) callback(msg);
+      });
+  return ::libmotionphoto::motion_photo::BuildMotionPhotoFromMemory(params,
+                                                                    outputter);
 }
 
 // =========================================================================
 // 5. Library Version
 // =========================================================================
 
-std::string GetLibMotionPhotoVersion() {
-  return "1.0.0";
-}
+std::string GetLibMotionPhotoVersion() { return "1.0.0"; }
 
 }  // namespace api
 }  // namespace libmotionphoto

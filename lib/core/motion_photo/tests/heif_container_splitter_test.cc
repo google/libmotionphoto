@@ -31,6 +31,7 @@
 #include "motion_photo/metadata_block.h"
 #include "motion_photo/metadata_engine.h"
 #include "motion_photo/motion_photo.h"
+#include "motion_photo/motion_photo_utils.h"
 #include "motion_photo/tests/test_framework.h"
 
 namespace libmotionphoto {
@@ -430,6 +431,65 @@ TEST(MetadataEngineHeifTest, RejectsHeicWithoutVideo) {
   ASSERT_FALSE(file.empty());
 
   EXPECT_FALSE(IsMotionPhotoPerEngine(file, FileType::kHeic));
+}
+
+TEST(HeifContainerSplitterTest,
+     EmitsSefdWithoutMpvdAndRejectsNonContiguousRange) {
+  const Bytes sefd_payload = {'S', 'E', 'F', 'H'};
+  const Bytes ftyp = MakeBox("ftyp", {'h', 'e', 'i', 'c', 0, 0, 0, 0});
+  const Bytes sefd = MakeBox("sefd", sefd_payload);
+  Bytes file;
+  file.insert(file.end(), ftyp.begin(), ftyp.end());
+  file.insert(file.end(), sefd.begin(), sefd.end());
+
+  std::vector<RawMetadataBlock> blocks = SplitHeif(file);
+  ASSERT_EQ(blocks.size(), 1u);
+  EXPECT_EQ(blocks[0].type, std::string("SEFD"));
+  EXPECT_EQ(blocks[0].offset, ftyp.size() + 8);
+  EXPECT_EQ(blocks[0].total_payload_size, sefd_payload.size());
+}
+
+TEST(HeifContainerSplitterTest, StripMotionPhotoMetadata_EdgeCases) {
+  // Single-quoted MotionPhoto item with GainMap preserved.
+  const std::string single_quote_gm =
+      "<x:xmpmeta xmlns:x='adobe:ns:meta/' "
+      "xmlns:Camera='http://ns.google.com/photos/1.0/camera/' "
+      "xmlns:Container='http://ns.google.com/photos/1.0/container/' "
+      "xmlns:Item='http://ns.google.com/photos/1.0/container/item/' "
+      "Camera:MotionPhoto='1' Container:Version='1'>"
+      "<Container:Directory><rdf:Seq>"
+      "<rdf:li Item:Semantic='Primary' Item:Mime='image/heic'/>"
+      "<rdf:li Item:Semantic='GainMap' Item:Mime='image/jpeg'/>"
+      "<rdf:li Item:Semantic='MotionPhoto' Item:Mime='video/mp4'/>"
+      "</rdf:Seq></Container:Directory></x:xmpmeta>";
+  std::string stripped_sq = StripMotionPhotoMetadata(single_quote_gm);
+  EXPECT_EQ(stripped_sq.find("MotionPhoto"), std::string::npos);
+  EXPECT_NE(stripped_sq.find("GainMap"), std::string::npos);
+
+  // Element-form <Item:Semantic>MotionPhoto</Item:Semantic> with GainMap.
+  const std::string elem_gm =
+      "<x:xmpmeta><Container:Directory><rdf:Seq>"
+      "<rdf:li><Item:Semantic>GainMap</Item:Semantic></rdf:li>"
+      "<rdf:li><Item:Semantic>MotionPhoto</Item:Semantic></rdf:li>"
+      "</rdf:Seq></Container:Directory></x:xmpmeta>";
+  std::string stripped_elem = StripMotionPhotoMetadata(elem_gm);
+  EXPECT_EQ(stripped_elem.find("MotionPhoto"), std::string::npos);
+  EXPECT_NE(stripped_elem.find("GainMap"), std::string::npos);
+
+  // Container:Version="1" and orphaned xmlns without GainMap.
+  const std::string no_gm =
+      "<x:xmpmeta xmlns:Camera=\"http://ns.google.com/photos/1.0/camera/\" "
+      "xmlns:Container=\"http://ns.google.com/photos/1.0/container/\" "
+      "xmlns:Item=\"http://ns.google.com/photos/1.0/container/item/\" "
+      "Camera:MotionPhoto=\"1\" Container:Version=\"1\">"
+      "<Container:Directory><rdf:Seq><rdf:li Item:Semantic=\"MotionPhoto\"/>"
+      "</rdf:Seq></Container:Directory></x:xmpmeta>";
+  std::string stripped_no_gm = StripMotionPhotoMetadata(no_gm);
+  EXPECT_EQ(stripped_no_gm.find("Container:Version"), std::string::npos);
+  EXPECT_EQ(stripped_no_gm.find("MotionPhoto"), std::string::npos);
+  EXPECT_EQ(stripped_no_gm.find("xmlns:Camera"), std::string::npos);
+  EXPECT_EQ(stripped_no_gm.find("xmlns:Container"), std::string::npos);
+  EXPECT_EQ(stripped_no_gm.find("xmlns:Item"), std::string::npos);
 }
 
 }  // namespace

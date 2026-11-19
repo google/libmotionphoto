@@ -34,9 +34,11 @@ namespace api {
 
 namespace fs = std::filesystem;
 
-// 1. Test ParseMotionPhotoFromFile with native MotionPhotoMetadata facade struct
+// 1. Test ParseMotionPhotoFromFile with native MotionPhotoMetadata facade
+// struct
 TEST(LibMotionPhotoApiTest, ParseMotionPhotoFromFileJpeg) {
-  std::string file_path = "lib/core/motion_photo/testdata/motion_photo_single_video_track.MP.jpg";
+  std::string file_path =
+      "lib/core/motion_photo/testdata/motion_photo_single_video_track.MP.jpg";
   MotionPhotoMetadata metadata;
   bool success = ParseMotionPhotoFromFile(file_path, &metadata);
   EXPECT_TRUE(success);
@@ -49,7 +51,8 @@ TEST(LibMotionPhotoApiTest, ParseMotionPhotoFromFileJpeg) {
 }
 
 TEST(LibMotionPhotoApiTest, ParseMotionPhotoFromFileHeic) {
-  std::string file_path = "lib/core/motion_photo/testdata/motion_photo_single_video_track.MP.heic";
+  std::string file_path =
+      "lib/core/motion_photo/testdata/motion_photo_single_video_track.MP.heic";
   MotionPhotoMetadata metadata;
   bool success = ParseMotionPhotoFromFile(file_path, &metadata);
   EXPECT_TRUE(success);
@@ -87,7 +90,8 @@ TEST(LibMotionPhotoApiTest, ParseMotionPhotoHeicWithoutVideo) {
 
 // 2. Test ParseMotionPhotoFromFd
 TEST(LibMotionPhotoApiTest, ParseMotionPhotoFromFd) {
-  std::string file_path = "lib/core/motion_photo/testdata/motion_photo_single_video_track.MP.jpg";
+  std::string file_path =
+      "lib/core/motion_photo/testdata/motion_photo_single_video_track.MP.jpg";
   int fd = open(file_path.c_str(), O_RDONLY);
   EXPECT_TRUE(fd >= 0);
 
@@ -102,17 +106,18 @@ TEST(LibMotionPhotoApiTest, ParseMotionPhotoFromFd) {
 
 // 3. Test CheckMotionPhoto with File, Fd, and Memory
 TEST(LibMotionPhotoApiTest, CheckMotionPhotoFileValid) {
-  std::string file_path = "lib/core/motion_photo/testdata/motion_photo_single_video_track.MP.jpg";
+  std::string file_path =
+      "lib/core/motion_photo/testdata/motion_photo_single_video_track.MP.jpg";
   std::vector<std::string> messages;
-  int status = CheckMotionPhotoFromFile(file_path, [&](const std::string& msg) {
-    messages.push_back(msg);
-  });
+  int status = CheckMotionPhotoFromFile(
+      file_path, [&](const std::string& msg) { messages.push_back(msg); });
   EXPECT_EQ(status, 0);
   EXPECT_FALSE(messages.empty());
 }
 
 TEST(LibMotionPhotoApiTest, CheckMotionPhotoFromFdAndMemoryValid) {
-  std::string file_path = "lib/core/motion_photo/testdata/motion_photo_single_video_track.MP.jpg";
+  std::string file_path =
+      "lib/core/motion_photo/testdata/motion_photo_single_video_track.MP.jpg";
   int fd = open(file_path.c_str(), O_RDONLY);
   EXPECT_TRUE(fd >= 0);
   size_t file_size = fs::file_size(file_path);
@@ -127,7 +132,8 @@ TEST(LibMotionPhotoApiTest, CheckMotionPhotoFromFdAndMemoryValid) {
 
 // 4. Test ExtractPrimaryImage with File, Fd, and Memory
 TEST(LibMotionPhotoApiTest, ExtractPrimaryImageTriadValid) {
-  std::string input_path = "lib/core/motion_photo/testdata/motion_photo_single_video_track.MP.jpg";
+  std::string input_path =
+      "lib/core/motion_photo/testdata/motion_photo_single_video_track.MP.jpg";
   size_t file_size = fs::file_size(input_path);
 
   // File
@@ -155,7 +161,8 @@ TEST(LibMotionPhotoApiTest, ExtractPrimaryImageTriadValid) {
   std::ifstream infile(input_path, std::ios::binary);
   std::vector<uint8_t> buffer(file_size);
   EXPECT_TRUE(infile.read(reinterpret_cast<char*>(buffer.data()), file_size));
-  EXPECT_TRUE(ExtractPrimaryImageFromMemory(buffer.data(), buffer.size(), out_mem));
+  EXPECT_TRUE(
+      ExtractPrimaryImageFromMemory(buffer.data(), buffer.size(), out_mem));
   EXPECT_TRUE(fs::exists(out_mem));
   EXPECT_TRUE(fs::file_size(out_mem) > 0);
   fs::remove(out_mem);
@@ -163,7 +170,8 @@ TEST(LibMotionPhotoApiTest, ExtractPrimaryImageTriadValid) {
 
 // 5. Test ExtractVideoTrack with File, Fd, and Memory
 TEST(LibMotionPhotoApiTest, ExtractVideoTrackTriadValid) {
-  std::string input_path = "lib/core/motion_photo/testdata/motion_photo_single_video_track.MP.jpg";
+  std::string input_path =
+      "lib/core/motion_photo/testdata/motion_photo_single_video_track.MP.jpg";
   size_t file_size = fs::file_size(input_path);
 
   // File
@@ -191,7 +199,8 @@ TEST(LibMotionPhotoApiTest, ExtractVideoTrackTriadValid) {
   std::ifstream infile(input_path, std::ios::binary);
   std::vector<uint8_t> buffer(file_size);
   EXPECT_TRUE(infile.read(reinterpret_cast<char*>(buffer.data()), file_size));
-  EXPECT_TRUE(ExtractVideoTrackFromMemory(buffer.data(), buffer.size(), out_mem));
+  EXPECT_TRUE(
+      ExtractVideoTrackFromMemory(buffer.data(), buffer.size(), out_mem));
   EXPECT_TRUE(fs::exists(out_mem));
   EXPECT_TRUE(fs::file_size(out_mem) > 0);
   fs::remove(out_mem);
@@ -199,7 +208,8 @@ TEST(LibMotionPhotoApiTest, ExtractVideoTrackTriadValid) {
 
 // 6. Test ExtractMotionPhoto (Multi-Output) with File, Fd, and Memory
 TEST(LibMotionPhotoApiTest, ExtractMotionPhotoMultiOutputTriadValid) {
-  std::string input_path = "lib/core/motion_photo/testdata/motion_photo_single_video_track.MP.jpg";
+  std::string input_path =
+      "lib/core/motion_photo/testdata/motion_photo_single_video_track.MP.jpg";
   size_t file_size = fs::file_size(input_path);
 
   ExtractorParams params;
@@ -228,7 +238,8 @@ TEST(LibMotionPhotoApiTest, ExtractMotionPhotoMultiOutputTriadValid) {
   std::ifstream infile(input_path, std::ios::binary);
   std::vector<uint8_t> buffer(file_size);
   EXPECT_TRUE(infile.read(reinterpret_cast<char*>(buffer.data()), file_size));
-  EXPECT_TRUE(ExtractMotionPhotoFromMemory(buffer.data(), buffer.size(), params));
+  EXPECT_TRUE(
+      ExtractMotionPhotoFromMemory(buffer.data(), buffer.size(), params));
   EXPECT_TRUE(fs::exists(params.primary_image_output_path));
   EXPECT_TRUE(fs::exists(params.video_output_path));
   fs::remove(params.primary_image_output_path);
@@ -255,7 +266,8 @@ TEST(LibMotionPhotoApiTest, ExtractHeicTriadValid) {
   ASSERT_TRUE(infile.read(reinterpret_cast<char*>(buffer.data()), file_size));
 
   // 1. ExtractPrimaryImage (File / Fd / Memory)
-  std::string img_file = (test_dir / "extracted_heic_primary_file.heic").string();
+  std::string img_file =
+      (test_dir / "extracted_heic_primary_file.heic").string();
   std::string img_fd = (test_dir / "extracted_heic_primary_fd.heic").string();
   std::string img_mem = (test_dir / "extracted_heic_primary_mem.heic").string();
   if (fs::exists(img_file)) fs::remove(img_file);
@@ -267,7 +279,8 @@ TEST(LibMotionPhotoApiTest, ExtractHeicTriadValid) {
   ASSERT_TRUE(fd >= 0);
   EXPECT_TRUE(ExtractPrimaryImageFromFd(fd, 0, file_size, img_fd));
   close(fd);
-  EXPECT_TRUE(ExtractPrimaryImageFromMemory(buffer.data(), buffer.size(), img_mem));
+  EXPECT_TRUE(
+      ExtractPrimaryImageFromMemory(buffer.data(), buffer.size(), img_mem));
 
   ASSERT_TRUE(fs::exists(img_file));
   ASSERT_TRUE(fs::exists(img_fd));
@@ -277,10 +290,17 @@ TEST(LibMotionPhotoApiTest, ExtractHeicTriadValid) {
   EXPECT_TRUE(fs::file_size(img_file) > 0u);
   EXPECT_EQ(fs::file_size(img_file), fs::file_size(img_fd));
   EXPECT_EQ(fs::file_size(img_file), fs::file_size(img_mem));
-  // Extracted still image from File has MotionPhoto XMP stripped and no mpvd box.
+  // Extracted still image from File/Fd/Memory has MotionPhoto XMP stripped and
+  // no mpvd box.
   EXPECT_FALSE(ParseMotionPhotoFromFile(img_file, nullptr));
   EXPECT_FALSE(ParseMotionPhotoFromFile(img_fd, nullptr));
   EXPECT_FALSE(ParseMotionPhotoFromFile(img_mem, nullptr));
+  for (const std::string& extracted_path : {img_file, img_fd, img_mem}) {
+    std::ifstream in(extracted_path, std::ios::binary);
+    std::string bytes((std::istreambuf_iterator<char>(in)),
+                      std::istreambuf_iterator<char>());
+    EXPECT_EQ(bytes.find("MotionPhoto="), std::string::npos);
+  }
   fs::remove(img_file);
   fs::remove(img_fd);
   fs::remove(img_mem);
@@ -298,7 +318,8 @@ TEST(LibMotionPhotoApiTest, ExtractHeicTriadValid) {
   ASSERT_TRUE(fd >= 0);
   EXPECT_TRUE(ExtractVideoTrackFromFd(fd, 0, file_size, vid_fd));
   close(fd);
-  EXPECT_TRUE(ExtractVideoTrackFromMemory(buffer.data(), buffer.size(), vid_mem));
+  EXPECT_TRUE(
+      ExtractVideoTrackFromMemory(buffer.data(), buffer.size(), vid_mem));
 
   ASSERT_TRUE(fs::exists(vid_file));
   ASSERT_TRUE(fs::exists(vid_fd));
@@ -310,7 +331,8 @@ TEST(LibMotionPhotoApiTest, ExtractHeicTriadValid) {
   fs::remove(vid_fd);
   fs::remove(vid_mem);
 
-  // 3. ExtractMotionPhoto (still image + video + metadata) from File / Fd / Memory
+  // 3. ExtractMotionPhoto (still image + video + metadata) from File / Fd /
+  // Memory
   ExtractorParams params;
   params.motion_photo_filepath = input_path;
   params.primary_image_output_path =
@@ -341,7 +363,8 @@ TEST(LibMotionPhotoApiTest, ExtractHeicTriadValid) {
   fs::remove(params.video_output_path);
   fs::remove(params.metadata_output_path);
 
-  EXPECT_TRUE(ExtractMotionPhotoFromMemory(buffer.data(), buffer.size(), params));
+  EXPECT_TRUE(
+      ExtractMotionPhotoFromMemory(buffer.data(), buffer.size(), params));
   EXPECT_TRUE(fs::exists(params.primary_image_output_path));
   EXPECT_TRUE(fs::exists(params.video_output_path));
   EXPECT_TRUE(fs::exists(params.metadata_output_path));
@@ -354,9 +377,9 @@ TEST(LibMotionPhotoApiTest, ExtractHeicTriadValid) {
   // out the exact primary .heic image and exact .mp4 video without the trailing
   // box.
   std::vector<uint8_t> heic_with_trailing = buffer;
-  const uint8_t trailing_sefd_box[16] = {
-      0x00, 0x00, 0x00, 0x10, 's', 'e', 'f', 'd',
-      0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};
+  const uint8_t trailing_sefd_box[16] = {0x00, 0x00, 0x00, 0x10, 's',  'e',
+                                         'f',  'd',  0x01, 0x02, 0x03, 0x04,
+                                         0x05, 0x06, 0x07, 0x08};
   heic_with_trailing.insert(heic_with_trailing.end(),
                             std::begin(trailing_sefd_box),
                             std::end(trailing_sefd_box));
@@ -385,11 +408,11 @@ TEST(LibMotionPhotoApiTest, ExtractHeicTriadValid) {
 
   std::string trailing_mem_vid =
       (test_dir / "extracted_trailing_heic_mem_vid.mp4").string();
-  EXPECT_TRUE(ExtractVideoTrackFromMemory(heic_with_trailing.data(),
-                                          heic_with_trailing.size(),
-                                          trailing_mem_vid));
+  EXPECT_TRUE(ExtractVideoTrackFromMemory(
+      heic_with_trailing.data(), heic_with_trailing.size(), trailing_mem_vid));
   // Video track from memory must match the extracted video from file
-  // (excluding the 16-byte trailing 'sefd' box and with metadata track stripped).
+  // (excluding the 16-byte trailing 'sefd' box and with metadata track
+  // stripped).
   EXPECT_EQ(fs::file_size(trailing_mem_vid),
             fs::file_size(trailing_params.video_output_path));
 
@@ -398,7 +421,8 @@ TEST(LibMotionPhotoApiTest, ExtractHeicTriadValid) {
 
 // 7. Test ExtractAgtm with File, Fd, and Memory
 TEST(LibMotionPhotoApiTest, ExtractAgtmFromFileAndFdValid) {
-  std::string file_path = "lib/core/motion_photo/testdata/motion_photo_agtm.MP.jpg";
+  std::string file_path =
+      "lib/core/motion_photo/testdata/motion_photo_agtm.MP.jpg";
   size_t file_size = fs::file_size(file_path);
 
   EXPECT_EQ(ExtractAgtmFromFile(file_path), 0);
@@ -410,7 +434,8 @@ TEST(LibMotionPhotoApiTest, ExtractAgtmFromFileAndFdValid) {
 }
 
 TEST(LibMotionPhotoApiTest, ExtractAgtmFromMemoryValid) {
-  std::string file_path = "lib/core/motion_photo/testdata/motion_photo_agtm.MP.jpg";
+  std::string file_path =
+      "lib/core/motion_photo/testdata/motion_photo_agtm.MP.jpg";
   std::ifstream file(file_path, std::ios::binary | std::ios::ate);
   EXPECT_TRUE(file.is_open());
   std::streamsize size = file.tellg();
@@ -419,9 +444,9 @@ TEST(LibMotionPhotoApiTest, ExtractAgtmFromMemoryValid) {
   EXPECT_TRUE(file.read(reinterpret_cast<char*>(buffer.data()), size));
 
   std::string output_json;
-  int status = ExtractAgtmFromMemory(buffer.data(), buffer.size(), [&](const std::string& msg) {
-    output_json += msg;
-  });
+  int status = ExtractAgtmFromMemory(
+      buffer.data(), buffer.size(),
+      [&](const std::string& msg) { output_json += msg; });
   EXPECT_EQ(status, 0);
   EXPECT_FALSE(output_json.empty());
   EXPECT_NE(output_json.find("hdrReferenceWhite"), std::string::npos);
@@ -429,12 +454,15 @@ TEST(LibMotionPhotoApiTest, ExtractAgtmFromMemoryValid) {
 
 // 6. Test BuildMotionPhotoFromFile
 TEST(LibMotionPhotoApiTest, BuildMotionPhotoFromFileValid) {
-  std::string image_path = "lib/core/motion_photo/testdata/motion_photo_photo_only.jpg";
-  std::string video_path = "lib/core/motion_photo/testdata/motion_photo_video_only.mp4";
+  std::string image_path =
+      "lib/core/motion_photo/testdata/motion_photo_photo_only.jpg";
+  std::string video_path =
+      "lib/core/motion_photo/testdata/motion_photo_video_only.mp4";
   std::string output_path = "/tmp/built_motion_photo_api_test.jpg";
   if (fs::exists(output_path)) fs::remove(output_path);
 
-  int status = BuildMotionPhotoFromFile(image_path, video_path, output_path, 500000);
+  int status =
+      BuildMotionPhotoFromFile(image_path, video_path, output_path, 500000);
   EXPECT_EQ(status, 0);
   EXPECT_TRUE(fs::exists(output_path));
   EXPECT_TRUE(fs::file_size(output_path) > 0);
@@ -630,7 +658,8 @@ TEST(LibMotionPhotoApiTest, LargeTrailerZeroCopyDetectionFromFdAndMemory) {
       "<rdf:li rdf:parseType='Resource'><Container:Item "
       "Item:Semantic='MotionPhoto' Item:Mime='video/mp4' "
       "Item:Length='2097152'/></rdf:li>"
-      "</rdf:Seq></Container:Directory></rdf:Description></rdf:RDF></x:xmpmeta>";
+      "</rdf:Seq></Container:Directory></rdf:Description></rdf:RDF></"
+      "x:xmpmeta>";
 
   std::vector<uint8_t> file_bytes;
   file_bytes.push_back(0xFF);
@@ -676,9 +705,10 @@ TEST(LibMotionPhotoApiTest, LargeTrailerZeroCopyDetectionFromFdAndMemory) {
   EXPECT_TRUE(ParseMotionPhotoFromFd(
       fd, 0, static_cast<int64_t>(file_bytes.size()), &fd_meta));
   // Passing a length larger than the actual file size causes a short pread
-  // near the aligned tail window where total_bytes_read <= (begin - read_begin);
-  // FdDataSource must safely return nullptr (and ParseMotionPhotoFromFd returns
-  // false) without creating an out-of-range DataSegment or crashing.
+  // near the aligned tail window where total_bytes_read <= (begin -
+  // read_begin); FdDataSource must safely return nullptr (and
+  // ParseMotionPhotoFromFd returns false) without creating an out-of-range
+  // DataSegment or crashing.
   MotionPhotoMetadata inflated_fd_meta;
   EXPECT_FALSE(ParseMotionPhotoFromFd(
       fd, 0, static_cast<int64_t>(file_bytes.size() + 2048),
@@ -687,6 +717,55 @@ TEST(LibMotionPhotoApiTest, LargeTrailerZeroCopyDetectionFromFdAndMemory) {
   std::remove(tmp_path.c_str());
   EXPECT_TRUE(fd_meta.is_motion_photo);
   EXPECT_EQ(fd_meta.video_length, static_cast<int64_t>(kLargeTrailerSize));
+}
+
+TEST(LibMotionPhotoApiTest,
+     ExtractPrimaryImageHeic_SingleTrackAndMpvdBeforeMeta) {
+  const char* test_tmpdir = std::getenv("TEST_TMPDIR");
+  fs::path base_dir = (test_tmpdir != nullptr && test_tmpdir[0] != '\0')
+                          ? fs::path(test_tmpdir)
+                          : fs::temp_directory_path();
+  fs::path test_dir = base_dir / "HeicExtractFallbackTest";
+  fs::create_directories(test_dir);
+
+  // 1. Extracted still from motion_photo_single_video_track.MP.heic retains
+  // zero Container:Version="1" or MotionPhoto tags.
+  const std::string kHeicMp =
+      "lib/core/motion_photo/testdata/motion_photo_single_video_track.MP.heic";
+  const std::string out_still = (test_dir / "single_track_still.heic").string();
+  ASSERT_TRUE(ExtractPrimaryImageFromFile(kHeicMp, out_still));
+  MotionPhotoMetadata still_meta;
+  EXPECT_FALSE(ParseMotionPhotoFromFile(out_still, &still_meta) &&
+               still_meta.is_motion_photo);
+  {
+    std::ifstream in(out_still, std::ios::binary);
+    std::string content((std::istreambuf_iterator<char>(in)),
+                        std::istreambuf_iterator<char>());
+    EXPECT_EQ(content.find("Container:Version"), std::string::npos);
+    EXPECT_EQ(content.find("MotionPhoto"), std::string::npos);
+  }
+  fs::remove(out_still);
+
+  // 2. Non-trailing 'mpvd' (followed by trailing 'free' box) must rebuild
+  // complete still rather than truncating at mpvd_start.
+  std::ifstream src_in(kHeicMp, std::ios::binary);
+  std::vector<uint8_t> heic_bytes((std::istreambuf_iterator<char>(src_in)),
+                                  std::istreambuf_iterator<char>());
+  ASSERT_TRUE(heic_bytes.size() > 100u);
+  std::vector<uint8_t> non_trailing = heic_bytes;
+  const uint8_t kFreeBox[8] = {0, 0, 0, 8, 'f', 'r', 'e', 'e'};
+  non_trailing.insert(non_trailing.end(), std::begin(kFreeBox),
+                      std::end(kFreeBox));
+
+  const std::string out_mem_rebuilt =
+      (test_dir / "rebuilt_non_trailing_mpvd.heic").string();
+  ASSERT_TRUE(ExtractPrimaryImageFromMemory(
+      non_trailing.data(), non_trailing.size(), out_mem_rebuilt));
+  EXPECT_TRUE(fs::file_size(out_mem_rebuilt) > 1000u);
+  MotionPhotoMetadata rebuilt_meta;
+  EXPECT_FALSE(ParseMotionPhotoFromFile(out_mem_rebuilt, &rebuilt_meta) &&
+               rebuilt_meta.is_motion_photo);
+  fs::remove_all(test_dir);
 }
 
 }  // namespace api

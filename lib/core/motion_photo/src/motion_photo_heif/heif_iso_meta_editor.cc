@@ -49,6 +49,7 @@ constexpr uint32_t kIinf = FourCc("iinf");
 constexpr uint32_t kInfe = FourCc("infe");
 constexpr uint32_t kIloc = FourCc("iloc");
 constexpr uint32_t kIref = FourCc("iref");
+constexpr uint32_t kIdat = FourCc("idat");
 constexpr uint32_t kCdsc = FourCc("cdsc");
 constexpr uint32_t kMime = FourCc("mime");
 
@@ -110,9 +111,9 @@ bool FitsIn(uint64_t value, size_t num_bytes) {
 }
 
 struct Box {
-  size_t offset = 0;      // Absolute offset of the box header.
-  size_t size = 0;        // Total box size, including the header.
-  size_t header = 0;      // Header length (8, or 16 for a 64-bit size).
+  size_t offset = 0;  // Absolute offset of the box header.
+  size_t size = 0;    // Total box size, including the header.
+  size_t header = 0;  // Header length (8, or 16 for a 64-bit size).
   uint32_t type = 0;
   bool size_was_zero = false;  // The box size field was 0 ("to end of file").
 
@@ -218,7 +219,8 @@ bool ParseIloc(const uint8_t* payload, size_t size, Iloc* iloc) {
       return false;
     }
     const size_t extent_bytes = index_size + offset_size + length_size;
-    if (extent_bytes > 0 && extent_count > r.remaining() / extent_bytes) {
+    if ((extent_bytes == 0 && extent_count > 1) ||
+        (extent_bytes > 0 && extent_count > r.remaining() / extent_bytes)) {
       return false;
     }
     for (uint64_t e = 0; e < extent_count; ++e) {
@@ -275,6 +277,7 @@ struct InfeEntry {
   uint32_t id = 0;
   uint32_t item_type = 0;
   std::string_view content_type;
+  std::string_view content_encoding;
   size_t offset = 0;  // Absolute offset of the 'infe' box.
   size_t size = 0;
 };
@@ -315,8 +318,11 @@ bool ParseIinf(const uint8_t* data, const Box& box, Iinf* iinf) {
       std::string_view name;
       if (!e.ReadUint(4, &item_type) || !e.ReadCString(&name)) return false;
       entry.item_type = static_cast<uint32_t>(item_type);
-      if (entry.item_type == kMime && !e.ReadCString(&entry.content_type)) {
-        return false;
+      if (entry.item_type == kMime) {
+        if (!e.ReadCString(&entry.content_type)) return false;
+        if (e.remaining() > 0 && !e.ReadCString(&entry.content_encoding)) {
+          return false;
+        }
       }
     }
     iinf->entries.push_back(entry);
@@ -541,6 +547,7 @@ bool HeifIsoMetaEditor::SetPrimaryXmp(const uint8_t* data, size_t size,
 
   // 3. Locate the XMP item describing the primary image.
   std::optional<uint32_t> xmp_id;
+  const InfeEntry* xmp_infe = nullptr;
   uint32_t max_id = 0;
   for (const InfeEntry& entry : iinf.entries) {
     max_id = std::max(max_id, entry.id);
@@ -552,6 +559,7 @@ bool HeifIsoMetaEditor::SetPrimaryXmp(const uint8_t* data, size_t size,
       if (ref.type == kCdsc && ref.from == entry.id &&
           std::find(ref.to.begin(), ref.to.end(), primary_id) != ref.to.end()) {
         xmp_id = entry.id;
+        xmp_infe = &entry;
         break;
       }
     }
@@ -577,10 +585,15 @@ bool HeifIsoMetaEditor::SetPrimaryXmp(const uint8_t* data, size_t size,
     }
   }
 
+  if (has_moov) {
+    return Fail(error, "Image sequences ('moov') are not supported");
+  }
+
   // 4a. Fast path: overwrite the existing XMP bytes in place when the new XMP
   // fits and nothing in front of the image data has to move.
   if (xmp_item != nullptr && xmp_item->IsFileOffset() &&
-      xmp_item->extents.size() == 1 && !removed_box_before_kept_box) {
+      xmp_item->extents.size() == 1 && !removed_box_before_kept_box &&
+      xmp_infe != nullptr && xmp_infe->content_encoding.empty()) {
     const IlocExtent& extent = xmp_item->extents[0];
     const Box* box = FindContainingBox(kept, extent.offset, extent.length);
     if (box != nullptr && box->type != kMeta && xmp.size() <= extent.length &&
@@ -603,17 +616,20 @@ bool HeifIsoMetaEditor::SetPrimaryXmp(const uint8_t* data, size_t size,
 
   // 4b. General path: rebuild 'meta' and append the XMP payload in a new
   // 'mdat' box at the end of the image.
-  if (has_moov) {
-    return Fail(error, "Image sequences ('moov') are not supported");
-  }
-  std::optional<IlocExtent> orphaned_xmp_extent;
-  if (xmp_item != nullptr && xmp_item->IsFileOffset() &&
-      xmp_item->extents.size() == 1) {
-    const IlocExtent& extent = xmp_item->extents[0];
-    const Box* box = FindContainingBox(kept, extent.offset, extent.length);
-    if (box != nullptr && box->type != kMeta &&
-        !IsShared(iloc, xmp_item->id, extent)) {
-      orphaned_xmp_extent = extent;
+  std::vector<IlocExtent> orphaned_file_extents;
+  std::vector<IlocExtent> orphaned_idat_extents;
+  if (xmp_item != nullptr) {
+    for (const IlocExtent& extent : xmp_item->extents) {
+      if (xmp_item->IsFileOffset()) {
+        const Box* box = FindContainingBox(kept, extent.offset, extent.length);
+        if (box != nullptr && box->type != kMeta &&
+            !IsShared(iloc, xmp_item->id, extent)) {
+          orphaned_file_extents.push_back(extent);
+        }
+      } else if (xmp_item->construction_method == 1 &&
+                 !IsShared(iloc, xmp_item->id, extent)) {
+        orphaned_idat_extents.push_back(extent);
+      }
     }
   }
 
@@ -650,8 +666,14 @@ bool HeifIsoMetaEditor::SetPrimaryXmp(const uint8_t* data, size_t size,
     WriteUint(&new_iinf, iinf.flags, 3);
     WriteUint(&new_iinf, count, version == 0 ? 2 : 4);
     for (const InfeEntry& entry : iinf.entries) {
-      new_iinf.insert(new_iinf.end(), data + entry.offset,
-                      data + entry.offset + entry.size);
+      if (xmp_id.has_value() && entry.id == *xmp_id &&
+          !entry.content_encoding.empty()) {
+        std::vector<uint8_t> rewritten = SerializeXmpInfe(entry.id);
+        new_iinf.insert(new_iinf.end(), rewritten.begin(), rewritten.end());
+      } else {
+        new_iinf.insert(new_iinf.end(), data + entry.offset,
+                        data + entry.offset + entry.size);
+      }
     }
     if (new_xmp_id != 0) {
       std::vector<uint8_t> infe = SerializeXmpInfe(new_xmp_id);
@@ -671,8 +693,8 @@ bool HeifIsoMetaEditor::SetPrimaryXmp(const uint8_t* data, size_t size,
   }
   const size_t length_size = FitsIn(max_length, 4) ? 4 : 8;
   const size_t iloc_size_wide = SerializeIloc(iloc, 8, length_size).size();
-  uint64_t meta_upper_bound = meta_box.size + new_iinf.size() + new_iref.size() +
-                              iloc_size_wide + 16;
+  uint64_t meta_upper_bound =
+      meta_box.size + new_iinf.size() + new_iref.size() + iloc_size_wide + 16;
   const uint64_t total_upper_bound =
       static_cast<uint64_t>(size) + meta_upper_bound + xmp.size() + 16;
   const size_t offset_size = FitsIn(total_upper_bound, 4) ? 4 : 8;
@@ -684,7 +706,8 @@ bool HeifIsoMetaEditor::SetPrimaryXmp(const uint8_t* data, size_t size,
       }
     }
   }
-  const size_t new_iloc_size = SerializeIloc(iloc, offset_size, length_size).size();
+  const size_t new_iloc_size =
+      SerializeIloc(iloc, offset_size, length_size).size();
 
   // New 'meta' size.
   size_t meta_payload = 4;  // version + flags
@@ -709,7 +732,8 @@ bool HeifIsoMetaEditor::SetPrimaryXmp(const uint8_t* data, size_t size,
   size_t cursor = 0;
   for (size_t i = 0; i < kept.size(); ++i) {
     new_offsets[i] = cursor;
-    const size_t box_size = kept[i].type == kMeta ? new_meta_size : kept[i].size;
+    const size_t box_size =
+        kept[i].type == kMeta ? new_meta_size : kept[i].size;
     if (kept[i].size_was_zero &&
         (!FitsIn(kept[i].size, 4) || kept[i].header != 8)) {
       return Fail(error, "Unsupported box size");
@@ -775,6 +799,13 @@ bool HeifIsoMetaEditor::SetPrimaryXmp(const uint8_t* data, size_t size,
     // version + flags
     output->insert(output->end(), data + box.offset + box.header,
                    data + box.offset + box.header + 4);
+    if (iref_box == nullptr && !meta_children.empty() &&
+        meta_children.back().size_was_zero) {
+      if (!FitsIn(meta_children.back().size, 4) ||
+          meta_children.back().header != 8) {
+        return Fail(error, "Unsupported 'meta' child box size");
+      }
+    }
     for (const Box& child : meta_children) {
       if (&child == iinf_box) {
         output->insert(output->end(), new_iinf.begin(), new_iinf.end());
@@ -783,7 +814,22 @@ bool HeifIsoMetaEditor::SetPrimaryXmp(const uint8_t* data, size_t size,
       } else if (&child == iref_box) {
         output->insert(output->end(), new_iref.begin(), new_iref.end());
       } else {
+        const size_t child_start = output->size();
         output->insert(output->end(), data + child.offset, data + child.end());
+        if (child.size_was_zero && iref_box == nullptr) {
+          PatchUint32(output, child_start, static_cast<uint32_t>(child.size));
+        }
+        if (child.type == kIdat && !orphaned_idat_extents.empty()) {
+          const size_t idat_payload_len = child.size - child.header;
+          for (const IlocExtent& extent : orphaned_idat_extents) {
+            if (extent.offset <= idat_payload_len &&
+                extent.length <= idat_payload_len - extent.offset) {
+              std::memset(output->data() + child_start + child.header +
+                              static_cast<size_t>(extent.offset),
+                          ' ', static_cast<size_t>(extent.length));
+            }
+          }
+        }
       }
     }
     if (iref_box == nullptr) {
@@ -805,15 +851,14 @@ bool HeifIsoMetaEditor::SetPrimaryXmp(const uint8_t* data, size_t size,
 
   // Blank the superseded XMP payload so stale metadata cannot be picked up by
   // tools that scan for XMP packets instead of following 'iloc'.
-  if (orphaned_xmp_extent.has_value()) {
+  for (const IlocExtent& extent : orphaned_file_extents) {
     for (size_t i = 0; i < kept.size(); ++i) {
       const Box& box = kept[i];
-      const IlocExtent& extent = *orphaned_xmp_extent;
       if (extent.offset >= box.offset && extent.offset <= box.end() &&
           extent.length <= box.end() - extent.offset && box.type != kMeta) {
-        std::memset(output->data() + new_offsets[i] +
-                        (extent.offset - box.offset),
-                    ' ', extent.length);
+        std::memset(
+            output->data() + new_offsets[i] + (extent.offset - box.offset), ' ',
+            extent.length);
         break;
       }
     }

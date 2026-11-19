@@ -251,16 +251,6 @@ std::optional<BoxLocation> FindTopLevelBox(image_io::DataSource* data_source,
   return std::nullopt;
 }
 
-// Returns true if the file has a valid top-level 'mpvd' box, which holds the
-// motion photo video in HEIF motion photos. This uses the same check as
-// MotionPhotoHeifInfoBuilder.
-bool HasMpvdBox(image_io::DataSource* data_source) {
-  MpvdBox mpvd_box;
-  MpvdBoxScanReceiver receiver(mpvd_box);
-  MpvdBox::Scan(data_source, 0, receiver);
-  return mpvd_box.IsValid();
-}
-
 // A byte range inside the in-memory copy of the 'meta' box payload.
 struct ByteRange {
   const uint8_t* data = nullptr;
@@ -539,9 +529,13 @@ std::optional<size_t> ReadItemData(image_io::DataSource* data_source,
   return first_extent_offset;
 }
 
-// Returns the XMP of the primary image as a "standard.xmp" block.
+// Returns the XMP of the primary image as a "standard.xmp" block. If
+// `out_contiguous` is non-null, sets it to true only when all extents form a
+// single contiguous byte range in the file.
 std::optional<RawMetadataBlock> ExtractPrimaryXmp(
-    image_io::DataSource* data_source, size_t file_size) {
+    image_io::DataSource* data_source, size_t file_size,
+    bool* out_contiguous = nullptr) {
+  if (out_contiguous != nullptr) *out_contiguous = false;
   std::optional<BoxLocation> meta =
       FindTopLevelBox(data_source, file_size, "meta");
   if (!meta.has_value() || meta->payload_size > kMaxMetaPayloadSize) {
@@ -581,6 +575,21 @@ std::optional<RawMetadataBlock> ExtractPrimaryXmp(
     return std::nullopt;
   }
   block.offset = *offset;
+  if (out_contiguous != nullptr) {
+    bool contiguous = !location->extents.empty();
+    uint64_t expected_next =
+        location->extents.empty()
+            ? 0
+            : location->base_offset + location->extents[0].first;
+    for (const auto& [ext_off, ext_len] : location->extents) {
+      if (location->base_offset + ext_off != expected_next) {
+        contiguous = false;
+        break;
+      }
+      expected_next += ext_len;
+    }
+    *out_contiguous = contiguous;
+  }
   return block;
 }
 
@@ -597,13 +606,12 @@ class HeifContainerSplitter : public ContainerSplitter {
     }
     std::optional<BoxLocation> mpvd =
         FindTopLevelBox(data_source, file_size, "mpvd");
-    if (!mpvd.has_value()) {
-      return blocks;
-    }
-    std::optional<RawMetadataBlock> xmp_block =
-        ExtractPrimaryXmp(data_source, file_size);
-    if (xmp_block.has_value()) {
-      blocks.push_back(*std::move(xmp_block));
+    if (mpvd.has_value()) {
+      std::optional<RawMetadataBlock> xmp_block =
+          ExtractPrimaryXmp(data_source, file_size);
+      if (xmp_block.has_value()) {
+        blocks.push_back(*std::move(xmp_block));
+      }
     }
     std::optional<BoxLocation> sefd =
         FindTopLevelBox(data_source, file_size, "sefd");
@@ -612,8 +620,10 @@ class HeifContainerSplitter : public ContainerSplitter {
       RawMetadataBlock sefd_block;
       sefd_block.type = "SEFD";
       sefd_block.format_identifier = "heic.sefd";
-      sefd_block.offset = mpvd->payload_offset;
-      sefd_block.total_payload_size = mpvd->payload_size;
+      sefd_block.offset =
+          mpvd.has_value() ? mpvd->payload_offset : sefd->payload_offset;
+      sefd_block.total_payload_size =
+          mpvd.has_value() ? mpvd->payload_size : sefd->payload_size;
       if (AppendFromDataSource(data_source, sefd->payload_offset,
                                sefd->payload_size, &sefd_block.bytes)) {
         blocks.push_back(std::move(sefd_block));
@@ -634,9 +644,10 @@ image_io::DataRange FindHeifPrimaryXmpRange(image_io::DataSource* data_source,
   if (data_source == nullptr || file_size == 0) {
     return image_io::DataRange();
   }
+  bool contiguous = false;
   std::optional<RawMetadataBlock> xmp_block =
-      ExtractPrimaryXmp(data_source, file_size);
-  if (!xmp_block.has_value() || xmp_block->bytes.empty()) {
+      ExtractPrimaryXmp(data_source, file_size, &contiguous);
+  if (!contiguous || !xmp_block.has_value() || xmp_block->bytes.empty()) {
     return image_io::DataRange();
   }
   return image_io::DataRange(xmp_block->offset,

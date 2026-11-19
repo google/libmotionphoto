@@ -76,27 +76,30 @@ string Track(TrackId track_id) {
 
 bool WriteToOutput(const std::string& inputFilePath,
                    const std::string& outputFilePath,
-                   std::streamoff beginOffset,
-                   std::streamoff endOffset) {
+                   std::streamoff beginOffset, std::streamoff endOffset) {
   if (beginOffset < 0 || endOffset <= beginOffset) {
-    std::cerr << "Error: Invalid range (end must be > begin and both >= 0)." << std::endl;
+    std::cerr << "Error: Invalid range (end must be > begin and both >= 0)."
+              << std::endl;
     return false;
   }
 
   std::ifstream inputFile(inputFilePath, std::ios::in | std::ios::binary);
   if (!inputFile.is_open()) {
-    std::cerr << "Error: Could not open input file: " << inputFilePath << std::endl;
+    std::cerr << "Error: Could not open input file: " << inputFilePath
+              << std::endl;
     return false;
   }
 
   std::ofstream outputFile(outputFilePath, std::ios::out | std::ios::binary);
   if (!outputFile.is_open()) {
-    std::cerr << "Error: Could not open output file: " << outputFilePath << std::endl;
+    std::cerr << "Error: Could not open output file: " << outputFilePath
+              << std::endl;
     return false;
   }
 
   if (!inputFile.seekg(beginOffset)) {
-    std::cerr << "Error: Could not seek to begin offset in input file." << std::endl;
+    std::cerr << "Error: Could not seek to begin offset in input file."
+              << std::endl;
     return false;
   }
 
@@ -105,7 +108,8 @@ bool WriteToOutput(const std::string& inputFilePath,
   std::streamoff bytesRemaining = endOffset - beginOffset;
 
   while (bytesRemaining > 0) {
-    size_t readCount = static_cast<size_t>(std::min<std::streamoff>(kBufferSize, bytesRemaining));
+    size_t readCount = static_cast<size_t>(
+        std::min<std::streamoff>(kBufferSize, bytesRemaining));
     inputFile.read(buffer, readCount);
     std::streamoff bytesRead = inputFile.gcount();
 
@@ -119,7 +123,9 @@ bool WriteToOutput(const std::string& inputFilePath,
     }
 
     if (bytesRead < readCount) {
-      std::cerr << "Warning: Reached end of file before reaching the specified endOffset." << std::endl;
+      std::cerr << "Warning: Reached end of file before reaching the specified "
+                   "endOffset."
+                << std::endl;
       break;
     }
 
@@ -129,9 +135,9 @@ bool WriteToOutput(const std::string& inputFilePath,
   return bytesRemaining == 0;
 }
 
-tuple<unique_ptr<DataSource>, size_t> ReadFile(const string& file_name,
-                                                const StringOutputter& outputter,
-                                                MessageHandler* message_handler) {
+tuple<unique_ptr<DataSource>, size_t> ReadFile(
+    const string& file_name, const StringOutputter& outputter,
+    MessageHandler* message_handler) {
   size_t file_size = 0;
   unique_ptr<DataSource> data_source;
   outputter("\nReading " + file_name + "\n");
@@ -215,13 +221,14 @@ tuple<size_t, DataRange, MpvdBox> GetImageSizeAndXmpRange(
         message_handler->ReportMessage(Message::kValueError,
                                        "No MpvdBox found in input");
       }
-    } else if (!primary_image_file_name_output.empty()) {
-      if (!WriteToOutput(motion_photo_file_name,
-                         primary_image_file_name_output, 0,
-                         mpvd_box.GetStartIndex())) {
+    } else if (!primary_image_file_name_output.empty() &&
+               mpvd_box.GetStartIndex() + mpvd_box.GetLength() ==
+                   static_cast<size_t>(image_size)) {
+      if (!WriteToOutput(motion_photo_file_name, primary_image_file_name_output,
+                         0, mpvd_box.GetStartIndex())) {
         if (message_handler) {
-          message_handler->ReportMessage(Message::kValueError,
-                                         "Failure in writing HEIF image output.");
+          message_handler->ReportMessage(
+              Message::kValueError, "Failure in writing HEIF image output.");
         }
       }
     }

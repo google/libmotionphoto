@@ -50,10 +50,13 @@ Bytes ReadFile(const std::string& path) {
 // --- Minimal ISO-BMFF writer for synthetic fixtures. ---
 void Put(Bytes* out, uint64_t value, size_t num_bytes) {
   for (size_t i = num_bytes; i > 0; --i) {
-    out->push_back(static_cast<uint8_t>(value >> (8 * (i - 1))));
+    const size_t shift = 8 * (i - 1);
+    out->push_back(shift >= 64 ? 0 : static_cast<uint8_t>(value >> shift));
   }
 }
-void PutStr(Bytes* out, std::string_view s) { out->insert(out->end(), s.begin(), s.end()); }
+void PutStr(Bytes* out, std::string_view s) {
+  out->insert(out->end(), s.begin(), s.end());
+}
 Bytes MakeBox(std::string_view type, const Bytes& payload) {
   Bytes out;
   Put(&out, payload.size() + 8, 4);
@@ -135,13 +138,20 @@ Bytes IlocV1(const std::vector<ItemLoc>& items) {
 Bytes Meta(std::initializer_list<Bytes> children) {
   return MakeFullBox("meta", 0, 0, Cat(children));
 }
+Bytes IrefCdsc(uint16_t from, uint16_t to) {
+  Bytes ref;
+  Put(&ref, from, 2);
+  Put(&ref, 1, 2);
+  Put(&ref, to, 2);
+  return MakeFullBox("iref", 0, 0, MakeBox("cdsc", ref));
+}
 
 // --- Minimal reader to resolve item payloads in edited output. ---
 struct Parsed {
   uint32_t primary = 0;
-  std::map<uint32_t, std::string> item_types;   // id -> item_type
+  std::map<uint32_t, std::string> item_types;      // id -> item_type
   std::map<uint32_t, std::vector<uint32_t>> cdsc;  // from -> to
-  std::map<uint32_t, Bytes> item_data;          // id -> concatenated payload
+  std::map<uint32_t, Bytes> item_data;             // id -> concatenated payload
   std::vector<std::string> top_level;
 };
 
@@ -188,7 +198,8 @@ std::optional<Parsed> Parse(const Bytes& d) {
             size_t q = e + 12;
             uint32_t id = Get(d, q, ev == 3 ? 4 : 2);
             q += (ev == 3 ? 4 : 2) + 2;
-            parsed.item_types[id] = std::string(d.begin() + q, d.begin() + q + 4);
+            parsed.item_types[id] =
+                std::string(d.begin() + q, d.begin() + q + 4);
             e += es;
           }
         }
@@ -201,7 +212,8 @@ std::optional<Parsed> Parse(const Bytes& d) {
             uint32_t from = Get(d, r + 8, w);
             uint64_t n = Get(d, r + 8 + w, 2);
             for (uint64_t i = 0; i < n; ++i) {
-              if (rt == "cdsc") parsed.cdsc[from].push_back(Get(d, r + 10 + w + i * w, w));
+              if (rt == "cdsc")
+                parsed.cdsc[from].push_back(Get(d, r + 10 + w + i * w, w));
             }
             r += rs;
           }
@@ -276,7 +288,8 @@ std::string MakeXmp(size_t min_size) {
   std::string xmp =
       "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF "
       "xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">"
-      "<rdf:Description xmlns:GCamera=\"http://ns.google.com/photos/1.0/camera/\" "
+      "<rdf:Description "
+      "xmlns:GCamera=\"http://ns.google.com/photos/1.0/camera/\" "
       "GCamera:MotionPhoto=\"1\" GCamera:MotionPhotoVersion=\"1\"/>";
   while (xmp.size() + 24 < min_size) xmp += "<!-- padding padding -->";
   xmp += "</rdf:RDF></x:xmpmeta>";
@@ -379,15 +392,15 @@ TEST(HeifIsoMetaEditorTest, HandlesMetaAfterMdatIdatAndTrailingBoxes) {
   const std::string grid = "GRID";  // Stored in 'idat' (construction_method 1).
   Bytes mdat = MakeBox("mdat", Bytes(tile.begin(), tile.end()));
   const uint32_t tile_offset = static_cast<uint32_t>(Ftyp().size() + 8);
-  Bytes input = Cat(
-      {Ftyp(), mdat,
-       Meta({Hdlr(), Pitm(2), Iinf({Infe(1, "hvc1"), Infe(2, "grid")}),
-             IlocV1({{1, 0, tile_offset - 4, 4,
-                      static_cast<uint32_t>(tile.size())},
-                     {2, 1, 0, 0, static_cast<uint32_t>(grid.size())}}),
-             MakeBox("idat", Bytes(grid.begin(), grid.end()))}),
-       MakeBox("free", Bytes(16, 0)), MakeBox("mpvd", Bytes(32, 7)),
-       MakeBox("sefd", Bytes(8, 9))});
+  Bytes input =
+      Cat({Ftyp(), mdat,
+           Meta({Hdlr(), Pitm(2), Iinf({Infe(1, "hvc1"), Infe(2, "grid")}),
+                 IlocV1({{1, 0, tile_offset - 4, 4,
+                          static_cast<uint32_t>(tile.size())},
+                         {2, 1, 0, 0, static_cast<uint32_t>(grid.size())}}),
+                 MakeBox("idat", Bytes(grid.begin(), grid.end()))}),
+           MakeBox("free", Bytes(16, 0)), MakeBox("mpvd", Bytes(32, 7)),
+           MakeBox("sefd", Bytes(8, 9))});
   std::optional<Parsed> before = Parse(input);
   ASSERT_TRUE(before.has_value());
   EXPECT_TRUE(before->item_data[1] == Bytes(tile.begin(), tile.end()));
@@ -400,25 +413,26 @@ TEST(HeifIsoMetaEditorTest, HandlesMetaAfterMdatIdatAndTrailingBoxes) {
                                                &output, &error));
   std::optional<Parsed> after = Parse(output);
   ASSERT_TRUE(after.has_value());
-  EXPECT_TRUE(after->top_level ==
-              (std::vector<std::string>{"ftyp", "mdat", "meta", "free", "mdat"}));
+  EXPECT_TRUE(after->top_level == (std::vector<std::string>{
+                                      "ftyp", "mdat", "meta", "free", "mdat"}));
   EXPECT_TRUE(after->item_data[1] == Bytes(tile.begin(), tile.end()));
   EXPECT_TRUE(after->item_data[2] == Bytes(grid.begin(), grid.end()));
   EXPECT_TRUE(after->cdsc[3] == std::vector<uint32_t>{2});
   EXPECT_EQ(PrimaryXmpViaSplitter(output), xmp);
   // Data in front of 'meta' does not move.
-  EXPECT_TRUE(Bytes(input.begin(), input.begin() + Ftyp().size() + mdat.size()) ==
-              Bytes(output.begin(), output.begin() + Ftyp().size() + mdat.size()));
+  EXPECT_TRUE(
+      Bytes(input.begin(), input.begin() + Ftyp().size() + mdat.size()) ==
+      Bytes(output.begin(), output.begin() + Ftyp().size() + mdat.size()));
 }
 
 TEST(HeifIsoMetaEditorTest, IsIdempotent) {
   Bytes input = ReadFile(kPhotoOnlyHeic);
   const std::string xmp = MakeXmp(3000);
   Bytes once, twice;
-  ASSERT_TRUE(HeifIsoMetaEditor::SetPrimaryXmp(input.data(), input.size(), xmp,
-                                               &once));
-  ASSERT_TRUE(HeifIsoMetaEditor::SetPrimaryXmp(once.data(), once.size(), xmp,
-                                               &twice));
+  ASSERT_TRUE(
+      HeifIsoMetaEditor::SetPrimaryXmp(input.data(), input.size(), xmp, &once));
+  ASSERT_TRUE(
+      HeifIsoMetaEditor::SetPrimaryXmp(once.data(), once.size(), xmp, &twice));
   EXPECT_TRUE(once == twice);  // Second pass takes the in-place path.
 }
 
@@ -443,8 +457,217 @@ TEST(HeifIsoMetaEditorTest, RejectsMalformedInput) {
                    Meta({Hdlr(), Pitm(1), Iinf({Infe(1, "hvc1")}),
                          IlocV1({{1, 0, 0, 100000, 10}})}),
                    MakeBox("mdat", Bytes(4, 1))});
-  EXPECT_TRUE(!HeifIsoMetaEditor::SetPrimaryXmp(bad.data(), bad.size(),
-                                                MakeXmp(5000), &output, &error));
+  EXPECT_TRUE(!HeifIsoMetaEditor::SetPrimaryXmp(
+      bad.data(), bad.size(), MakeXmp(5000), &output, &error));
+}
+
+TEST(HeifIsoMetaEditorTest,
+     HandlesTrailingZeroSizedBoxInsideMetaWhenAppendingIref) {
+  const std::string image = "HEVC-TILE-PAYLOAD-0123456789";
+  Bytes mdat_payload(image.begin(), image.end());
+  Bytes zero_free;
+  Put(&zero_free, 0, 4);  // size == 0 ("to end of 'meta'")
+  PutStr(&zero_free, "free");
+  Put(&zero_free, 0, 8);
+  auto build = [&](uint32_t payload_offset) {
+    return Cat({Ftyp(),
+                Meta({Hdlr(), Pitm(1), Iinf({Infe(1, "hvc1")}),
+                      IlocV1({{1, 0, 0, payload_offset,
+                               static_cast<uint32_t>(image.size())}}),
+                      zero_free}),
+                MakeBox("mdat", mdat_payload)});
+  };
+  Bytes probe = build(0);
+  Bytes input = build(static_cast<uint32_t>(probe.size() - image.size()));
+
+  const std::string xmp = MakeXmp(200);
+  Bytes output;
+  std::string error;
+  ASSERT_TRUE(HeifIsoMetaEditor::SetPrimaryXmp(input.data(), input.size(), xmp,
+                                               &output, &error));
+  EXPECT_EQ(RTrim(PrimaryXmpViaSplitter(output)), xmp);
+}
+
+TEST(HeifIsoMetaEditorTest, ClearsGzipContentEncodingWhenReplacingXmp) {
+  auto infe_mime_gzip = [](uint16_t id) {
+    Bytes p;
+    Put(&p, id, 2);
+    Put(&p, 0, 2);
+    PutStr(&p, "mime");
+    p.push_back(0);  // name
+    PutStr(&p, "application/rdf+xml");
+    p.push_back(0);
+    PutStr(&p, "gzip");
+    p.push_back(0);
+    return MakeFullBox("infe", 2, 1, p);
+  };
+  const std::string image = "IMG_DATA";
+  const std::string fake_gz_xmp(128, 'Z');
+  Bytes mdat_payload;
+  mdat_payload.insert(mdat_payload.end(), image.begin(), image.end());
+  mdat_payload.insert(mdat_payload.end(), fake_gz_xmp.begin(),
+                      fake_gz_xmp.end());
+  auto build = [&](uint32_t img_off, uint32_t xmp_off) {
+    return Cat(
+        {Ftyp(),
+         Meta({Hdlr(), Pitm(1), Iinf({Infe(1, "hvc1"), infe_mime_gzip(2)}),
+               IrefCdsc(2, 1),
+               IlocV1({{1, 0, 0, img_off, static_cast<uint32_t>(image.size())},
+                       {2, 0, 0, xmp_off,
+                        static_cast<uint32_t>(fake_gz_xmp.size())}})}),
+         MakeBox("mdat", mdat_payload)});
+  };
+  Bytes probe = build(0, 0);
+  uint32_t mdat_start =
+      static_cast<uint32_t>(probe.size() - mdat_payload.size());
+  Bytes input =
+      build(mdat_start, mdat_start + static_cast<uint32_t>(image.size()));
+
+  // Shrink/fit size: must NOT fast-path and leave "gzip" in infe.
+  const std::string small_xmp = MakeXmp(80);
+  Bytes out_small;
+  ASSERT_TRUE(HeifIsoMetaEditor::SetPrimaryXmp(input.data(), input.size(),
+                                               small_xmp, &out_small));
+  EXPECT_EQ(RTrim(PrimaryXmpViaSplitter(out_small)), small_xmp);
+  std::string out_small_str(out_small.begin(), out_small.end());
+  EXPECT_EQ(out_small_str.find("gzip"), std::string::npos);
+
+  // Grow size: must also clear "gzip".
+  const std::string big_xmp = MakeXmp(400);
+  Bytes out_big;
+  ASSERT_TRUE(HeifIsoMetaEditor::SetPrimaryXmp(input.data(), input.size(),
+                                               big_xmp, &out_big));
+  EXPECT_EQ(RTrim(PrimaryXmpViaSplitter(out_big)), big_xmp);
+  std::string out_big_str(out_big.begin(), out_big.end());
+  EXPECT_EQ(out_big_str.find("gzip"), std::string::npos);
+}
+
+TEST(HeifIsoMetaEditorTest, BlanksStaleIdatAndMultiExtentXmpBytes) {
+  auto infe_mime = [](uint16_t id) {
+    Bytes p;
+    Put(&p, id, 2);
+    Put(&p, 0, 2);
+    PutStr(&p, "mime");
+    p.push_back(0);
+    PutStr(&p, "application/rdf+xml");
+    p.push_back(0);
+    return MakeFullBox("infe", 2, 1, p);
+  };
+  // 1. 'idat'-stored XMP
+  {
+    const std::string old_idat_xmp =
+        "<x:xmpmeta>OLD_IDAT_XMP_MARKER</x:xmpmeta>";
+    const std::string image = "IMG";
+    Bytes idat_payload(old_idat_xmp.begin(), old_idat_xmp.end());
+    Bytes mdat_payload(image.begin(), image.end());
+    auto build = [&](uint32_t img_off) {
+      return Cat(
+          {Ftyp(),
+           Meta(
+               {Hdlr(), Pitm(1), Iinf({Infe(1, "hvc1"), infe_mime(2)}),
+                IrefCdsc(2, 1),
+                IlocV1(
+                    {{1, 0, 0, img_off, static_cast<uint32_t>(image.size())},
+                     {2, 1, 0, 0, static_cast<uint32_t>(old_idat_xmp.size())}}),
+                MakeBox("idat", idat_payload)}),
+           MakeBox("mdat", mdat_payload)});
+    };
+    Bytes probe = build(0);
+    Bytes input = build(static_cast<uint32_t>(probe.size() - image.size()));
+    const std::string new_xmp = MakeXmp(120);
+    Bytes output;
+    ASSERT_TRUE(HeifIsoMetaEditor::SetPrimaryXmp(input.data(), input.size(),
+                                                 new_xmp, &output));
+    std::string out_str(output.begin(), output.end());
+    EXPECT_EQ(out_str.find("OLD_IDAT_XMP_MARKER"), std::string::npos);
+    EXPECT_EQ(RTrim(PrimaryXmpViaSplitter(output)), new_xmp);
+  }
+  // 2. Non-contiguous multi-extent XMP
+  {
+    const std::string ext1 = "<x:xmpmeta>EXTENT_ONE_XMP";
+    const std::string gap = "GAP_IMAGE_BYTES";
+    const std::string ext2 = "EXTENT_TWO_XMP</x:xmpmeta>";
+    Bytes mdat_payload;
+    mdat_payload.insert(mdat_payload.end(), ext1.begin(), ext1.end());
+    mdat_payload.insert(mdat_payload.end(), gap.begin(), gap.end());
+    mdat_payload.insert(mdat_payload.end(), ext2.begin(), ext2.end());
+    // Build IlocV1 manually for item 2 with 2 extents.
+    auto build_iloc = [&](uint32_t mdat_off) {
+      Bytes p;
+      Put(&p, 0x44, 1);  // offset_size=4, length_size=4
+      Put(&p, 0x40, 1);  // base_offset_size=4, index_size=0
+      Put(&p, 2, 2);     // item_count=2
+      // item 1 (image in gap)
+      Put(&p, 1, 2);
+      Put(&p, 0, 2);  // construction_method=0
+      Put(&p, 0, 2);  // data_reference_index=0
+      Put(&p, 0, 4);  // base_offset=0
+      Put(&p, 1, 2);  // extent_count=1
+      Put(&p, mdat_off + static_cast<uint32_t>(ext1.size()), 4);
+      Put(&p, static_cast<uint32_t>(gap.size()), 4);
+      // item 2 (2 extents)
+      Put(&p, 2, 2);
+      Put(&p, 0, 2);  // construction_method=0
+      Put(&p, 0, 2);  // data_reference_index=0
+      Put(&p, 0, 4);  // base_offset=0
+      Put(&p, 2, 2);  // extent_count=2
+      Put(&p, mdat_off, 4);
+      Put(&p, static_cast<uint32_t>(ext1.size()), 4);
+      Put(&p, mdat_off + static_cast<uint32_t>(ext1.size() + gap.size()), 4);
+      Put(&p, static_cast<uint32_t>(ext2.size()), 4);
+      return MakeFullBox("iloc", 1, 0, p);
+    };
+    auto build = [&](uint32_t mdat_off) {
+      return Cat({Ftyp(),
+                  Meta({Hdlr(), Pitm(1), Iinf({Infe(1, "hvc1"), infe_mime(2)}),
+                        IrefCdsc(2, 1), build_iloc(mdat_off)}),
+                  MakeBox("mdat", mdat_payload)});
+    };
+    Bytes probe = build(0);
+    Bytes input =
+        build(static_cast<uint32_t>(probe.size() - mdat_payload.size()));
+    const std::string new_xmp = MakeXmp(120);
+    Bytes output;
+    ASSERT_TRUE(HeifIsoMetaEditor::SetPrimaryXmp(input.data(), input.size(),
+                                                 new_xmp, &output));
+    std::string out_str(output.begin(), output.end());
+    EXPECT_EQ(out_str.find("EXTENT_ONE_XMP"), std::string::npos);
+    EXPECT_EQ(out_str.find("EXTENT_TWO_XMP"), std::string::npos);
+    EXPECT_NE(out_str.find("GAP_IMAGE_BYTES"), std::string::npos);
+    EXPECT_EQ(RTrim(PrimaryXmpViaSplitter(output)), new_xmp);
+  }
+}
+
+TEST(HeifIsoMetaEditorTest, RejectsMoovConsistentlyAcrossShrinkAndGrow) {
+  auto infe_mime = [](uint16_t id) {
+    Bytes p;
+    Put(&p, id, 2);
+    Put(&p, 0, 2);
+    PutStr(&p, "mime");
+    p.push_back(0);
+    PutStr(&p, "application/rdf+xml");
+    p.push_back(0);
+    return MakeFullBox("infe", 2, 1, p);
+  };
+  const std::string old_xmp(120, 'X');
+  Bytes mdat_payload(old_xmp.begin(), old_xmp.end());
+  auto build = [&](uint32_t xmp_off) {
+    return Cat({Ftyp(),
+                Meta({Hdlr(), Pitm(1), Iinf({Infe(1, "hvc1"), infe_mime(2)}),
+                      IrefCdsc(2, 1),
+                      IlocV1({{2, 0, 0, xmp_off,
+                               static_cast<uint32_t>(old_xmp.size())}})}),
+                MakeBox("moov", Bytes(16, 0)), MakeBox("mdat", mdat_payload)});
+  };
+  Bytes probe = build(0);
+  Bytes input =
+      build(static_cast<uint32_t>(probe.size() - mdat_payload.size()));
+  Bytes output;
+  std::string error;
+  EXPECT_TRUE(!HeifIsoMetaEditor::SetPrimaryXmp(input.data(), input.size(),
+                                                MakeXmp(60), &output, &error));
+  EXPECT_TRUE(!HeifIsoMetaEditor::SetPrimaryXmp(input.data(), input.size(),
+                                                MakeXmp(400), &output, &error));
 }
 
 }  // namespace motion_photo

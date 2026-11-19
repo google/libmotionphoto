@@ -24,6 +24,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.Locale;
 
 /** Utility class for file operations in the sample app. */
 public class StorageUtils {
@@ -33,15 +34,6 @@ public class StorageUtils {
   @SuppressWarnings("ContentResolverUri")
   public static String copyUriToTempFile(
       Context context, Uri uri, String prefix, String defaultSuffix) throws IOException {
-    InputStream inputStream;
-    if ("file".equals(uri.getScheme())) {
-      inputStream = new FileInputStream(new File(uri.getPath()));
-    } else {
-      inputStream = context.getContentResolver().openInputStream(uri);
-    }
-    if (inputStream == null) {
-      throw new IOException("Failed to open input stream for URI: " + uri);
-    }
     String suffix = defaultSuffix;
     String mimeType = context.getContentResolver().getType(uri);
     if (mimeType != null) {
@@ -62,14 +54,20 @@ public class StorageUtils {
       }
     }
     File tempFile = File.createTempFile(prefix, suffix, context.getCacheDir());
-    FileOutputStream outputStream = new FileOutputStream(tempFile);
-    byte[] buffer = new byte[4096];
-    int bytesRead;
-    while ((bytesRead = inputStream.read(buffer)) != -1) {
-      outputStream.write(buffer, 0, bytesRead);
+    try (InputStream inputStream = "file".equals(uri.getScheme())
+            ? new FileInputStream(new File(uri.getPath()))
+            : context.getContentResolver().openInputStream(uri)) {
+      if (inputStream == null) {
+        throw new IOException("Failed to open input stream for URI: " + uri);
+      }
+      try (FileOutputStream outputStream = new FileOutputStream(tempFile)) {
+        byte[] buffer = new byte[4096];
+        int bytesRead;
+        while ((bytesRead = inputStream.read(buffer)) != -1) {
+          outputStream.write(buffer, 0, bytesRead);
+        }
+      }
     }
-    inputStream.close();
-    outputStream.close();
     return tempFile.getAbsolutePath();
   }
 

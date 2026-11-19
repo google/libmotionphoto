@@ -143,9 +143,9 @@ public class HeifAndroidExtractionTest {
     assertNotNull(extractedStillProto);
     assertFalse(parserService.isMotionPhoto(extractedStillProto, false, Collections.emptyList()));
 
-    // 2. Verify extracted .mp4 video file
+    // 2. Verify extracted .mp4 video file (AGTM/it35 preserved by StripMetadataTrack)
     assertTrue(outVideoMp4.exists());
-    assertEquals(122038L, outVideoMp4.length());
+    assertEquals(122240L, outVideoMp4.length());
 
     // 3. Verify extracted .xml XMP metadata file
     assertTrue(outMetadataXml.exists());

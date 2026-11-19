@@ -20,6 +20,7 @@
 #include <cctype>
 #include <cstdint>
 #include <fstream>
+#include <regex>
 #include <string>
 
 #include "motion_photo/motion_photo.h"
@@ -77,16 +78,16 @@ FileType GetFileTypeFromFileName(const std::string& file_name) {
     lseek(fd, 0, SEEK_SET);
   }
 
-  if (bytes_read >= 2 &&
-      static_cast<uint8_t>(header[0]) == 0xFF &&
+  if (bytes_read >= 2 && static_cast<uint8_t>(header[0]) == 0xFF &&
       static_cast<uint8_t>(header[1]) == 0xD8) {
     return FileType::kJpeg;
   }
 
-  if (bytes_read >= 12 &&
-      header[4] == 'f' && header[5] == 't' && header[6] == 'y' && header[7] == 'p') {
+  if (bytes_read >= 12 && header[4] == 'f' && header[5] == 't' &&
+      header[6] == 'y' && header[7] == 'p') {
     std::string brand(header + 8, 4);
-    if (brand == "heic" || brand == "heix" || brand == "mif1" || brand == "msf1") {
+    if (brand == "heic" || brand == "heix" || brand == "mif1" ||
+        brand == "msf1") {
       return FileType::kHeic;
     } else if (brand == "avif" || brand == "avis") {
       return FileType::kAvif;
@@ -94,6 +95,63 @@ FileType GetFileTypeFromFileName(const std::string& file_name) {
   }
 
   return GetFileTypeFromFileExtension(file_name);
+}
+
+std::string StripMotionPhotoMetadata(const std::string& xmp) {
+  std::string result = xmp;
+
+  bool has_gainmap =
+      (xmp.find("Item:Semantic=\"GainMap\"") != std::string::npos ||
+       xmp.find("Item:Semantic='GainMap'") != std::string::npos ||
+       xmp.find("<Item:Semantic>GainMap</Item:Semantic>") != std::string::npos);
+
+  if (has_gainmap) {
+    std::regex attr_regex(
+        R"(\b(GCamera|Camera):(MotionPhoto|MotionPhotoVersion|MotionPhotoPresentationTimestampUs)\s*=\s*("[^"]*"|'[^']*'))");
+    result = std::regex_replace(result, attr_regex, "");
+
+    std::regex elem_regex(
+        R"(<((GCamera|Camera):(MotionPhoto|MotionPhotoVersion|MotionPhotoPresentationTimestampUs))>[^<]*</\1>)");
+    result = std::regex_replace(result, elem_regex, "");
+
+    std::regex item_regex(
+        R"raw(\s*<rdf:li\b[^>]*?Item:Semantic\s*=\s*(?:"MotionPhoto"|'MotionPhoto')[^>]*?/>|\s*<rdf:li\b(?:(?!</rdf:li>)[\s\S])*?(?:Item:Semantic\s*=\s*(?:"MotionPhoto"|'MotionPhoto')|<Item:Semantic>\s*MotionPhoto\s*</Item:Semantic>)(?:(?!</rdf:li>)[\s\S])*?</rdf:li>)raw");
+    result = std::regex_replace(result, item_regex, "");
+  } else {
+    std::regex attr_regex(
+        R"(\b(?:(?:GCamera|Camera):(?:MotionPhoto|MotionPhotoVersion|MotionPhotoPresentationTimestampUs)|Container:Version)\s*=\s*("[^"]*"|'[^']*'))");
+    result = std::regex_replace(result, attr_regex, "");
+
+    std::regex elem_regex(
+        R"(<((?:GCamera|Camera):(?:MotionPhoto|MotionPhotoVersion|MotionPhotoPresentationTimestampUs)|Container:Version)>[^<]*</\1>)");
+    result = std::regex_replace(result, elem_regex, "");
+
+    std::regex directory_regex(
+        R"(<Container:Directory>[\s\S]*?</Container:Directory>)");
+    result = std::regex_replace(result, directory_regex, "");
+  }
+
+  auto has_prefix_use = [](const std::string& text, const std::string& prefix) {
+    const std::string needle = prefix + ":";
+    size_t pos = 0;
+    while ((pos = text.find(needle, pos)) != std::string::npos) {
+      const bool is_xmlns = pos >= 6 && text.compare(pos - 6, 6, "xmlns:") == 0;
+      if (!is_xmlns) {
+        return true;
+      }
+      pos += needle.size();
+    }
+    return false;
+  };
+  for (const char* prefix : {"GCamera", "Camera", "Container", "Item"}) {
+    if (!has_prefix_use(result, prefix)) {
+      std::regex xmlns_regex(std::string(R"(\s*\bxmlns:)") + prefix +
+                             R"(\s*=\s*("[^"]*"|'[^']*'))");
+      result = std::regex_replace(result, xmlns_regex, "");
+    }
+  }
+
+  return result;
 }
 
 }  // namespace motion_photo

@@ -498,8 +498,10 @@ bool HeifIsoMetaEditor::SetPrimaryXmp(const uint8_t* data, size_t size,
 
   // 1. Top-level layout.
   std::vector<Box> top;
-  if (!ParseBoxes(data, 0, size, &top) || top.empty() ||
-      top.front().type != kFtyp) {
+  if (!ParseBoxes(data, 0, size, &top)) {
+    return Fail(error, "Malformed or truncated top-level ISO-BMFF boxes");
+  }
+  if (top.empty() || top.front().type != kFtyp) {
     return Fail(error, "Not an ISO-BMFF file starting with 'ftyp'");
   }
   std::vector<Box> kept;

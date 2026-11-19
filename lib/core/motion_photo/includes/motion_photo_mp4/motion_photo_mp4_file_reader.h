@@ -26,6 +26,8 @@
 namespace libmotionphoto {
 namespace motion_photo {
 
+class Mp4BoxReader;
+
 // A class for reading an MP4 file and the track data and video metadata.
 class MotionPhotoMp4FileReader {
  public:
@@ -37,6 +39,9 @@ class MotionPhotoMp4FileReader {
   // Returns whether the file and information was read successfully.
   bool Read(const std::string& file_name, int64_t offset = 0);
 
+  // Reads MP4 track data and video metadata from an in-memory MP4 slice.
+  bool ReadFromMemory(const uint8_t* data, size_t size, int64_t offset = 0);
+
   // Returns the video track data read from the MP4 file.
   const VideoTrackData& GetVideoTrackData() const { return track_data_; }
 
@@ -46,6 +51,8 @@ class MotionPhotoMp4FileReader {
   }
 
  private:
+  bool ExtractFromReader(const Mp4BoxReader& reader);
+
   VideoTrackData track_data_;
   std::vector<uint8_t> high_res_track_metadata_;
 };

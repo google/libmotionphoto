@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
@@ -638,6 +639,42 @@ TEST(HeifContainerSplitterTest,
   std::vector<RawMetadataBlock> blocks = SplitHeif(file);
   ASSERT_EQ(blocks.size(), 1u);
   EXPECT_EQ(AsString(blocks[0].bytes), ext1 + ext2);
+}
+
+TEST(HeifContainerSplitterTest,
+     StripMotionPhotoMetadata_LargeSpacePaddedXmpFast) {
+  std::string padded_xmp =
+      "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">"
+      "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">"
+      "<rdf:Description xmlns:dc=\"http://purl.org/dc/elements/1.1/\" "
+      "xmlns:Camera=\"http://ns.google.com/photos/1.0/camera/\" "
+      "xmlns:Container=\"http://ns.google.com/photos/1.0/container/\" "
+      "xmlns:Item=\"http://ns.google.com/photos/1.0/container/item/\" "
+      "Camera:MotionPhoto=\"1\" Camera:MotionPhotoVersion=\"1\" "
+      "Container:Version=\"1\">"
+      "<dc:description><rdf:Alt><rdf:li xml:lang=\"x-default\">"
+      "Adobe</rdf:li></rdf:Alt></dc:description>"
+      "<Container:Directory><rdf:Seq>"
+      "<rdf:li Item:Semantic=\"Primary\" Item:Mime=\"image/heic\"/>"
+      "<rdf:li Item:Semantic=\"GainMap\" Item:Mime=\"image/jpeg\"/>"
+      "<rdf:li Item:Semantic=\"MotionPhoto\" Item:Mime=\"video/mp4\" "
+      "Item:Length=\"12345\"/>"
+      "</rdf:Seq></Container:Directory>"
+      "</rdf:Description></rdf:RDF>";
+  padded_xmp.append(60 * 1024, ' ');
+  padded_xmp += "</x:xmpmeta>";
+
+  const auto start = std::chrono::steady_clock::now();
+  const std::string stripped = StripMotionPhotoMetadata(padded_xmp);
+  const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - start)
+                              .count();
+  EXPECT_TRUE(elapsed_ms < 1000);
+  EXPECT_EQ(stripped.find("MotionPhoto"), std::string::npos);
+  EXPECT_NE(stripped.find("GainMap"), std::string::npos);
+  EXPECT_NE(stripped.find("xml:lang=\"x-default\""), std::string::npos);
+  EXPECT_EQ(stripped.find("xmlns:Camera"), std::string::npos);
+  EXPECT_NE(stripped.find("xmlns:Container"), std::string::npos);
 }
 
 }  // namespace

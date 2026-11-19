@@ -319,7 +319,9 @@ bool ParseAndCheckXmpMetadata(DataSource* data_source, size_t file_size,
   size_t error_count = motion_photo_checker->GetErrorCount();
   size_t warning_count = motion_photo_checker->GetWarningCount();
   outputter("...XMP metadata indicates a motion photo\n");
-  motion_photo_checker->CheckFileName(motion_photo_file_name);
+  if (!motion_photo_file_name.empty()) {
+    motion_photo_checker->CheckFileName(motion_photo_file_name);
+  }
   motion_photo_checker->CheckCameraMetadata();
   motion_photo_checker->CheckContainerMetadata();
   if (file_type == FileType::kJpeg) {
@@ -350,22 +352,41 @@ bool ParseAndCheckXmpMetadata(DataSource* data_source, size_t file_size,
   return motion_photo_checker->GetErrorCount() == error_count;
 }
 
-bool ReadDecodeAndCheckVideoMetadata(const std::string& motion_photo_file_name,
-                                     int64_t mp4_offset,
-                                     MotionPhoto* motion_photo,
-                                     MotionPhotoReader* motion_photo_reader,
-                                     MotionPhotoChecker* motion_photo_checker,
-                                     const StringOutputter& outputter,
-                                     MessageHandler* message_handler) {
-  outputter("\nReading MP4 data\n");
-  MotionPhotoMp4FileReader mp4_reader;
-  if (!mp4_reader.Read(motion_photo_file_name, mp4_offset)) {
-    if (message_handler) {
-      message_handler->ReportMessage(
-          Message(Message::kStdLibError, EIO, motion_photo_file_name));
-    }
+namespace {
+
+bool ReadDataRangeToBytes(DataSource* data_source, size_t begin, size_t end,
+                          std::vector<uint8_t>* out) {
+  if (data_source == nullptr || out == nullptr || begin >= end) {
     return false;
   }
+  out->clear();
+  out->reserve(end - begin);
+  size_t pos = begin;
+  while (pos < end) {
+    std::shared_ptr<DataSegment> seg =
+        data_source->GetDataSegment(pos, end - pos);
+    if (!seg || !seg->Contains(pos)) {
+      out->clear();
+      return false;
+    }
+    size_t avail = std::min(end, seg->GetEnd()) - pos;
+    const uint8_t* ptr = seg->GetBuffer(pos);
+    if (avail == 0 || ptr == nullptr) {
+      out->clear();
+      return false;
+    }
+    out->insert(out->end(), ptr, ptr + avail);
+    pos += avail;
+  }
+  return true;
+}
+
+bool CheckDecodedVideoMetadata(const MotionPhotoMp4FileReader& mp4_reader,
+                               MotionPhoto* motion_photo,
+                               MotionPhotoReader* motion_photo_reader,
+                               MotionPhotoChecker* motion_photo_checker,
+                               const StringOutputter& outputter,
+                               MessageHandler* message_handler) {
   std::vector<uint8_t> video_metadata;
   const auto& track_data = mp4_reader.GetVideoTrackData();
   outputter("...Low res video track id: " +
@@ -409,6 +430,74 @@ bool ReadDecodeAndCheckVideoMetadata(const std::string& motion_photo_file_name,
   }
 
   return true;
+}
+
+}  // namespace
+
+bool ReadDecodeAndCheckVideoMetadata(const std::string& motion_photo_file_name,
+                                     int64_t mp4_offset,
+                                     MotionPhoto* motion_photo,
+                                     MotionPhotoReader* motion_photo_reader,
+                                     MotionPhotoChecker* motion_photo_checker,
+                                     const StringOutputter& outputter,
+                                     MessageHandler* message_handler) {
+  outputter("\nReading MP4 data\n");
+  MotionPhotoMp4FileReader mp4_reader;
+  if (!mp4_reader.Read(motion_photo_file_name, mp4_offset)) {
+    if (message_handler) {
+      message_handler->ReportMessage(
+          Message(Message::kStdLibError, EIO, motion_photo_file_name));
+    }
+    return false;
+  }
+  return CheckDecodedVideoMetadata(mp4_reader, motion_photo, motion_photo_reader,
+                                   motion_photo_checker, outputter,
+                                   message_handler);
+}
+
+bool ReadDecodeAndCheckVideoMetadata(DataSource* data_source, size_t file_size,
+                                     const std::string& motion_photo_file_name,
+                                     int64_t mp4_offset,
+                                     MotionPhoto* motion_photo,
+                                     MotionPhotoReader* motion_photo_reader,
+                                     MotionPhotoChecker* motion_photo_checker,
+                                     const StringOutputter& outputter,
+                                     MessageHandler* message_handler) {
+  if (data_source == nullptr && !motion_photo_file_name.empty()) {
+    return ReadDecodeAndCheckVideoMetadata(
+        motion_photo_file_name, mp4_offset, motion_photo, motion_photo_reader,
+        motion_photo_checker, outputter, message_handler);
+  }
+  outputter("\nReading MP4 data\n");
+  MotionPhotoMp4FileReader mp4_reader;
+  bool read_ok = false;
+  if (data_source != nullptr && mp4_offset >= 0 &&
+      static_cast<size_t>(mp4_offset) < file_size) {
+    const size_t start = static_cast<size_t>(mp4_offset);
+    const size_t len = file_size - start;
+    std::shared_ptr<DataSegment> seg = data_source->GetDataSegment(start, len);
+    if (seg && seg->GetBegin() <= start && seg->GetEnd() >= file_size) {
+      read_ok = mp4_reader.ReadFromMemory(seg->GetBuffer(start), len, 0);
+    } else {
+      std::vector<uint8_t> mp4_bytes;
+      if (ReadDataRangeToBytes(data_source, start, file_size, &mp4_bytes)) {
+        read_ok =
+            mp4_reader.ReadFromMemory(mp4_bytes.data(), mp4_bytes.size(), 0);
+      }
+    }
+  }
+  if (!read_ok) {
+    if (message_handler) {
+      message_handler->ReportMessage(
+          Message(Message::kStdLibError, EIO,
+                  motion_photo_file_name.empty() ? "data_source"
+                                                 : motion_photo_file_name));
+    }
+    return false;
+  }
+  return CheckDecodedVideoMetadata(mp4_reader, motion_photo, motion_photo_reader,
+                                   motion_photo_checker, outputter,
+                                   message_handler);
 }
 
 }  // namespace motion_photo

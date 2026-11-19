@@ -778,7 +778,9 @@ TEST(LibMotionPhotoApiTest, BuildsParsesChecksAndExtractsAvifAndMultiExtent) {
 
   auto put = [](std::vector<uint8_t>* out, uint64_t val, size_t n) {
     for (size_t i = n; i > 0; --i) {
-      out->push_back(static_cast<uint8_t>((val >> (8 * (i - 1))) & 0xFF));
+      size_t shift = 8 * (i - 1);
+      out->push_back(
+          static_cast<uint8_t>(shift >= 64 ? 0 : ((val >> shift) & 0xFF)));
     }
   };
   auto put_str = [](std::vector<uint8_t>* out, const std::string& s) {
@@ -810,7 +812,7 @@ TEST(LibMotionPhotoApiTest, BuildsParsesChecksAndExtractsAvifAndMultiExtent) {
     std::vector<uint8_t> hdlr_p;
     put(&hdlr_p, 0, 4);
     put_str(&hdlr_p, "pict");
-    put(&hdlr_p, 0, 13);
+    hdlr_p.insert(hdlr_p.end(), 13, 0);
     std::vector<uint8_t> pitm_p;
     put(&pitm_p, 1, 2);
     std::vector<uint8_t> infe1_p;
@@ -935,7 +937,7 @@ TEST(LibMotionPhotoApiTest, BuildsParsesChecksAndExtractsAvifAndMultiExtent) {
     std::vector<uint8_t> hdlr_p;
     put(&hdlr_p, 0, 4);
     put_str(&hdlr_p, "pict");
-    put(&hdlr_p, 0, 13);
+    hdlr_p.insert(hdlr_p.end(), 13, 0);
     std::vector<uint8_t> pitm_p;
     put(&pitm_p, 1, 2);
     std::vector<uint8_t> infe1_p;
@@ -1021,7 +1023,11 @@ TEST(LibMotionPhotoApiTest, BuildsParsesChecksAndExtractsAvifAndMultiExtent) {
   MotionPhotoMetadata multi_fd_meta;
   ASSERT_TRUE(ParseMotionPhotoFromFd(
       multi_fd, 0, static_cast<int64_t>(multi_heic.size()), &multi_fd_meta));
+  EXPECT_EQ(CheckMotionPhotoFromFd(
+                multi_fd, 0, static_cast<int64_t>(multi_heic.size())),
+            0);
   close(multi_fd);
+  EXPECT_EQ(CheckMotionPhotoFromFile(multi_path), 0);
   EXPECT_TRUE(multi_fd_meta.is_motion_photo);
   EXPECT_EQ(multi_fd_meta.primary_image_mime, "image/heic");
   EXPECT_EQ(multi_fd_meta.video_length, static_cast<int64_t>(vid_bytes.size()));
@@ -1039,6 +1045,235 @@ TEST(LibMotionPhotoApiTest, BuildsParsesChecksAndExtractsAvifAndMultiExtent) {
   MotionPhotoMetadata multi_still_meta;
   EXPECT_FALSE(ParseMotionPhotoFromFile(multi_still, &multi_still_meta) &&
                multi_still_meta.is_motion_photo);
+
+  fs::remove_all(test_dir);
+}
+
+TEST(LibMotionPhotoApiTest, LargeFdOverreadXmlLangAndParityRegression) {
+  const char* test_tmpdir = std::getenv("TEST_TMPDIR");
+  fs::path base_dir = (test_tmpdir != nullptr && test_tmpdir[0] != '\0')
+                          ? fs::path(test_tmpdir)
+                          : fs::temp_directory_path();
+  fs::path test_dir = base_dir / "LargeFdOverreadXmlLangAndParity";
+  fs::create_directories(test_dir);
+
+  auto put = [](std::vector<uint8_t>* out, uint64_t val, size_t n) {
+    for (size_t i = n; i > 0; --i) {
+      size_t shift = 8 * (i - 1);
+      out->push_back(
+          static_cast<uint8_t>(shift >= 64 ? 0 : ((val >> shift) & 0xFF)));
+    }
+  };
+  auto put_str = [](std::vector<uint8_t>* out, const std::string& s) {
+    out->insert(out->end(), s.begin(), s.end());
+  };
+  auto make_box = [&](const std::string& type, const std::vector<uint8_t>& p) {
+    std::vector<uint8_t> b;
+    put(&b, 8 + p.size(), 4);
+    put_str(&b, type);
+    b.insert(b.end(), p.begin(), p.end());
+    return b;
+  };
+  auto make_full_box = [&](const std::string& type, uint8_t ver,
+                           const std::vector<uint8_t>& p) {
+    std::vector<uint8_t> fp;
+    fp.push_back(ver);
+    put(&fp, 0, 3);
+    fp.insert(fp.end(), p.begin(), p.end());
+    return make_box(type, fp);
+  };
+
+  std::ifstream vid_in("lib/core/motion_photo/testdata/motion_photo_video_only.mp4",
+                       std::ios::binary);
+  std::vector<uint8_t> vid_bytes((std::istreambuf_iterator<char>(vid_in)),
+                                 std::istreambuf_iterator<char>());
+  auto mpvd_box = make_box("mpvd", vid_bytes);
+
+  auto build_large_heic = [&](const std::string& xmp) {
+    const std::string big_pixels(280 * 1024, '\xAA');
+    std::vector<uint8_t> mdat_p;
+    put_str(&mdat_p, big_pixels);
+    put_str(&mdat_p, xmp);
+
+    auto make_container = [&](uint32_t mdat_data_off) {
+      std::vector<uint8_t> ftyp_p;
+      put_str(&ftyp_p, "heic");
+      put(&ftyp_p, 0, 4);
+      put_str(&ftyp_p, "mif1heic");
+      std::vector<uint8_t> hdlr_p;
+      put(&hdlr_p, 0, 4);
+      put_str(&hdlr_p, "pict");
+      hdlr_p.insert(hdlr_p.end(), 13, 0);
+      std::vector<uint8_t> pitm_p;
+      put(&pitm_p, 1, 2);
+      std::vector<uint8_t> infe1_p;
+      put(&infe1_p, 1, 2);
+      put(&infe1_p, 0, 2);
+      put_str(&infe1_p, "hvc1");
+      infe1_p.push_back(0);
+      std::vector<uint8_t> infe2_p;
+      put(&infe2_p, 2, 2);
+      put(&infe2_p, 0, 2);
+      put_str(&infe2_p, "mime");
+      infe2_p.push_back(0);
+      put_str(&infe2_p, "application/rdf+xml");
+      infe2_p.push_back(0);
+      std::vector<uint8_t> iinf_p;
+      put(&iinf_p, 2, 2);
+      auto infe1 = make_full_box("infe", 2, infe1_p);
+      auto infe2 = make_full_box("infe", 2, infe2_p);
+      iinf_p.insert(iinf_p.end(), infe1.begin(), infe1.end());
+      iinf_p.insert(iinf_p.end(), infe2.begin(), infe2.end());
+      std::vector<uint8_t> cdsc_p;
+      put(&cdsc_p, 2, 2);
+      put(&cdsc_p, 1, 2);
+      put(&cdsc_p, 1, 2);
+      std::vector<uint8_t> iloc_p;
+      put(&iloc_p, 0x4400, 2);
+      put(&iloc_p, 2, 2);
+      put(&iloc_p, 1, 2);
+      put(&iloc_p, 0, 2);
+      put(&iloc_p, 0, 2);
+      put(&iloc_p, 1, 2);
+      put(&iloc_p, mdat_data_off, 4);
+      put(&iloc_p, big_pixels.size(), 4);
+      put(&iloc_p, 2, 2);
+      put(&iloc_p, 0, 2);
+      put(&iloc_p, 0, 2);
+      put(&iloc_p, 1, 2);
+      put(&iloc_p, mdat_data_off + big_pixels.size(), 4);
+      put(&iloc_p, xmp.size(), 4);
+      std::vector<uint8_t> meta_children;
+      for (const auto& c :
+           {make_full_box("hdlr", 0, hdlr_p), make_full_box("pitm", 0, pitm_p),
+            make_full_box("iinf", 0, iinf_p),
+            make_full_box("iref", 0, make_box("cdsc", cdsc_p)),
+            make_full_box("iloc", 1, iloc_p)}) {
+        meta_children.insert(meta_children.end(), c.begin(), c.end());
+      }
+      std::vector<uint8_t> out = make_box("ftyp", ftyp_p);
+      auto meta = make_full_box("meta", 0, meta_children);
+      auto mdat = make_box("mdat", mdat_p);
+      out.insert(out.end(), meta.begin(), meta.end());
+      out.insert(out.end(), mdat.begin(), mdat.end());
+      out.insert(out.end(), mpvd_box.begin(), mpvd_box.end());
+      return out;
+    };
+    auto probe = make_container(0);
+    return make_container(static_cast<uint32_t>(
+        probe.size() - mpvd_box.size() - mdat_p.size()));
+  };
+
+  // XMP starts >280KB and immediately precedes 'mpvd', plus uses xml:lang.
+  const std::string valid_xmp =
+      "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">"
+      "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">"
+      "<rdf:Description xmlns:dc=\"http://purl.org/dc/elements/1.1/\" "
+      "xmlns:Camera=\"http://ns.google.com/photos/1.0/camera/\" "
+      "xmlns:Container=\"http://ns.google.com/photos/1.0/container/\" "
+      "xmlns:Item=\"http://ns.google.com/photos/1.0/container/item/\" "
+      "Camera:MotionPhoto=\"1\" Camera:MotionPhotoVersion=\"1\" "
+      "Camera:MotionPhotoPresentationTimestampUs=\"4242\">"
+      "<dc:description><rdf:Alt><rdf:li xml:lang=\"x-default\">"
+      "Title</rdf:li></rdf:Alt></dc:description>"
+      "<Container:Directory><rdf:Seq>"
+      "<rdf:li><Container:Item Item:Semantic=\"Primary\" "
+      "Item:Mime=\"image/heic\" Item:Padding=\"8\"/></rdf:li>"
+      "<rdf:li><Container:Item Item:Semantic=\"MotionPhoto\" "
+      "Item:Mime=\"video/mp4\" Item:Length=\"" +
+      std::to_string(vid_bytes.size()) +
+      "\"/></rdf:li>"
+      "</rdf:Seq></Container:Directory>"
+      "</rdf:Description></rdf:RDF></x:xmpmeta>";
+
+  std::vector<uint8_t> valid_large = build_large_heic(valid_xmp);
+  const std::string large_path = (test_dir / "large_xmllang.MP.heic").string();
+  {
+    std::ofstream out(large_path, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(valid_large.data()),
+              valid_large.size());
+  }
+
+  int fd = open(large_path.c_str(), O_RDONLY);
+  ASSERT_TRUE(fd >= 0);
+  MotionPhotoMetadata fd_meta;
+  ASSERT_TRUE(ParseMotionPhotoFromFd(
+      fd, 0, static_cast<int64_t>(valid_large.size()), &fd_meta));
+  EXPECT_TRUE(fd_meta.is_motion_photo);
+  EXPECT_EQ(fd_meta.presentation_timestamp_us, 4242);
+  EXPECT_EQ(CheckMotionPhotoFromFd(
+                fd, 0, static_cast<int64_t>(valid_large.size())),
+            0);
+  close(fd);
+  EXPECT_EQ(CheckMotionPhotoFromFile(large_path), 0);
+  EXPECT_EQ(
+      CheckMotionPhotoFromMemory(valid_large.data(), valid_large.size()), 0);
+
+  // Invalid padding fails CheckMotionPhoto consistently across File/Fd/Memory.
+  std::string bad_padding_xmp = valid_xmp;
+  size_t pad_pos = bad_padding_xmp.find("Item:Padding=\"8\"");
+  ASSERT_NE(pad_pos, std::string::npos);
+  bad_padding_xmp.replace(pad_pos, 16, "Item:Padding=\"9\"");
+  std::vector<uint8_t> invalid_large = build_large_heic(bad_padding_xmp);
+  const std::string bad_path = (test_dir / "bad_padding.MP.heic").string();
+  {
+    std::ofstream out(bad_path, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(invalid_large.data()),
+              invalid_large.size());
+  }
+  int bad_fd = open(bad_path.c_str(), O_RDONLY);
+  ASSERT_TRUE(bad_fd >= 0);
+  EXPECT_NE(CheckMotionPhotoFromFile(bad_path), 0);
+  EXPECT_NE(CheckMotionPhotoFromFd(
+                bad_fd, 0, static_cast<int64_t>(invalid_large.size())),
+            0);
+  close(bad_fd);
+  EXPECT_NE(
+      CheckMotionPhotoFromMemory(invalid_large.data(), invalid_large.size()),
+      0);
+
+  // ExtractMotionPhoto File/Fd/Memory must produce byte-for-byte identical
+  // still image and stripped MP4 video.
+  const std::string ref_heic =
+      "lib/core/motion_photo/testdata/motion_photo_single_video_track.MP.heic";
+  const size_t ref_size = fs::file_size(ref_heic);
+  std::ifstream ref_in(ref_heic, std::ios::binary);
+  std::vector<uint8_t> ref_buf(ref_size);
+  ASSERT_TRUE(ref_in.read(reinterpret_cast<char*>(ref_buf.data()), ref_size));
+
+  auto read_bytes = [](const std::string& p) {
+    std::ifstream in(p, std::ios::binary);
+    return std::string((std::istreambuf_iterator<char>(in)),
+                       std::istreambuf_iterator<char>());
+  };
+  ExtractorParams p_file{ref_heic,
+                         (test_dir / "out_file.heic").string(),
+                         (test_dir / "out_file.mp4").string(),
+                         ""};
+  ExtractorParams p_fd{ref_heic,
+                       (test_dir / "out_fd.heic").string(),
+                       (test_dir / "out_fd.mp4").string(),
+                       ""};
+  ExtractorParams p_mem{ref_heic,
+                        (test_dir / "out_mem.heic").string(),
+                        (test_dir / "out_mem.mp4").string(),
+                        ""};
+  ASSERT_TRUE(ExtractMotionPhotoFromFile(p_file));
+  int ref_fd = open(ref_heic.c_str(), O_RDONLY);
+  ASSERT_TRUE(ref_fd >= 0);
+  ASSERT_TRUE(ExtractMotionPhotoFromFd(ref_fd, 0, ref_size, p_fd));
+  close(ref_fd);
+  ASSERT_TRUE(
+      ExtractMotionPhotoFromMemory(ref_buf.data(), ref_buf.size(), p_mem));
+
+  EXPECT_EQ(read_bytes(p_file.primary_image_output_path),
+            read_bytes(p_fd.primary_image_output_path));
+  EXPECT_EQ(read_bytes(p_fd.primary_image_output_path),
+            read_bytes(p_mem.primary_image_output_path));
+  EXPECT_EQ(read_bytes(p_file.video_output_path),
+            read_bytes(p_fd.video_output_path));
+  EXPECT_EQ(read_bytes(p_fd.video_output_path),
+            read_bytes(p_mem.video_output_path));
 
   fs::remove_all(test_dir);
 }

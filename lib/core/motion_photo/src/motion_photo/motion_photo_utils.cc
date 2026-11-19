@@ -21,9 +21,11 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <initializer_list>
 #include <memory>
-#include <regex>
 #include <string>
+#include <string_view>
+#include <vector>
 
 #include "image_io/base/data_segment.h"
 #include "image_io/base/data_source.h"
@@ -194,45 +196,299 @@ FileType GetFileTypeFromFileName(const std::string& file_name) {
   return GetFileTypeFromFileExtension(file_name);
 }
 
+namespace {
+
+bool IsXmlSpace(char c) {
+  return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+bool IsIdentChar(char c) {
+  return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
+}
+
+bool IsAttrNameChar(char c) {
+  return IsIdentChar(c) || c == ':' || c == '-' || c == '.';
+}
+
+size_t SkipXmlSpaces(std::string_view s, size_t pos) {
+  while (pos < s.size() && IsXmlSpace(s[pos])) {
+    ++pos;
+  }
+  return pos;
+}
+
+bool ContainsTargetName(std::initializer_list<std::string_view> names,
+                        std::string_view target) {
+  for (std::string_view name : names) {
+    if (name == target) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool ContainsSemanticValue(std::string_view s, std::string_view semantic) {
+  constexpr std::string_view kKey = "Item:Semantic";
+  constexpr std::string_view kCloseTag = "</Item:Semantic>";
+  size_t pos = 0;
+  while ((pos = s.find(kKey, pos)) != std::string_view::npos) {
+    const size_t after = pos + kKey.size();
+    if (pos > 0 && s[pos - 1] == '<' && after < s.size() && s[after] == '>') {
+      size_t val_start = SkipXmlSpaces(s, after + 1);
+      if (val_start + semantic.size() <= s.size() &&
+          s.substr(val_start, semantic.size()) == semantic) {
+        size_t val_end = SkipXmlSpaces(s, val_start + semantic.size());
+        if (val_end + kCloseTag.size() <= s.size() &&
+            s.substr(val_end, kCloseTag.size()) == kCloseTag) {
+          return true;
+        }
+      }
+    } else if (pos == 0 || !IsIdentChar(s[pos - 1])) {
+      size_t eq = SkipXmlSpaces(s, after);
+      if (eq < s.size() && s[eq] == '=') {
+        size_t qpos = SkipXmlSpaces(s, eq + 1);
+        if (qpos < s.size() && (s[qpos] == '"' || s[qpos] == '\'')) {
+          const char quote = s[qpos];
+          const size_t vstart = qpos + 1;
+          if (vstart + semantic.size() < s.size() &&
+              s.substr(vstart, semantic.size()) == semantic &&
+              s[vstart + semantic.size()] == quote) {
+            return true;
+          }
+        }
+      }
+    }
+    pos = after;
+  }
+  return false;
+}
+
+std::string RemoveXmlAttributes(
+    std::string_view s, std::initializer_list<std::string_view> attr_names,
+    bool trim_leading_ws) {
+  std::string out;
+  out.reserve(s.size());
+  size_t copied = 0;
+  size_t search_pos = 0;
+  while (search_pos < s.size()) {
+    const size_t eq = s.find('=', search_pos);
+    if (eq == std::string_view::npos) {
+      break;
+    }
+    size_t name_end = eq;
+    while (name_end > copied && IsXmlSpace(s[name_end - 1])) {
+      --name_end;
+    }
+    size_t name_start = name_end;
+    while (name_start > copied && IsAttrNameChar(s[name_start - 1])) {
+      --name_start;
+    }
+    const bool boundary_ok =
+        (name_start == 0 || !IsIdentChar(s[name_start - 1]));
+    if (!boundary_ok ||
+        !ContainsTargetName(attr_names,
+                            s.substr(name_start, name_end - name_start))) {
+      search_pos = eq + 1;
+      continue;
+    }
+    const size_t qpos = SkipXmlSpaces(s, eq + 1);
+    if (qpos >= s.size() || (s[qpos] != '"' && s[qpos] != '\'')) {
+      search_pos = eq + 1;
+      continue;
+    }
+    const size_t qend = s.find(s[qpos], qpos + 1);
+    if (qend == std::string_view::npos) {
+      search_pos = eq + 1;
+      continue;
+    }
+    size_t cut_start = name_start;
+    if (trim_leading_ws) {
+      while (cut_start > copied && IsXmlSpace(s[cut_start - 1])) {
+        --cut_start;
+      }
+    }
+    out.append(s.data() + copied, cut_start - copied);
+    copied = qend + 1;
+    search_pos = copied;
+  }
+  out.append(s.data() + copied, s.size() - copied);
+  return out;
+}
+
+std::string RemoveSimpleElements(
+    std::string_view s, std::initializer_list<std::string_view> elem_names) {
+  std::string out;
+  out.reserve(s.size());
+  size_t copied = 0;
+  size_t search_pos = 0;
+  while (search_pos < s.size()) {
+    const size_t lt = s.find('<', search_pos);
+    if (lt == std::string_view::npos) {
+      break;
+    }
+    const size_t gt = s.find('>', lt + 1);
+    if (gt == std::string_view::npos) {
+      break;
+    }
+    const std::string_view tag = s.substr(lt + 1, gt - (lt + 1));
+    if (!ContainsTargetName(elem_names, tag)) {
+      search_pos = lt + 1;
+      continue;
+    }
+    const size_t next_lt = s.find('<', gt + 1);
+    if (next_lt == std::string_view::npos || next_lt + 2 + tag.size() >= s.size() ||
+        s[next_lt + 1] != '/' || s.substr(next_lt + 2, tag.size()) != tag ||
+        s[next_lt + 2 + tag.size()] != '>') {
+      search_pos = gt + 1;
+      continue;
+    }
+    out.append(s.data() + copied, lt - copied);
+    copied = next_lt + 3 + tag.size();
+    search_pos = copied;
+  }
+  out.append(s.data() + copied, s.size() - copied);
+  return out;
+}
+
+std::string RemoveContainerDirectory(std::string_view s) {
+  constexpr std::string_view kOpen = "<Container:Directory>";
+  constexpr std::string_view kClose = "</Container:Directory>";
+  std::string out;
+  out.reserve(s.size());
+  size_t copied = 0;
+  size_t search_pos = 0;
+  while (search_pos < s.size()) {
+    const size_t open_pos = s.find(kOpen, search_pos);
+    if (open_pos == std::string_view::npos) {
+      break;
+    }
+    const size_t close_pos = s.find(kClose, open_pos + kOpen.size());
+    if (close_pos == std::string_view::npos) {
+      break;
+    }
+    out.append(s.data() + copied, open_pos - copied);
+    copied = close_pos + kClose.size();
+    search_pos = copied;
+  }
+  out.append(s.data() + copied, s.size() - copied);
+  return out;
+}
+
+size_t FindTagCloseQuoteAware(std::string_view s, size_t start) {
+  char quote = '\0';
+  for (size_t i = start; i < s.size(); ++i) {
+    const char c = s[i];
+    if (quote != '\0') {
+      if (c == quote) {
+        quote = '\0';
+      }
+    } else if (c == '"' || c == '\'') {
+      quote = c;
+    } else if (c == '>') {
+      return i;
+    }
+  }
+  return std::string_view::npos;
+}
+
+std::string RemoveMotionPhotoListItems(std::string_view s) {
+  constexpr std::string_view kOpenLi = "<rdf:li";
+  constexpr std::string_view kCloseLi = "</rdf:li>";
+  std::string out;
+  out.reserve(s.size());
+  size_t copied = 0;
+  size_t search_pos = 0;
+  while (search_pos < s.size()) {
+    const size_t lt = s.find(kOpenLi, search_pos);
+    if (lt == std::string_view::npos) {
+      break;
+    }
+    const size_t after_name = lt + kOpenLi.size();
+    if (after_name >= s.size() ||
+        (!IsXmlSpace(s[after_name]) && s[after_name] != '>' &&
+         s[after_name] != '/')) {
+      search_pos = after_name;
+      continue;
+    }
+    const size_t gt = FindTagCloseQuoteAware(s, after_name);
+    if (gt == std::string_view::npos) {
+      break;
+    }
+    const bool self_closing = (gt > after_name - 1 && s[gt - 1] == '/');
+    size_t elem_end = gt + 1;
+    if (!self_closing) {
+      const size_t close_pos = s.find(kCloseLi, gt + 1);
+      if (close_pos == std::string_view::npos) {
+        search_pos = gt + 1;
+        continue;
+      }
+      const size_t next_li = s.find(kOpenLi, gt + 1);
+      if (next_li != std::string_view::npos && next_li < close_pos) {
+        search_pos = next_li;
+        continue;
+      }
+      elem_end = close_pos + kCloseLi.size();
+    }
+    if (!ContainsSemanticValue(s.substr(lt, elem_end - lt), "MotionPhoto")) {
+      search_pos = elem_end;
+      continue;
+    }
+    size_t cut_start = lt;
+    while (cut_start > copied && IsXmlSpace(s[cut_start - 1])) {
+      --cut_start;
+    }
+    out.append(s.data() + copied, cut_start - copied);
+    copied = elem_end;
+    search_pos = copied;
+  }
+  out.append(s.data() + copied, s.size() - copied);
+  return out;
+}
+
+}  // namespace
+
 std::string StripMotionPhotoMetadata(const std::string& xmp) {
-  std::string result = xmp;
+  const bool has_gainmap = ContainsSemanticValue(xmp, "GainMap");
 
-  bool has_gainmap =
-      (xmp.find("Item:Semantic=\"GainMap\"") != std::string::npos ||
-       xmp.find("Item:Semantic='GainMap'") != std::string::npos ||
-       xmp.find("<Item:Semantic>GainMap</Item:Semantic>") != std::string::npos);
-
+  std::string result;
   if (has_gainmap) {
-    std::regex attr_regex(
-        R"(\b(GCamera|Camera):(MotionPhoto|MotionPhotoVersion|MotionPhotoPresentationTimestampUs)\s*=\s*("[^"]*"|'[^']*'))");
-    result = std::regex_replace(result, attr_regex, "");
-
-    std::regex elem_regex(
-        R"(<((GCamera|Camera):(MotionPhoto|MotionPhotoVersion|MotionPhotoPresentationTimestampUs))>[^<]*</\1>)");
-    result = std::regex_replace(result, elem_regex, "");
-
-    std::regex item_regex(
-        R"raw(\s*<rdf:li\b[^>]*?Item:Semantic\s*=\s*(?:"MotionPhoto"|'MotionPhoto')[^>]*?/>|\s*<rdf:li\b(?:(?!</rdf:li>)[\s\S])*?(?:Item:Semantic\s*=\s*(?:"MotionPhoto"|'MotionPhoto')|<Item:Semantic>\s*MotionPhoto\s*</Item:Semantic>)(?:(?!</rdf:li>)[\s\S])*?</rdf:li>)raw");
-    result = std::regex_replace(result, item_regex, "");
+    result = RemoveXmlAttributes(
+        xmp,
+        {"Camera:MotionPhoto", "Camera:MotionPhotoVersion",
+         "Camera:MotionPhotoPresentationTimestampUs", "GCamera:MotionPhoto",
+         "GCamera:MotionPhotoVersion",
+         "GCamera:MotionPhotoPresentationTimestampUs"},
+        /*trim_leading_ws=*/false);
+    result = RemoveSimpleElements(
+        result,
+        {"Camera:MotionPhoto", "Camera:MotionPhotoVersion",
+         "Camera:MotionPhotoPresentationTimestampUs", "GCamera:MotionPhoto",
+         "GCamera:MotionPhotoVersion",
+         "GCamera:MotionPhotoPresentationTimestampUs"});
+    result = RemoveMotionPhotoListItems(result);
   } else {
-    std::regex attr_regex(
-        R"(\b(?:(?:GCamera|Camera):(?:MotionPhoto|MotionPhotoVersion|MotionPhotoPresentationTimestampUs)|Container:Version)\s*=\s*("[^"]*"|'[^']*'))");
-    result = std::regex_replace(result, attr_regex, "");
-
-    std::regex elem_regex(
-        R"(<((?:GCamera|Camera):(?:MotionPhoto|MotionPhotoVersion|MotionPhotoPresentationTimestampUs)|Container:Version)>[^<]*</\1>)");
-    result = std::regex_replace(result, elem_regex, "");
-
-    std::regex directory_regex(
-        R"(<Container:Directory>[\s\S]*?</Container:Directory>)");
-    result = std::regex_replace(result, directory_regex, "");
+    result = RemoveXmlAttributes(
+        xmp,
+        {"Camera:MotionPhoto", "Camera:MotionPhotoVersion",
+         "Camera:MotionPhotoPresentationTimestampUs", "GCamera:MotionPhoto",
+         "GCamera:MotionPhotoVersion",
+         "GCamera:MotionPhotoPresentationTimestampUs", "Container:Version"},
+        /*trim_leading_ws=*/false);
+    result = RemoveSimpleElements(
+        result,
+        {"Camera:MotionPhoto", "Camera:MotionPhotoVersion",
+         "Camera:MotionPhotoPresentationTimestampUs", "GCamera:MotionPhoto",
+         "GCamera:MotionPhotoVersion",
+         "GCamera:MotionPhotoPresentationTimestampUs", "Container:Version"});
+    result = RemoveContainerDirectory(result);
   }
 
-  auto has_prefix_use = [](const std::string& text, const std::string& prefix) {
-    const std::string needle = prefix + ":";
+  auto has_prefix_use = [](std::string_view text, std::string_view prefix) {
+    const std::string needle = std::string(prefix) + ":";
     size_t pos = 0;
-    while ((pos = text.find(needle, pos)) != std::string::npos) {
-      const bool is_xmlns = pos >= 6 && text.compare(pos - 6, 6, "xmlns:") == 0;
+    while ((pos = text.find(needle, pos)) != std::string_view::npos) {
+      const bool is_xmlns =
+          pos >= 6 && text.compare(pos - 6, 6, "xmlns:") == 0;
       if (!is_xmlns) {
         return true;
       }
@@ -242,9 +498,9 @@ std::string StripMotionPhotoMetadata(const std::string& xmp) {
   };
   for (const char* prefix : {"GCamera", "Camera", "Container", "Item"}) {
     if (!has_prefix_use(result, prefix)) {
-      std::regex xmlns_regex(std::string(R"(\s*\bxmlns:)") + prefix +
-                             R"(\s*=\s*("[^"]*"|'[^']*'))");
-      result = std::regex_replace(result, xmlns_regex, "");
+      const std::string xmlns_attr = std::string("xmlns:") + prefix;
+      result = RemoveXmlAttributes(result, {xmlns_attr},
+                                   /*trim_leading_ws=*/true);
     }
   }
 

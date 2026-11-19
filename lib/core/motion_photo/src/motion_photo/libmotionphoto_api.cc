@@ -156,18 +156,24 @@ class FdDataSource : public ::photos_editing_formats::image_io::DataSource {
         data_transferred = true;
       } else {
         size_t chunk_size = std::max(min_size, static_cast<size_t>(64 * 1024));
-        for (size_t begin = data_range.GetBegin(); begin < data_range.GetEnd();
-             begin += chunk_size) {
-          size_t end = std::min(data_range.GetEnd(), begin + chunk_size);
-          auto data_segment = Read(begin, end - begin);
-          if (data_segment && data_segment->GetLength() > 0) {
-            status = data_destination->Transfer(data_segment->GetDataRange(),
-                                                *data_segment);
-            data_transferred = true;
+        size_t pos = data_range.GetBegin();
+        while (pos < data_range.GetEnd()) {
+          size_t end =
+              pos + std::min(data_range.GetEnd() - pos, chunk_size);
+          auto data_segment = Read(pos, end - pos);
+          if (!data_segment) {
+            break;
           }
+          auto transfer_range = data_segment->GetDataRange().GetIntersection(
+              ::photos_editing_formats::image_io::DataRange(pos, end));
+          if (!transfer_range.IsValid() || transfer_range.GetEnd() <= pos) {
+            break;
+          }
+          status = data_destination->Transfer(transfer_range, *data_segment);
+          data_transferred = true;
+          pos = transfer_range.GetEnd();
           if (status != ::photos_editing_formats::image_io::DataDestination::
-                            kTransferOk ||
-              !data_segment || data_segment->GetLength() == 0) {
+                            kTransferOk) {
             break;
           }
         }
@@ -463,20 +469,47 @@ int CheckMotionPhotoFromFile(const std::string& filepath,
 
 int CheckMotionPhotoFromFd(int fd, int64_t offset, int64_t length,
                            MessageCallback callback) {
-  MotionPhotoMetadata metadata;
-  if (!ParseMotionPhotoFromFd(fd, offset, length, &metadata, callback)) {
+  if (fd < 0 || offset < 0 || length <= 0) {
     return 1;
   }
-  return metadata.is_motion_photo ? 0 : 1;
+  if (static_cast<uint64_t>(offset) >
+      std::numeric_limits<uint64_t>::max() - static_cast<uint64_t>(length)) {
+    return 1;
+  }
+  struct stat st;
+  if (fstat(fd, &st) == 0 && st.st_size >= 0 && offset + length > st.st_size) {
+    return 1;
+  }
+  ::libmotionphoto::motion_photo::FileType file_type =
+      SniffFileTypeFromFd(fd, offset);
+  ::photos_editing_formats::image_io::StringOutputter outputter(
+      [callback](const std::string& msg) {
+        if (callback) callback(msg);
+      });
+  FdDataSource data_source(fd, offset, length, /*owns_fd=*/false);
+  return ::libmotionphoto::motion_photo::CheckMotionPhotoFromSource(
+      &data_source, static_cast<size_t>(length), file_type, "", outputter);
 }
 
 int CheckMotionPhotoFromMemory(const uint8_t* data, size_t size,
                                MessageCallback callback) {
-  MotionPhotoMetadata metadata;
-  if (!ParseMotionPhotoFromMemory(data, size, &metadata, callback)) {
+  if (data == nullptr || size == 0) {
     return 1;
   }
-  return metadata.is_motion_photo ? 0 : 1;
+  ::libmotionphoto::motion_photo::FileType file_type =
+      ::libmotionphoto::motion_photo::SniffFileTypeOrDefaultJpeg(data, size);
+  ::photos_editing_formats::image_io::StringOutputter outputter(
+      [callback](const std::string& msg) {
+        if (callback) callback(msg);
+      });
+  auto data_segment = ::photos_editing_formats::image_io::DataSegment::Create(
+      ::photos_editing_formats::image_io::DataRange(0, size), data,
+      ::photos_editing_formats::image_io::DataSegment::BufferDispositionPolicy::
+          kDontDelete);
+  ::photos_editing_formats::image_io::DataSegmentDataSource data_source(
+      data_segment);
+  return ::libmotionphoto::motion_photo::CheckMotionPhotoFromSource(
+      &data_source, size, file_type, "", outputter);
 }
 
 // =========================================================================
@@ -825,6 +858,11 @@ bool ExtractMotionPhotoFromFile(const ExtractorParams& params,
       });
   int status = ::libmotionphoto::motion_photo::ExtractMotionPhoto(
       internal_params, outputter);
+  if (status == 0 && !params.video_output_path.empty()) {
+    ::photos_editing_formats::image_io::MessageHandler message_handler;
+    ::libmotionphoto::motion_photo::MotionPhotoMp4FileBuilder::
+        StripMetadataTrack(params.video_output_path, &message_handler);
+  }
   return status == 0;
 }
 

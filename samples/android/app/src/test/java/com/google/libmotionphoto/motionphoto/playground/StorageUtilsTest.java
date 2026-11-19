@@ -21,6 +21,7 @@ import static org.junit.Assert.assertTrue;
 import android.content.ContentProvider;
 import android.content.ContentValues;
 import android.content.Context;
+import android.content.pm.ProviderInfo;
 import android.database.Cursor;
 import android.database.MatrixCursor;
 import android.net.Uri;
@@ -86,8 +87,7 @@ public class StorageUtilsTest {
     }
 
     String authority = "com.google.libmotionphoto.test.generic";
-    ShadowContentResolver.registerProviderInternal(
-        authority,
+    ContentProvider provider =
         new ContentProvider() {
           @Override
           public boolean onCreate() {
@@ -134,7 +134,11 @@ public class StorageUtilsTest {
               Uri uri, ContentValues values, String selection, String[] selectionArgs) {
             return 0;
           }
-        });
+        };
+    ProviderInfo providerInfo = new ProviderInfo();
+    providerInfo.authority = authority;
+    provider.attachInfo(context, providerInfo);
+    ShadowContentResolver.registerProviderInternal(authority, provider);
 
     Uri avifUri = Uri.parse("content://" + authority + "/item1");
     String avifCopied = StorageUtils.copyUriToTempFile(context, avifUri, "generic_avif", ".jpg");

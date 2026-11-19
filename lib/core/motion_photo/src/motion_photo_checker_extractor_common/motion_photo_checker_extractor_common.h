@@ -88,6 +88,15 @@ bool ReadDecodeAndCheckVideoMetadata(
     const image_io::StringOutputter& outputter,
     image_io::MessageHandler* message_handler);
 
+// Reads, decodes, and checks the video metadata from a DataSource MP4 slice.
+bool ReadDecodeAndCheckVideoMetadata(
+    image_io::DataSource* data_source, size_t file_size,
+    const std::string& motion_photo_file_name, int64_t mp4_offset,
+    MotionPhoto* motion_photo, MotionPhotoReader* motion_photo_reader,
+    MotionPhotoChecker* motion_photo_checker,
+    const image_io::StringOutputter& outputter,
+    image_io::MessageHandler* message_handler);
+
 }  // namespace motion_photo
 }  // namespace libmotionphoto
 

@@ -444,6 +444,11 @@ TEST(HeifIsoMetaEditorTest, RejectsMalformedInput) {
   Bytes garbage = {0, 0, 0, 3, 'f', 't', 'y', 'p'};
   EXPECT_TRUE(!HeifIsoMetaEditor::SetPrimaryXmp(garbage.data(), garbage.size(),
                                                 xmp, &output, &error));
+  EXPECT_NE(error.find("Malformed or truncated"), std::string::npos);
+  Bytes not_ftyp = MakeBox("free", Bytes(4, 0));
+  EXPECT_TRUE(!HeifIsoMetaEditor::SetPrimaryXmp(not_ftyp.data(), not_ftyp.size(),
+                                                xmp, &output, &error));
+  EXPECT_NE(error.find("starting with 'ftyp'"), std::string::npos);
   Bytes no_meta = Cat({Ftyp(), MakeBox("mdat", Bytes(4, 1))});
   EXPECT_TRUE(!HeifIsoMetaEditor::SetPrimaryXmp(no_meta.data(), no_meta.size(),
                                                 xmp, &output, &error));

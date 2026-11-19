@@ -2000,7 +2000,9 @@ TEST(MotionPhotoBuilderTest,
       "lib/core/motion_photo/testdata/motion_photo_video_only.mp4";
   auto put = [](std::vector<uint8_t>* out, uint64_t val, size_t n) {
     for (size_t i = n; i > 0; --i) {
-      out->push_back(static_cast<uint8_t>((val >> (8 * (i - 1))) & 0xFF));
+      size_t shift = 8 * (i - 1);
+      out->push_back(
+          static_cast<uint8_t>(shift >= 64 ? 0 : ((val >> shift) & 0xFF)));
     }
   };
   auto put_str = [](std::vector<uint8_t>* out, absl::string_view s) {
@@ -2074,7 +2076,7 @@ TEST(MotionPhotoBuilderTest,
     std::vector<uint8_t> hdlr_p;
     put(&hdlr_p, 0, 4);
     put_str(&hdlr_p, "pict");
-    put(&hdlr_p, 0, 13);
+    hdlr_p.insert(hdlr_p.end(), 13, 0);
     std::vector<uint8_t> pitm_p;
     put(&pitm_p, 1, 2);
     std::vector<uint8_t> iinf_p;

@@ -109,17 +109,23 @@ class FdDataSource : public libmotionphoto::image_io::DataSource {
         data_transferred = true;
       } else {
         size_t chunk_size = std::max(min_size, static_cast<size_t>(64 * 1024));
-        for (size_t begin = data_range.GetBegin(); begin < data_range.GetEnd();
-             begin += chunk_size) {
-          size_t end = std::min(data_range.GetEnd(), begin + chunk_size);
-          auto data_segment = Read(begin, end - begin);
-          if (data_segment && data_segment->GetLength() > 0) {
-            status = data_destination->Transfer(data_segment->GetDataRange(),
-                                                *data_segment);
-            data_transferred = true;
+        size_t pos = data_range.GetBegin();
+        while (pos < data_range.GetEnd()) {
+          size_t end =
+              pos + std::min(data_range.GetEnd() - pos, chunk_size);
+          auto data_segment = Read(pos, end - pos);
+          if (!data_segment) {
+            break;
           }
-          if (status != ii::DataDestination::kTransferOk || !data_segment ||
-              data_segment->GetLength() == 0) {
+          auto transfer_range = data_segment->GetDataRange().GetIntersection(
+              ii::DataRange(pos, end));
+          if (!transfer_range.IsValid() || transfer_range.GetEnd() <= pos) {
+            break;
+          }
+          status = data_destination->Transfer(transfer_range, *data_segment);
+          data_transferred = true;
+          pos = transfer_range.GetEnd();
+          if (status != ii::DataDestination::kTransferOk) {
             break;
           }
         }

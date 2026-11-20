@@ -16,19 +16,21 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <memory>
+#include <fstream>
+#include <ios>
 #include <string>
 #include <string_view>
 #include <vector>
 
-#if defined(MOTION_PHOTO_HEIC_SUPPORT)
-#include <libheif/heif.h>
-#include "motion_photo_heif/libheif_deleter.h"
-#endif  // defined(MOTION_PHOTO_HEIC_SUPPORT)
-
+#include "image_io/base/data_range.h"
+#include "image_io/base/data_segment.h"
+#include "image_io/base/data_segment_data_source.h"
 #include "image_io/utils/file_utils.h"
+#include "motion_photo/container_splitter.h"
 #include "motion_photo/motion_photo_source.h"
+#include "motion_photo/motion_photo_utils.h"
 #include "motion_photo/mpvd_box.h"
+#include "motion_photo_heif/heif_iso_meta_editor.h"
 
 namespace libmotionphoto {
 namespace motion_photo {
@@ -37,24 +39,6 @@ namespace {
 
 using image_io::Byte;
 using libmotionphoto::image_io::Message;
-
-#if defined(MOTION_PHOTO_HEIC_SUPPORT)
-struct HeifSinkWriter {
-  static struct heif_error WriteCallback(struct heif_context* ctx,
-                                         const void* data, size_t size,
-                                         void* userdata) {
-    DataSink* sink = static_cast<DataSink*>(userdata);
-    if (!sink->Write(static_cast<const uint8_t*>(data), size)) {
-      struct heif_error err = {heif_error_Encoding_error,
-                               heif_suberror_Cannot_write_output_data,
-                               "Failed to write to data sink"};
-      return err;
-    }
-    struct heif_error ok = {heif_error_Ok, heif_suberror_Unspecified, "Success"};
-    return ok;
-  }
-};
-#endif  // defined(MOTION_PHOTO_HEIC_SUPPORT)
 
 }  // namespace
 
@@ -71,7 +55,6 @@ bool MotionPhotoHeifImageBuilder::Build(const MediaSource& image_source,
                                         std::string_view xmp_metadata,
                                         const MpvdBox* mpvd_box,
                                         DataSink* output_sink) {
-#if defined(MOTION_PHOTO_HEIC_SUPPORT)
   if (output_sink == nullptr || image_source.GetSize() == 0) {
     return false;
   }
@@ -87,82 +70,24 @@ bool MotionPhotoHeifImageBuilder::Build(const MediaSource& image_source,
     raw_bytes = local_buffer.data();
   }
 
-  heif_error error;
-  std::unique_ptr<heif_context, LibHeifDeleter> context(heif_context_alloc());
-  error = heif_context_read_from_memory_without_copy(context.get(), raw_bytes,
-                                                     raw_size, nullptr);
-  if (error.code != heif_error_Ok) {
-    message_handler_->ReportMessage(Message::kDecodingError,
-                                    "Failed to create heif context");
-    return false;
-  }
-
-  heif_image_handle* handle_ptr;
-  error = heif_context_get_primary_image_handle(context.get(), &handle_ptr);
-  std::unique_ptr<heif_image_handle, LibHeifDeleter> handle(handle_ptr);
-  if (error.code != heif_error_Ok) {
-    message_handler_->ReportMessage(Message::kDecodingError,
-                                    "Failed to get heif primary image handle");
-    return false;
-  }
-
-  heif_image* img_ptr;
-  error = heif_decode_image(handle.get(), &img_ptr, heif_colorspace_RGB,
-                            heif_chroma_interleaved_RGB, nullptr);
-  if (error.code != heif_error_Ok) {
-    message_handler_->ReportMessage(Message::kDecodingError,
-                                    "Failed to decode the HEIF image");
-    return false;
-  }
-  std::unique_ptr<heif_image, LibHeifDeleter> img(img_ptr);
-
-  heif_compression_format compression_format = heif_compression_HEVC;
-  const char* mime = heif_get_file_mime_type(raw_bytes, raw_size);
-  if (mime != nullptr) {
-    std::string_view mime_str(mime);
-    if (mime_str.find("avif") != std::string_view::npos) {
-      compression_format = heif_compression_AV1;
+  // Losslessly rewrite the HEIF 'meta' box: the coded image items are copied
+  // bit-exactly and only the primary image XMP item is replaced, so no HEVC/AV1
+  // decoder or encoder is needed on any platform.
+  std::vector<uint8_t> edited;
+  std::string error;
+  if (!HeifIsoMetaEditor::SetPrimaryXmp(raw_bytes, raw_size, xmp_metadata,
+                                        &edited, &error)) {
+    if (message_handler_ != nullptr) {
+      message_handler_->ReportMessage(
+          Message::kDecodingError, "Failed to set HEIF primary XMP: " + error);
     }
-  }
-
-  heif_encoder* encoder_ptr;
-  error = heif_context_get_encoder_for_format(context.get(), compression_format,
-                                              &encoder_ptr);
-  if (error.code != heif_error_Ok) {
-    std::string error_msg = "Failed to get encoder for format: ";
-    error_msg += (compression_format == heif_compression_AV1) ? "AV1" : "HEVC";
-    message_handler_->ReportMessage(Message::kDecodingError, error_msg);
     return false;
   }
-  std::unique_ptr<heif_encoder, LibHeifDeleter> encoder(encoder_ptr);
-  heif_encoder_set_lossy_quality(encoder.get(), 100);
-
-  std::unique_ptr<heif_context, LibHeifDeleter> new_context(heif_context_alloc());
-  error = heif_context_encode_image(new_context.get(), img.get(), encoder.get(),
-                                    nullptr, nullptr);
-  if (error.code != heif_error_Ok) {
-    message_handler_->ReportMessage(Message::kDecodingError,
-                                    "Failed to re-encode the image");
-    return false;
-  }
-
-  error =
-      heif_context_add_XMP_metadata(new_context.get(), handle.get(),
-                                    xmp_metadata.data(), xmp_metadata.length());
-  if (error.code != heif_error_Ok) {
-    message_handler_->ReportMessage(Message::kDecodingError,
-                                    "Failed to add XMP to HEIF image");
-    return false;
-  }
-
-  struct heif_writer writer;
-  writer.writer_api_version = 1;
-  writer.write = HeifSinkWriter::WriteCallback;
-
-  error = heif_context_write(new_context.get(), &writer, output_sink);
-  if (error.code != heif_error_Ok) {
-    message_handler_->ReportMessage(Message::kDecodingError,
-                                    "Failed to write HEIF image to sink");
+  if (!output_sink->Write(edited.data(), edited.size())) {
+    if (message_handler_ != nullptr) {
+      message_handler_->ReportMessage(Message::kDecodingError,
+                                      "Failed to write HEIF image to sink");
+    }
     return false;
   }
 
@@ -175,11 +100,6 @@ bool MotionPhotoHeifImageBuilder::Build(const MediaSource& image_source,
   }
 
   return true;
-#else   // defined(MOTION_PHOTO_HEIC_SUPPORT)
-  message_handler_->ReportMessage(Message::kDecodingError,
-                                  "HEIF support is disabled in this build");
-  return false;
-#endif  // !defined(MOTION_PHOTO_HEIC_SUPPORT)
 }
 
 bool MotionPhotoHeifImageBuilder::AddImageFileAndMetadata(
@@ -201,6 +121,102 @@ bool MotionPhotoHeifImageBuilder::AddPaddingFromMpvdBox(
   output_file->write(reinterpret_cast<const char*>(padding.data()),
                      padding.size() * sizeof(Byte));
   return true;
+}
+
+bool MotionPhotoHeifImageBuilder::StripToStillImageFromMemory(
+    const uint8_t* data, size_t size, size_t trailing_image_size,
+    std::string_view fallback_xmp, const std::string& output_path,
+    image_io::MessageHandler* message_handler) {
+  if (data == nullptr || size == 0 || output_path.empty()) {
+    return false;
+  }
+  const bool has_trailing_boundary =
+      trailing_image_size > 0 && trailing_image_size <= size;
+  const size_t still_size = has_trailing_boundary ? trailing_image_size : size;
+
+  auto data_segment = ::photos_editing_formats::image_io::DataSegment::Create(
+      ::photos_editing_formats::image_io::DataRange(0, still_size),
+      const_cast<uint8_t*>(data),
+      ::photos_editing_formats::image_io::DataSegment::BufferDispositionPolicy::
+          kDontDelete);
+  ::photos_editing_formats::image_io::DataSegmentDataSource data_source(
+      data_segment);
+  std::vector<::photos_editing_formats::image_io::DataRange> xmp_ranges =
+      FindHeifPrimaryXmpRanges(&data_source, still_size);
+
+  std::string stripped_xmp;
+  std::string original_xmp;
+  if (!xmp_ranges.empty() &&
+      ReadDataRangesToString(&data_source, xmp_ranges, &original_xmp)) {
+    stripped_xmp = StripMotionPhotoMetadata(original_xmp);
+  } else {
+    stripped_xmp.assign(fallback_xmp);
+  }
+  if (stripped_xmp.find_first_not_of(" \t\r\n") == std::string::npos) {
+    stripped_xmp = "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"/>";
+  }
+
+  // Fast path: overwrite single-extent XMP in place when no bytes follow
+  // `still_size` and the stripped packet does not grow.
+  if (has_trailing_boundary && xmp_ranges.size() == 1 &&
+      xmp_ranges.front().GetEnd() <= still_size &&
+      stripped_xmp.size() <= xmp_ranges.front().GetLength()) {
+    const size_t xmp_begin = xmp_ranges.front().GetBegin();
+    const size_t xmp_len = xmp_ranges.front().GetLength();
+    const size_t xmp_end = xmp_ranges.front().GetEnd();
+    std::string padded = stripped_xmp;
+    padded.append(xmp_len - padded.size(), ' ');
+    std::ofstream out(output_path, std::ios::binary);
+    if (out.is_open()) {
+      out.write(reinterpret_cast<const char*>(data),
+                static_cast<std::streamsize>(xmp_begin));
+      out.write(padded.data(), static_cast<std::streamsize>(padded.size()));
+      out.write(reinterpret_cast<const char*>(data + xmp_end),
+                static_cast<std::streamsize>(still_size - xmp_end));
+      if (out.good()) {
+        return true;
+      }
+    }
+  }
+
+  std::vector<uint8_t> rebuilt;
+  std::string error;
+  if (!HeifIsoMetaEditor::SetPrimaryXmp(data, still_size, stripped_xmp,
+                                        &rebuilt, &error)) {
+    if (message_handler != nullptr) {
+      message_handler->ReportMessage(
+          Message::kDecodingError, "Failed to set HEIF primary XMP: " + error);
+    }
+    return false;
+  }
+  std::ofstream out(output_path, std::ios::binary);
+  if (!out.is_open()) {
+    return false;
+  }
+  out.write(reinterpret_cast<const char*>(rebuilt.data()),
+            static_cast<std::streamsize>(rebuilt.size()));
+  return out.good();
+}
+
+bool MotionPhotoHeifImageBuilder::StripToStillImageFromDataSource(
+    image_io::DataSource* data_source, size_t source_size,
+    bool mpvd_is_trailing, size_t trailing_image_size,
+    std::string_view fallback_xmp, const std::string& output_path,
+    image_io::MessageHandler* message_handler) {
+  if (data_source == nullptr || source_size == 0 || output_path.empty()) {
+    return false;
+  }
+  const size_t read_size = (mpvd_is_trailing && trailing_image_size > 0 &&
+                            trailing_image_size <= source_size)
+                               ? trailing_image_size
+                               : source_size;
+  std::vector<uint8_t> buffer;
+  if (!ReadDataRangeToBytes(data_source, 0, read_size, &buffer)) {
+    return false;
+  }
+  return StripToStillImageFromMemory(
+      buffer.data(), buffer.size(), mpvd_is_trailing ? buffer.size() : 0,
+      fallback_xmp, output_path, message_handler);
 }
 
 }  // namespace motion_photo

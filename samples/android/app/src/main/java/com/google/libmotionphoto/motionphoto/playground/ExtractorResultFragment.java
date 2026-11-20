@@ -36,7 +36,6 @@ import android.view.LayoutInflater;
 import android.view.SurfaceView;
 import android.view.View;
 import android.view.ViewGroup;
-import android.webkit.MimeTypeMap;
 import android.widget.Button;
 import android.widget.ImageView;
 import android.widget.ScrollView;
@@ -280,8 +279,8 @@ public class ExtractorResultFragment extends Fragment {
                 File imgFile = viewModel.getExtractorExtractedImageFile().getValue();
                 if (imgFile != null && imgFile.exists()) {
                   pendingFileToSave = imgFile;
-                  String mimeType = getMimeType(imgFile);
-                  String ext = imgFile.getName().substring(imgFile.getName().lastIndexOf('.'));
+                  String mimeType = StorageUtils.getMimeType(imgFile);
+                  String ext = StorageUtils.getFileExtension(imgFile.getName(), ".jpg");
 
                   saveLauncher.launch(
                       new CreateDocumentDynamic.Params(mimeType, "extracted_image" + ext));
@@ -591,7 +590,14 @@ public class ExtractorResultFragment extends Fragment {
             gainmapPresent ? (hasGainmapObj ? "ISO 21496-1 (Attached)" : "XMP Container") : "None")
         .append("\n");
     Bitmap.Config config = bitmap != null ? bitmap.getConfig() : null;
-    sb.append("Format: ").append(config != null ? config.name() : "JPEG (Hardware)").append("\n");
+    String hardwareLabel = "JPEG (Hardware)";
+    String fileExt = StorageUtils.getFileExtension(file != null ? file.getName() : null, ".jpg");
+    if (".avif".equals(fileExt)) {
+      hardwareLabel = "AVIF (Hardware)";
+    } else if (".heic".equals(fileExt) || ".heif".equals(fileExt)) {
+      hardwareLabel = "HEIC (Hardware)";
+    }
+    sb.append("Format: ").append(config != null ? config.name() : hardwareLabel).append("\n");
     boolean isWindowHdr = false;
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && getActivity() != null) {
       isWindowHdr = (getActivity().getWindow().getColorMode() == ActivityInfo.COLOR_MODE_HDR);
@@ -1118,7 +1124,7 @@ public class ExtractorResultFragment extends Fragment {
               return;
             }
 
-            String ext = inputPath.substring(inputPath.lastIndexOf('.'));
+            String ext = StorageUtils.getFileExtension(inputPath, ".jpg");
 
             File extractedImageFile =
                 File.createTempFile("extractor_extracted_photo", ext, context.getCacheDir());
@@ -1169,23 +1175,6 @@ public class ExtractorResultFragment extends Fragment {
             isExtracting.set(false);
           }
         });
-  }
-
-  private String getMimeType(File file) {
-    String ext = MimeTypeMap.getFileExtensionFromUrl(file.getAbsolutePath());
-    if (ext == null || ext.isEmpty()) {
-      String name = file.getName();
-      int lastDot = name.lastIndexOf('.');
-      if (lastDot != -1) {
-        ext = name.substring(lastDot + 1);
-      }
-    }
-
-    if (ext != null) {
-      return MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext.toLowerCase(Locale.US));
-    }
-
-    return "*/*";
   }
 
   @SuppressWarnings("ContentResolverUri")
@@ -1361,26 +1350,37 @@ public class ExtractorResultFragment extends Fragment {
       return false;
     }
 
-    try (java.io.FileInputStream fis = new java.io.FileInputStream(file)) {
-      byte[] header = new byte[(int) Math.min(file.length(), 65536)];
-      int read = fis.read(header);
-      if (read > 0) {
-        String str = new String(header, 0, read, java.nio.charset.StandardCharsets.ISO_8859_1);
-        if (str.contains("hdrgm")
-            || str.contains("GainMap")
-            || str.contains("21496")
-            || str.contains("ultrahdr")) {
+    try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(file, "r")) {
+      long fileLen = raf.length();
+      int headLen = (int) Math.min(fileLen, 65536L);
+      byte[] head = new byte[headLen];
+      raf.readFully(head);
+      if (containsGainmapMarker(head, headLen)) {
+        return true;
+      }
+      if (fileLen > 65536L) {
+        long tailOffset = Math.max(65536L, fileLen - 131072L);
+        int tailLen = (int) (fileLen - tailOffset);
+        byte[] tail = new byte[tailLen];
+        raf.seek(tailOffset);
+        raf.readFully(tail);
+        if (containsGainmapMarker(tail, tailLen)) {
           return true;
         }
       }
-
     } catch (Exception ignored) {
-
       // Ignored: Non-critical heuristic check for UltraHDR/Gainmap markers.
-
     }
 
     return false;
+  }
+
+  private static boolean containsGainmapMarker(byte[] bytes, int len) {
+    String str = new String(bytes, 0, len, java.nio.charset.StandardCharsets.ISO_8859_1);
+    return str.contains("hdrgm")
+        || str.contains("GainMap")
+        || str.contains("21496")
+        || str.contains("ultrahdr");
   }
 
   private void updateImageTabHdrState(boolean isHdr) {

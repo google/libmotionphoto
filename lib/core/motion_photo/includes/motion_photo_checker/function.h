@@ -15,8 +15,12 @@
 #ifndef MOTION_PHOTO_CHECKER_FUNCTION_H_  // NOLINT
 #define MOTION_PHOTO_CHECKER_FUNCTION_H_  // NOLINT
 
+#include <cstddef>
 #include <functional>
 #include <string>
+
+#include "image_io/base/data_source.h"
+#include "motion_photo/motion_photo.h"
 
 namespace libmotionphoto {
 namespace motion_photo {
@@ -25,6 +29,11 @@ using StringOutputter = std::function<void(const std::string&)>;
 
 int CheckMotionPhoto(const std::string& motion_photo_file_name,
                      const StringOutputter& outputter);
+
+int CheckMotionPhotoFromSource(image_io::DataSource* data_source,
+                               size_t file_size, FileType file_type,
+                               const std::string& motion_photo_file_name,
+                               const StringOutputter& outputter);
 
 /// The motion photo checker entry point, easily callable from a main() type
 /// function.

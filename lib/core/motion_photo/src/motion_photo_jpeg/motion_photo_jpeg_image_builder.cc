@@ -191,7 +191,8 @@ bool MotionPhotoJpegImageBuilder::Build(
   }
   size_t new_xmp_size = xmp_segment->GetDataRange().GetLength();
   size_t old_xmp_size = cut_range.GetLength();
-  ssize_t delta_xmp = new_xmp_size - old_xmp_size;
+  ssize_t delta_xmp =
+      static_cast<ssize_t>(new_xmp_size) - static_cast<ssize_t>(old_xmp_size);
 
   // Handle MPF if present
   shared_ptr<DataSegment> new_mpf_segment = nullptr;
@@ -227,19 +228,87 @@ bool MotionPhotoJpegImageBuilder::Build(
           delta_mpf = static_cast<ssize_t>(new_mpf_size) -
                       static_cast<ssize_t>(old_mpf_size);
 
-          size_t new_primary_image_size =
-              old_primary_image_size + delta_xmp + delta_mpf;
-          mpf_info.entries[0].image_size = new_primary_image_size;
+          const int64_t primary_delta =
+              static_cast<int64_t>(delta_xmp) + static_cast<int64_t>(delta_mpf);
+          const int64_t new_primary_image_size =
+              static_cast<int64_t>(old_primary_image_size) + primary_delta;
 
-          MpfInfoEncoder encoder;
-          const auto& encoded_mpf = encoder.Encode(mpf_info, true);
+          // Per CIPA DC-007 section 5.2.3.3, secondary image offsets (i >= 1,
+          // when non-zero) are relative to the MP Endian field inside the APP2
+          // MPF segment:
+          // - If XMP (cut_range) precedes MPF (mpf_range), both the MP Endian
+          //   field and secondary images shift by delta_xmp, so the relative
+          //   offset shifts by delta_mpf.
+          // - If XMP (cut_range) follows MPF (mpf_range), the MP Endian field
+          //   does not move while secondary images shift by (delta_xmp +
+          //   delta_mpf).
+          const bool xmp_precedes_mpf =
+              cut_range.GetEnd() <= mpf_range.GetBegin();
+          const int64_t secondary_offset_delta =
+              xmp_precedes_mpf ? static_cast<int64_t>(delta_mpf)
+                               : primary_delta;
 
-          Byte* mpf_buffer = new Byte[encoded_mpf.size()];
-          absl::c_copy(encoded_mpf, mpf_buffer);
+          bool mpf_offsets_valid = new_primary_image_size > 0 &&
+                                   new_primary_image_size <= UINT32_MAX;
+          size_t max_mpf_image_end = image_range.GetEnd();
+          const uint64_t old_mpf_endian_pos =
+              static_cast<uint64_t>(mpf_range.GetBegin()) + header_offset;
 
-          DataRange new_mpf_range(0, encoded_mpf.size());
-          new_mpf_segment = DataSegment::Create(new_mpf_range, mpf_buffer,
-                                                DataSegment::kDelete);
+          for (size_t i = 1; mpf_offsets_valid && i < mpf_info.entries.size();
+               ++i) {
+            const uint32_t orig_offset = mpf_info.entries[i].image_offset;
+            if (orig_offset == 0) {
+              continue;
+            }
+            const uint64_t orig_img_start = old_mpf_endian_pos + orig_offset;
+            const uint64_t orig_img_end =
+                orig_img_start + mpf_info.entries[i].image_size;
+            if (orig_img_end > max_mpf_image_end &&
+                orig_img_end <= image_source.GetSize() &&
+                mpf_info.entries[i].image_size >= 4) {
+              Byte markers[4] = {0};
+              if (image_source.ReadAt(static_cast<size_t>(orig_img_start), 2,
+                                      markers) &&
+                  image_source.ReadAt(static_cast<size_t>(orig_img_end - 2), 2,
+                                      markers + 2) &&
+                  markers[0] == 0xFF && markers[1] == JpegMarker::kSOI &&
+                  markers[2] == 0xFF && markers[3] == JpegMarker::kEOI) {
+                max_mpf_image_end = static_cast<size_t>(orig_img_end);
+              }
+            }
+
+            const int64_t updated_offset =
+                static_cast<int64_t>(orig_offset) + secondary_offset_delta;
+            if (updated_offset <= 0 || updated_offset > UINT32_MAX) {
+              mpf_offsets_valid = false;
+              break;
+            }
+            mpf_info.entries[i].image_offset =
+                static_cast<uint32_t>(updated_offset);
+          }
+
+          if (mpf_offsets_valid) {
+            image_range = DataRange(image_range.GetBegin(), max_mpf_image_end);
+            mpf_info.entries[0].image_size =
+                static_cast<uint32_t>(new_primary_image_size);
+
+            MpfInfoEncoder encoder;
+            const auto& encoded_mpf = encoder.Encode(mpf_info, true);
+
+            Byte* mpf_buffer = new Byte[encoded_mpf.size()];
+            absl::c_copy(encoded_mpf, mpf_buffer);
+
+            DataRange new_mpf_range(0, encoded_mpf.size());
+            new_mpf_segment = DataSegment::Create(new_mpf_range, mpf_buffer,
+                                                  DataSegment::kDelete);
+          } else {
+            if (message_handler_) {
+              message_handler_->ReportMessage(
+                  Message::kValueError,
+                  "MPF offsets or primary image size exceed 32-bit bounds.");
+            }
+            return false;
+          }
         }
       }
     }
@@ -258,7 +327,10 @@ bool MotionPhotoJpegImageBuilder::Build(
 
   std::sort(replacements.begin(), replacements.end(),
             [](const Replacement& a, const Replacement& b) {
-              return a.old_range.GetBegin() < b.old_range.GetBegin();
+              if (a.old_range.GetBegin() != b.old_range.GetBegin()) {
+                return a.old_range.GetBegin() < b.old_range.GetBegin();
+              }
+              return a.old_range.GetEnd() < b.old_range.GetEnd();
             });
 
   // Stream slices directly into output_sink without intermediate files

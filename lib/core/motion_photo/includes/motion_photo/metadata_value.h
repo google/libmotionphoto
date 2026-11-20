@@ -17,6 +17,7 @@
 
 #include <cctype>
 #include <string>
+#include <string_view>
 
 namespace libmotionphoto {
 namespace motion_photo {
@@ -64,11 +65,11 @@ struct MetadataValue {
   bool is_valid_;
 };
 
-inline bool EqualsIgnoreCase(const std::string& s1, const std::string& s2) {
-  if (s1.length() != s2.length()) {
+inline bool EqualsIgnoreCase(std::string_view s1, std::string_view s2) {
+  if (s1.size() != s2.size()) {
     return false;
   }
-  for (size_t i = 0; i < s1.length(); ++i) {
+  for (size_t i = 0; i < s1.size(); ++i) {
     if (std::tolower(static_cast<unsigned char>(s1[i])) !=
         std::tolower(static_cast<unsigned char>(s2[i]))) {
       return false;
@@ -78,11 +79,11 @@ inline bool EqualsIgnoreCase(const std::string& s1, const std::string& s2) {
 }
 
 inline bool EqualsIgnoreCase(const MetadataValue<std::string>& v,
-                             const std::string& s) {
-  return v.IsValid() && EqualsIgnoreCase(v.GetValue(), s);
+                             std::string_view s) {
+  return v.IsValid() && EqualsIgnoreCase(std::string_view(v.GetValue()), s);
 }
 
-inline bool EqualsIgnoreCase(const std::string& s,
+inline bool EqualsIgnoreCase(std::string_view s,
                              const MetadataValue<std::string>& v) {
   return EqualsIgnoreCase(v, s);
 }
@@ -90,7 +91,8 @@ inline bool EqualsIgnoreCase(const std::string& s,
 inline bool EqualsIgnoreCase(const MetadataValue<std::string>& v1,
                              const MetadataValue<std::string>& v2) {
   return v1.IsValid() && v2.IsValid() &&
-         EqualsIgnoreCase(v1.GetValue(), v2.GetValue());
+         EqualsIgnoreCase(std::string_view(v1.GetValue()),
+                          std::string_view(v2.GetValue()));
 }
 
 }  // namespace motion_photo

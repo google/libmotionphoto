@@ -76,7 +76,8 @@ class MotionPhotoMp4FileBuilder {
   static bool IsOptimizationSupported(
       const std::string& file_name, image_io::MessageHandler* message_handler);
 
-  // Strips the metadata track from an MP4 file in-place and optimizes it.
+  // Strips Motion Photo metadata tracks from an MP4 file in-place while
+  // preserving video, audio, and dynamic HDR (AGTM) metadata tracks.
   //   file_name: The name of the file to modify.
   //   message_handler: An message handler for writing messages.
   // Returns whether the operation was successful.

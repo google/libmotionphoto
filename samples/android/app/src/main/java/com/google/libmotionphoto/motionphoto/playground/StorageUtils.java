@@ -21,7 +21,6 @@ import android.webkit.MimeTypeMap;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
-import java.io.FileWriter;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -35,33 +34,95 @@ public class StorageUtils {
   @SuppressWarnings("ContentResolverUri")
   public static String copyUriToTempFile(
       Context context, Uri uri, String prefix, String defaultSuffix) throws IOException {
-    InputStream inputStream;
-    if ("file".equals(uri.getScheme())) {
-      inputStream = new FileInputStream(new File(uri.getPath()));
-    } else {
-      inputStream = context.getContentResolver().openInputStream(uri);
+    String suffix = resolveSuffix(context, uri, defaultSuffix);
+    File tempFile = File.createTempFile(prefix, suffix, context.getCacheDir());
+    try (InputStream inputStream = "file".equals(uri.getScheme())
+            ? new FileInputStream(new File(uri.getPath()))
+            : context.getContentResolver().openInputStream(uri)) {
+      if (inputStream == null) {
+        throw new IOException("Failed to open input stream for URI: " + uri);
+      }
+      try (FileOutputStream outputStream = new FileOutputStream(tempFile)) {
+        byte[] buffer = new byte[4096];
+        int bytesRead;
+        while ((bytesRead = inputStream.read(buffer)) != -1) {
+          outputStream.write(buffer, 0, bytesRead);
+        }
+      }
+    } catch (IOException | RuntimeException e) {
+      tempFile.delete();
+      throw e;
     }
-    if (inputStream == null) {
-      throw new IOException("Failed to open input stream for URI: " + uri);
-    }
-    String suffix = defaultSuffix;
+    return tempFile.getAbsolutePath();
+  }
+
+  private static String resolveSuffix(Context context, Uri uri, String defaultSuffix) {
     String mimeType = context.getContentResolver().getType(uri);
     if (mimeType != null) {
-      String ext = MimeTypeMap.getSingleton().getExtensionFromMimeType(mimeType);
-      if (ext != null) {
-        suffix = "." + ext;
+      if (mimeType.equalsIgnoreCase("image/heic") || mimeType.equalsIgnoreCase("image/heif")) {
+        return ".heic";
+      }
+      if (mimeType.equalsIgnoreCase("image/avif")) {
+        return ".avif";
+      }
+      if (!mimeType.equalsIgnoreCase("application/octet-stream") && !mimeType.endsWith("/*")) {
+        String ext = MimeTypeMap.getSingleton().getExtensionFromMimeType(mimeType);
+        if (ext != null && !ext.isEmpty() && !ext.equalsIgnoreCase("bin")) {
+          return "." + ext.toLowerCase(Locale.US);
+        }
       }
     }
-    File tempFile = File.createTempFile(prefix, suffix, context.getCacheDir());
-    FileOutputStream outputStream = new FileOutputStream(tempFile);
-    byte[] buffer = new byte[4096];
-    int bytesRead;
-    while ((bytesRead = inputStream.read(buffer)) != -1) {
-      outputStream.write(buffer, 0, bytesRead);
+    String fileName = getFileNameFromUri(context, uri);
+    return getFileExtension(fileName, defaultSuffix);
+  }
+
+  /** Returns the lowercase dot-prefixed file extension, or {@code fallback} if missing. */
+  public static String getFileExtension(String path, String fallback) {
+    if (path == null || path.isEmpty()) {
+      return fallback;
     }
-    inputStream.close();
-    outputStream.close();
-    return tempFile.getAbsolutePath();
+    int lastSep = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+    int lastDot = path.lastIndexOf('.');
+    if (lastDot > lastSep && lastDot < path.length() - 1) {
+      return path.substring(lastDot).toLowerCase(Locale.US);
+    }
+    return fallback;
+  }
+
+  /** Returns the MIME type for {@code file}, falling back cleanly for HEIC/AVIF/MP4/XML. */
+  public static String getMimeType(File file) {
+    if (file == null) {
+      return "*/*";
+    }
+    String dotExt = getFileExtension(file.getName(), "");
+    String ext = dotExt.isEmpty() ? "" : dotExt.substring(1);
+    if (ext.isEmpty()) {
+      String urlExt = MimeTypeMap.getFileExtensionFromUrl(file.getAbsolutePath());
+      ext = urlExt != null ? urlExt.toLowerCase(Locale.US) : "";
+    }
+    switch (ext) {
+      case "heic":
+      case "heif":
+        return "image/heic";
+      case "avif":
+        return "image/avif";
+      case "jpg":
+      case "jpeg":
+        return "image/jpeg";
+      case "mp4":
+        return "video/mp4";
+      case "xml":
+        return "text/xml";
+      default:
+        break;
+    }
+    if (!ext.isEmpty()) {
+      String resolved = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext);
+      if (resolved != null && !resolved.isEmpty()) {
+        return resolved;
+      }
+    }
+    return "*/*";
   }
 
   @SuppressWarnings("ContentResolverUri")
@@ -72,39 +133,6 @@ public class StorageUtils {
           new File(uri.getPath()), ParcelFileDescriptor.MODE_READ_ONLY);
     }
     return context.getContentResolver().openFileDescriptor(uri, "r");
-  }
-
-  public static String generateXmpFile(Context context, long timestampUs) throws IOException {
-    String xmpTemplate =
-        "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"Adobe XMP Core 5.1.0-jc003\">\n"
-            + "  <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n"
-            + "    <rdf:Description rdf:about=\"\"\n"
-            + "      xmlns:Metadata=\"http://ns.google.com/1.0/motion_photo_video_metadata/\">\n"
-            + "      <Metadata:Flags>\n"
-            + "        <Metadata:LowRes Metadata:Stabilized=\"0\"/>\n"
-            + "        <Metadata:HighRes Metadata:Stabilized=\"0\" />\n"
-            + "      </Metadata:Flags>\n"
-            + "      <Metadata:Scores Metadata:ModelVersion=\"1\">\n"
-            + "        <Metadata:PrimaryImage>\n"
-            + "          <Metadata:Frame Metadata:Score=\"1.0\" Metadata:Time=\"%d\" />\n"
-            + "        </Metadata:PrimaryImage>\n"
-            + "        <Metadata:HighResTrack>\n"
-            + "          <rdf:Seq>\n"
-            + "            <rdf:li>\n"
-            + "              <Metadata:Frame Metadata:Score=\"1.0\" Metadata:Time=\"%d\" />\n"
-            + "            </rdf:li>\n"
-            + "          </rdf:Seq>\n"
-            + "        </Metadata:HighResTrack>\n"
-            + "      </Metadata:Scores>\n"
-            + "    </rdf:Description>\n"
-            + "  </rdf:RDF>\n"
-            + "</x:xmpmeta>\n";
-    String xmpContent = String.format(Locale.US, xmpTemplate, timestampUs, timestampUs);
-    File tempFile = File.createTempFile("moments", ".xmp", context.getCacheDir());
-    FileWriter writer = new FileWriter(tempFile);
-    writer.write(xmpContent);
-    writer.close();
-    return tempFile.getAbsolutePath();
   }
 
   public static File copyAssetToCache(Context context, String assetName) throws IOException {

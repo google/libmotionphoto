@@ -66,18 +66,25 @@ public class MotionPhotoBuilderServiceTest {
   public void buildMotionPhotoFromMemory_createsValidContainer() throws Exception {
     File tempOutput = File.createTempFile("service_build_mem_out_", ".jpg");
     tempOutput.deleteOnExit();
+    File tempMeta = File.createTempFile("service_build_mem_meta_", ".xml");
+    tempMeta.deleteOnExit();
 
     byte[] imageBytes = Files.readAllBytes(Path.of(photoOnlyPath));
     byte[] videoBytes = Files.readAllBytes(Path.of(videoOnlyPath));
 
     int buildResult =
         service.buildMotionPhotoFromMemory(
-            imageBytes, videoBytes, null, tempOutput.getAbsolutePath());
+            imageBytes, videoBytes, null, 345678L, tempOutput.getAbsolutePath());
     assertThat(buildResult).isEqualTo(0);
     assertThat(tempOutput.exists()).isTrue();
     assertThat(tempOutput.length()).isGreaterThan(0L);
 
     int checkResult = MotionPhotoChecker.check(tempOutput.getAbsolutePath(), msg -> {});
     assertThat(checkResult).isEqualTo(0);
+
+    assertThat(MetadataEngine.extractMetadata(tempOutput.getAbsolutePath(), tempMeta.getAbsolutePath()))
+        .isTrue();
+    String xmpXml = Files.readString(tempMeta.toPath());
+    assertThat(xmpXml).contains("MotionPhotoPresentationTimestampUs=\"345678\"");
   }
 }

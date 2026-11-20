@@ -51,4 +51,22 @@ interface IMotionPhotoBuilderService {
         in byte[] videoBytes,
         in String momentsXmp,
         in String outputImagePath);
+
+    /**
+     * Assembles a Motion Photo container directly from in-memory byte buffers in a single pass
+     * with an explicit still-image presentation timestamp.
+     *
+     * @param imageBytes The primary image bytes.
+     * @param videoBytes The primary video bytes.
+     * @param momentsXmp Optional moments XMP metadata XML string (can be null).
+     * @param presentationTimestampUs Presentation timestamp in microseconds (-1 for default).
+     * @param outputImagePath The output motion photo file path.
+     * @return 0 on success, or non-zero error code.
+     */
+    int buildMotionPhotoFromMemoryWithTimestamp(
+        in byte[] imageBytes,
+        in byte[] videoBytes,
+        in String momentsXmp,
+        long presentationTimestampUs,
+        in String outputImagePath);
 }

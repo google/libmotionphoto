@@ -276,9 +276,13 @@ bool MotionPhoto::EnforceContainerMetadataValues() {
   if (image_item) {
     if (!image_item->mime.WasAssigned() || image_item->mime.GetValue().empty()) {
       changed = true;
-      image_item->mime = file_type_ == FileType::kJpeg
-                            ? kContainerJpegImageItemMime
-                            : kContainerHeicImageItemMime;
+      if (file_type_ == FileType::kJpeg) {
+        image_item->mime = kContainerJpegImageItemMime;
+      } else if (file_type_ == FileType::kAvif) {
+        image_item->mime = kContainerAvifImageItemMime;
+      } else {
+        image_item->mime = kContainerHeicImageItemMime;
+      }
     }
   }
   if (video_item) {

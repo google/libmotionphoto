@@ -15,13 +15,14 @@
 #ifndef MOTION_PHOTO_BUILDER_FUNCTION_H_
 #define MOTION_PHOTO_BUILDER_FUNCTION_H_
 
-#include <cstdint>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include "motion_photo/metadata_engine.h"
 #include "motion_photo/motion_photo_source.h"
 
 namespace libmotionphoto {
@@ -38,6 +39,7 @@ struct MotionPhotoBuilderParams {
   std::string working_video_file_name;
   std::string optimized_video_file_name;
   int64_t presentation_timestamp_us = -1;
+  HandlerOptions handler_options;
 };
 
 struct MotionPhotoBuilderMemoryParams {
@@ -48,6 +50,7 @@ struct MotionPhotoBuilderMemoryParams {
   std::string moments_xmp;
   std::string output_image_file_name;
   int64_t presentation_timestamp_us = -1;
+  HandlerOptions handler_options;
 };
 
 struct MotionPhotoStreamParams {
@@ -55,6 +58,7 @@ struct MotionPhotoStreamParams {
   std::shared_ptr<MediaSource> primary_video;
   std::string moments_xmp;
   int64_t presentation_timestamp_us = -1;
+  HandlerOptions handler_options;
 };
 
 /// Direct stream-to-sink builder without intermediate files or temp storage.

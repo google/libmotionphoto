@@ -844,8 +844,8 @@ TEST(LibMotionPhotoApiTest, BuildsParsesChecksAndExtractsAvifAndMultiExtent) {
     }
     std::vector<uint8_t> out = make_box("ftyp", ftyp_p);
     auto meta = make_full_box("meta", 0, meta_children);
-    auto mdat =
-        make_box("mdat", std::vector<uint8_t>(av1_pixels.begin(), av1_pixels.end()));
+    auto mdat = make_box(
+        "mdat", std::vector<uint8_t>(av1_pixels.begin(), av1_pixels.end()));
     out.insert(out.end(), meta.begin(), meta.end());
     out.insert(out.end(), mdat.begin(), mdat.end());
     return out;
@@ -881,8 +881,7 @@ TEST(LibMotionPhotoApiTest, BuildsParsesChecksAndExtractsAvifAndMultiExtent) {
   ASSERT_TRUE(ParseMotionPhotoFromFd(
       fd, 0, static_cast<int64_t>(mp_bytes.size()), &fd_meta));
   EXPECT_EQ(
-      CheckMotionPhotoFromFd(fd, 0, static_cast<int64_t>(mp_bytes.size())),
-      0);
+      CheckMotionPhotoFromFd(fd, 0, static_cast<int64_t>(mp_bytes.size())), 0);
   close(fd);
   EXPECT_EQ(CheckMotionPhotoFromMemory(mp_bytes.data(), mp_bytes.size()), 0);
 
@@ -918,7 +917,8 @@ TEST(LibMotionPhotoApiTest, BuildsParsesChecksAndExtractsAvifAndMultiExtent) {
   std::vector<uint8_t> vid_bytes((std::istreambuf_iterator<char>(vid_in)),
                                  std::istreambuf_iterator<char>());
   const std::string ext2 =
-      "<rdf:li><Container:Item Item:Semantic=\"Primary\" Item:Mime=\"image/heic\" "
+      "<rdf:li><Container:Item Item:Semantic=\"Primary\" "
+      "Item:Mime=\"image/heic\" "
       "Item:Padding=\"8\"/></rdf:li>"
       "<rdf:li><Container:Item Item:Semantic=\"MotionPhoto\" "
       "Item:Mime=\"video/mp4\" Item:Length=\"" +
@@ -1008,9 +1008,10 @@ TEST(LibMotionPhotoApiTest, BuildsParsesChecksAndExtractsAvifAndMultiExtent) {
   EXPECT_EQ(multi_mem_meta.presentation_timestamp_us, 777);
   EXPECT_EQ(multi_mem_meta.primary_image_mime, "image/heic");
   EXPECT_EQ(multi_mem_meta.image_padding, 8);
-  EXPECT_EQ(multi_mem_meta.video_length, static_cast<int64_t>(vid_bytes.size()));
-  EXPECT_EQ(
-      CheckMotionPhotoFromMemory(multi_heic.data(), multi_heic.size()), 0);
+  EXPECT_EQ(multi_mem_meta.video_length,
+            static_cast<int64_t>(vid_bytes.size()));
+  EXPECT_EQ(CheckMotionPhotoFromMemory(multi_heic.data(), multi_heic.size()),
+            0);
 
   const std::string multi_path = (test_dir / "multi_ext.MP.heic").string();
   const std::string multi_still = (test_dir / "multi_still.heic").string();
@@ -1025,8 +1026,8 @@ TEST(LibMotionPhotoApiTest, BuildsParsesChecksAndExtractsAvifAndMultiExtent) {
   MotionPhotoMetadata multi_fd_meta;
   ASSERT_TRUE(ParseMotionPhotoFromFd(
       multi_fd, 0, static_cast<int64_t>(multi_heic.size()), &multi_fd_meta));
-  EXPECT_EQ(CheckMotionPhotoFromFd(
-                multi_fd, 0, static_cast<int64_t>(multi_heic.size())),
+  EXPECT_EQ(CheckMotionPhotoFromFd(multi_fd, 0,
+                                   static_cast<int64_t>(multi_heic.size())),
             0);
   close(multi_fd);
   EXPECT_EQ(CheckMotionPhotoFromFile(multi_path), 0);
@@ -1105,8 +1106,9 @@ TEST(LibMotionPhotoApiTest, LargeFdOverreadXmlLangAndParityRegression) {
     return make_box(type, fp);
   };
 
-  std::ifstream vid_in("lib/core/motion_photo/testdata/motion_photo_video_only.mp4",
-                       std::ios::binary);
+  std::ifstream vid_in(
+      "lib/core/motion_photo/testdata/motion_photo_video_only.mp4",
+      std::ios::binary);
   std::vector<uint8_t> vid_bytes((std::istreambuf_iterator<char>(vid_in)),
                                  std::istreambuf_iterator<char>());
   auto mpvd_box = make_box("mpvd", vid_bytes);
@@ -1182,8 +1184,8 @@ TEST(LibMotionPhotoApiTest, LargeFdOverreadXmlLangAndParityRegression) {
       return out;
     };
     auto probe = make_container(0);
-    return make_container(static_cast<uint32_t>(
-        probe.size() - mpvd_box.size() - mdat_p.size()));
+    return make_container(
+        static_cast<uint32_t>(probe.size() - mpvd_box.size() - mdat_p.size()));
   };
 
   // XMP starts >280KB and immediately precedes 'mpvd', plus uses xml:lang.
@@ -1223,13 +1225,13 @@ TEST(LibMotionPhotoApiTest, LargeFdOverreadXmlLangAndParityRegression) {
       fd, 0, static_cast<int64_t>(valid_large.size()), &fd_meta));
   EXPECT_TRUE(fd_meta.is_motion_photo);
   EXPECT_EQ(fd_meta.presentation_timestamp_us, 4242);
-  EXPECT_EQ(CheckMotionPhotoFromFd(
-                fd, 0, static_cast<int64_t>(valid_large.size())),
-            0);
+  EXPECT_EQ(
+      CheckMotionPhotoFromFd(fd, 0, static_cast<int64_t>(valid_large.size())),
+      0);
   close(fd);
   EXPECT_EQ(CheckMotionPhotoFromFile(large_path), 0);
-  EXPECT_EQ(
-      CheckMotionPhotoFromMemory(valid_large.data(), valid_large.size()), 0);
+  EXPECT_EQ(CheckMotionPhotoFromMemory(valid_large.data(), valid_large.size()),
+            0);
 
   // Invalid padding fails CheckMotionPhoto consistently across File/Fd/Memory.
   std::string bad_padding_xmp = valid_xmp;
@@ -1246,8 +1248,8 @@ TEST(LibMotionPhotoApiTest, LargeFdOverreadXmlLangAndParityRegression) {
   int bad_fd = open(bad_path.c_str(), O_RDONLY);
   ASSERT_TRUE(bad_fd >= 0);
   EXPECT_NE(CheckMotionPhotoFromFile(bad_path), 0);
-  EXPECT_NE(CheckMotionPhotoFromFd(
-                bad_fd, 0, static_cast<int64_t>(invalid_large.size())),
+  EXPECT_NE(CheckMotionPhotoFromFd(bad_fd, 0,
+                                   static_cast<int64_t>(invalid_large.size())),
             0);
   close(bad_fd);
   EXPECT_NE(
@@ -1268,16 +1270,13 @@ TEST(LibMotionPhotoApiTest, LargeFdOverreadXmlLangAndParityRegression) {
     return std::string((std::istreambuf_iterator<char>(in)),
                        std::istreambuf_iterator<char>());
   };
-  ExtractorParams p_file{ref_heic,
-                         (test_dir / "out_file.heic").string(),
+  ExtractorParams p_file{ref_heic, (test_dir / "out_file.heic").string(),
                          (test_dir / "out_file.mp4").string(),
                          (test_dir / "out_file.xml").string()};
-  ExtractorParams p_fd{ref_heic,
-                       (test_dir / "out_fd.heic").string(),
+  ExtractorParams p_fd{ref_heic, (test_dir / "out_fd.heic").string(),
                        (test_dir / "out_fd.mp4").string(),
                        (test_dir / "out_fd.xml").string()};
-  ExtractorParams p_mem{ref_heic,
-                        (test_dir / "out_mem.heic").string(),
+  ExtractorParams p_mem{ref_heic, (test_dir / "out_mem.heic").string(),
                         (test_dir / "out_mem.mp4").string(),
                         (test_dir / "out_mem.xml").string()};
   ASSERT_TRUE(ExtractMotionPhotoFromFile(p_file));
@@ -1308,18 +1307,12 @@ TEST(LibMotionPhotoApiTest, LargeFdOverreadXmlLangAndParityRegression) {
   std::ifstream jpg_in(ref_jpg, std::ios::binary);
   std::vector<uint8_t> jpg_buf(jpg_size);
   ASSERT_TRUE(jpg_in.read(reinterpret_cast<char*>(jpg_buf.data()), jpg_size));
-  ExtractorParams jp_file{ref_jpg,
-                          (test_dir / "jpg_file.jpg").string(),
-                          (test_dir / "jpg_file.mp4").string(),
-                          ""};
-  ExtractorParams jp_fd{ref_jpg,
-                        (test_dir / "jpg_fd.jpg").string(),
-                        (test_dir / "jpg_fd.mp4").string(),
-                        ""};
-  ExtractorParams jp_mem{ref_jpg,
-                         (test_dir / "jpg_mem.jpg").string(),
-                         (test_dir / "jpg_mem.mp4").string(),
-                         ""};
+  ExtractorParams jp_file{ref_jpg, (test_dir / "jpg_file.jpg").string(),
+                          (test_dir / "jpg_file.mp4").string(), ""};
+  ExtractorParams jp_fd{ref_jpg, (test_dir / "jpg_fd.jpg").string(),
+                        (test_dir / "jpg_fd.mp4").string(), ""};
+  ExtractorParams jp_mem{ref_jpg, (test_dir / "jpg_mem.jpg").string(),
+                         (test_dir / "jpg_mem.mp4").string(), ""};
   ASSERT_TRUE(ExtractMotionPhotoFromFile(jp_file));
   int jpg_fd = open(ref_jpg.c_str(), O_RDONLY);
   ASSERT_TRUE(jpg_fd >= 0);
@@ -1337,13 +1330,12 @@ TEST(LibMotionPhotoApiTest, LargeFdOverreadXmlLangAndParityRegression) {
             read_bytes(jp_mem.video_output_path));
 
   // SniffFileType must not scan past a truncated non-zero 'ftyp' box_size < 16.
-  const uint8_t truncated_mif1[] = {0, 0, 0, 12, 'f', 't', 'y', 'p',
-                                    'm', 'i', 'f', '1', 0, 0, 0, 0,
-                                    'a', 'v', 'i', 'f'};
-  EXPECT_EQ(
-      static_cast<int>(
-          motion_photo::SniffFileType(truncated_mif1, sizeof(truncated_mif1))),
-      static_cast<int>(motion_photo::FileType::kHeic));
+  const uint8_t truncated_mif1[] = {0,   0,   0,   12,  'f', 't', 'y',
+                                    'p', 'm', 'i', 'f', '1', 0,   0,
+                                    0,   0,   'a', 'v', 'i', 'f'};
+  EXPECT_EQ(static_cast<int>(motion_photo::SniffFileType(
+                truncated_mif1, sizeof(truncated_mif1))),
+            static_cast<int>(motion_photo::FileType::kHeic));
 
   // PopulateNativeMetadata selects semantic MotionPhoto item even when GainMap
   // precedes it in Container:Directory.
@@ -1391,6 +1383,214 @@ TEST(LibMotionPhotoApiTest, LargeFdOverreadXmlLangAndParityRegression) {
   }
 
   fs::remove_all(test_dir);
+}
+
+TEST(LibMotionPhotoApiTest,
+     BuildMotionPhotoFromAppleLivePhotoMovExtractsTimestamp) {
+  auto make_box = [](const std::string& type,
+                     const std::vector<uint8_t>& payload) {
+    std::vector<uint8_t> box;
+    uint32_t size = static_cast<uint32_t>(8 + payload.size());
+    box.push_back((size >> 24) & 0xFF);
+    box.push_back((size >> 16) & 0xFF);
+    box.push_back((size >> 8) & 0xFF);
+    box.push_back(size & 0xFF);
+    box.insert(box.end(), type.begin(), type.end());
+    box.insert(box.end(), payload.begin(), payload.end());
+    return box;
+  };
+  auto push_u32 = [](std::vector<uint8_t>* v, uint32_t val) {
+    v->push_back((val >> 24) & 0xFF);
+    v->push_back((val >> 16) & 0xFF);
+    v->push_back((val >> 8) & 0xFF);
+    v->push_back(val & 0xFF);
+  };
+
+  // Construct an Apple Live Photo .mov with still-image-time = 1,400,000 us
+  // (840 ticks @ 600 Hz in edts/elst).
+  std::vector<uint8_t> ftyp_payload = {'q', 't', ' ', ' ', 0, 0, 0, 0,
+                                       'q', 't', ' ', ' ', 0, 0, 0, 0};
+  auto ftyp = make_box("ftyp", ftyp_payload);
+
+  std::vector<uint8_t> mvhd_payload(100, 0);
+  mvhd_payload[14] = 0x02;
+  mvhd_payload[15] = 0x58;  // timescale = 600
+  mvhd_payload[18] = 0x07;
+  mvhd_payload[19] = 0x08;  // duration = 1800
+  mvhd_payload[20] = 0x00;
+  mvhd_payload[21] = 0x01;  // rate = 1.0
+  mvhd_payload[24] = 0x01;  // volume = 1.0
+  mvhd_payload[60] = 0x00;
+  mvhd_payload[61] = 0x01;  // matrix
+  mvhd_payload[76] = 0x00;
+  mvhd_payload[77] = 0x01;
+  mvhd_payload[92] = 0x40;
+  mvhd_payload[99] = 2;  // next_track_ID = 2
+  auto mvhd = make_box("mvhd", mvhd_payload);
+
+  std::vector<uint8_t> elst_payload(8, 0);
+  elst_payload[7] = 2;
+  push_u32(&elst_payload, 840);
+  push_u32(&elst_payload, 0xFFFFFFFF);
+  push_u32(&elst_payload, 0x00010000);
+  push_u32(&elst_payload, 1);
+  push_u32(&elst_payload, 0);
+  push_u32(&elst_payload, 0x00010000);
+  auto edts = make_box("edts", make_box("elst", elst_payload));
+
+  std::string key = "mdta.com.apple.quicktime.still-image-time";
+  std::vector<uint8_t> mebx_payload(8, 0);
+  mebx_payload.insert(mebx_payload.end(), key.begin(), key.end());
+  std::vector<uint8_t> stsd_payload(8, 0);
+  stsd_payload[7] = 1;
+  auto mebx = make_box("mebx", mebx_payload);
+  stsd_payload.insert(stsd_payload.end(), mebx.begin(), mebx.end());
+  auto stsd = make_box("stsd", stsd_payload);
+
+  std::vector<uint8_t> hdlr_payload(24, 0);
+  hdlr_payload[8] = 'm';
+  hdlr_payload[9] = 'e';
+  hdlr_payload[10] = 't';
+  hdlr_payload[11] = 'a';
+  auto hdlr = make_box("hdlr", hdlr_payload);
+
+  std::vector<uint8_t> mdhd_payload(24, 0);
+  mdhd_payload[14] = 0x02;
+  mdhd_payload[15] = 0x58;
+  mdhd_payload[19] = 1;
+  auto mdhd = make_box("mdhd", mdhd_payload);
+
+  auto stbl = make_box("stbl", stsd);
+  auto minf = make_box("minf", stbl);
+  std::vector<uint8_t> mdia_payload;
+  mdia_payload.insert(mdia_payload.end(), mdhd.begin(), mdhd.end());
+  mdia_payload.insert(mdia_payload.end(), hdlr.begin(), hdlr.end());
+  mdia_payload.insert(mdia_payload.end(), minf.begin(), minf.end());
+  auto mdia = make_box("mdia", mdia_payload);
+
+  std::vector<uint8_t> tkhd_payload(84, 0);
+  tkhd_payload[3] = 7;
+  tkhd_payload[15] = 1;
+  tkhd_payload[22] = 0x03;
+  tkhd_payload[23] = 0x49;  // 841
+  auto tkhd = make_box("tkhd", tkhd_payload);
+
+  std::vector<uint8_t> trak_payload;
+  trak_payload.insert(trak_payload.end(), tkhd.begin(), tkhd.end());
+  trak_payload.insert(trak_payload.end(), edts.begin(), edts.end());
+  trak_payload.insert(trak_payload.end(), mdia.begin(), mdia.end());
+  auto trak = make_box("trak", trak_payload);
+
+  std::vector<uint8_t> moov_payload = mvhd;
+  moov_payload.insert(moov_payload.end(), trak.begin(), trak.end());
+  auto moov = make_box("moov", moov_payload);
+
+  std::vector<uint8_t> mov_bytes = ftyp;
+  mov_bytes.insert(mov_bytes.end(), moov.begin(), moov.end());
+
+  std::string image_path =
+      "lib/core/motion_photo/testdata/motion_photo_photo_only.jpg";
+  std::ifstream img_f(image_path, std::ios::binary);
+  std::vector<uint8_t> image_bytes((std::istreambuf_iterator<char>(img_f)),
+                                   std::istreambuf_iterator<char>());
+  ASSERT_FALSE(image_bytes.empty());
+
+  const char* test_tmpdir = std::getenv("TEST_TMPDIR");
+  fs::path base_dir = (test_tmpdir != nullptr && test_tmpdir[0] != '\0')
+                          ? fs::path(test_tmpdir)
+                          : fs::temp_directory_path();
+  fs::path test_dir = base_dir / "AppleLivePhotoApiTest";
+  fs::create_directories(test_dir);
+
+  const std::string out_mem_path =
+      (test_dir / "apple_live_photo_transcoded_mem.MP.jpg").string();
+  if (fs::exists(out_mem_path)) fs::remove(out_mem_path);
+  EXPECT_EQ(BuildMotionPhotoFromMemory(image_bytes.data(), image_bytes.size(),
+                                       mov_bytes.data(), mov_bytes.size(),
+                                       out_mem_path,
+                                       /*presentation_timestamp_us=*/-1),
+            0);
+  MotionPhotoMetadata meta_mem;
+  EXPECT_TRUE(ParseMotionPhotoFromFile(out_mem_path, &meta_mem));
+  EXPECT_TRUE(meta_mem.is_motion_photo);
+  EXPECT_EQ(meta_mem.presentation_timestamp_us, 1400000);
+  EXPECT_TRUE(CheckMotionPhotoFile(out_mem_path));
+
+  // Verify existing still-JPEG XMP presentation timestamp (500000) is
+  // preserved rather than overwritten by the Apple .mov timestamp (1400000).
+  const std::string out_preset_xmp_jpg =
+      (test_dir / "built_with_xmp_ts_500000.MP.jpg").string();
+  const std::string still_with_500k_path =
+      (test_dir / "still_with_xmp_ts_500000.jpg").string();
+  const std::string out_preserved_path =
+      (test_dir / "apple_live_photo_preserved_500000.MP.jpg").string();
+  EXPECT_EQ(BuildMotionPhotoFromMemory(image_bytes.data(), image_bytes.size(),
+                                       mov_bytes.data(), mov_bytes.size(),
+                                       out_preset_xmp_jpg,
+                                       /*presentation_timestamp_us=*/500000),
+            0);
+  ASSERT_TRUE(
+      ExtractPrimaryImageFromFile(out_preset_xmp_jpg, still_with_500k_path));
+  std::vector<uint8_t> still_with_500k;
+  {
+    std::ifstream in(still_with_500k_path, std::ios::binary);
+    still_with_500k.assign((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+  }
+  ASSERT_FALSE(still_with_500k.empty());
+  EXPECT_EQ(BuildMotionPhotoFromMemory(still_with_500k.data(),
+                                       still_with_500k.size(), mov_bytes.data(),
+                                       mov_bytes.size(), out_preserved_path,
+                                       /*presentation_timestamp_us=*/-1),
+            0);
+  MotionPhotoMetadata preserved_meta;
+  EXPECT_TRUE(ParseMotionPhotoFromFile(out_preserved_path, &preserved_meta));
+  EXPECT_EQ(preserved_meta.presentation_timestamp_us, 500000);
+  fs::remove(out_preset_xmp_jpg);
+  fs::remove(still_with_500k_path);
+  fs::remove(out_preserved_path);
+  fs::remove(out_mem_path);
+
+  const std::string in_mov_path =
+      (test_dir / "apple_live_photo_input.mov").string();
+  const std::string out_file_path =
+      (test_dir / "apple_live_photo_transcoded_file.MP.jpg").string();
+  {
+    std::ofstream mov_out(in_mov_path, std::ios::binary);
+    mov_out.write(reinterpret_cast<const char*>(mov_bytes.data()),
+                  mov_bytes.size());
+  }
+  if (fs::exists(out_file_path)) fs::remove(out_file_path);
+  EXPECT_EQ(BuildMotionPhotoFromFile(image_path, in_mov_path, out_file_path,
+                                     /*presentation_timestamp_us=*/-1),
+            0);
+  MotionPhotoMetadata meta_file;
+  EXPECT_TRUE(ParseMotionPhotoFromFile(out_file_path, &meta_file));
+  EXPECT_TRUE(meta_file.is_motion_photo);
+  EXPECT_EQ(meta_file.presentation_timestamp_us, 1400000);
+  fs::remove_all(test_dir);
+
+  // Also verify 3P plugin detection ("apple_live_photo") on a raw JPEG + Apple
+  // .mov trailer without standard Google Motion Photo XMP.
+  std::vector<uint8_t> raw_concat = image_bytes;
+  raw_concat.insert(raw_concat.end(), mov_bytes.begin(), mov_bytes.end());
+  HandlerOptions apple_plugin_opts;
+  apple_plugin_opts.disable_3p_plugins = false;
+  apple_plugin_opts.enabled_3p_plugins = {"apple_live_photo"};
+  MotionPhotoMetadata plugin_meta;
+  EXPECT_TRUE(ParseMotionPhotoFromMemory(raw_concat.data(), raw_concat.size(),
+                                         &plugin_meta, nullptr,
+                                         apple_plugin_opts));
+  EXPECT_TRUE(plugin_meta.is_motion_photo);
+  EXPECT_EQ(plugin_meta.video_length, static_cast<int64_t>(mov_bytes.size()));
+
+  HandlerOptions disabled_opts;
+  disabled_opts.disable_3p_plugins = true;
+  MotionPhotoMetadata disabled_meta;
+  EXPECT_FALSE(ParseMotionPhotoFromMemory(raw_concat.data(), raw_concat.size(),
+                                          &disabled_meta, nullptr,
+                                          disabled_opts));
+  EXPECT_FALSE(disabled_meta.is_motion_photo);
 }
 
 }  // namespace api

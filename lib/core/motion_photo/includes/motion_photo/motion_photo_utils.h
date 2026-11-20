@@ -25,12 +25,13 @@
 #include "image_io/base/data_range.h"
 #include "image_io/base/data_segment.h"
 #include "image_io/base/data_source.h"
-#include "motion_photo/motion_photo.h"
-
 #include "motion_photo/common.h"
+#include "motion_photo/motion_photo.h"
 
 namespace libmotionphoto {
 namespace motion_photo {
+
+class MediaSource;
 
 // Lazy DataSource backed by pread() on an open file descriptor.
 // Reads chunks on demand over [base_offset, base_offset + total_length) without
@@ -58,6 +59,26 @@ class FdDataSource : public image_io::DataSource {
   int64_t total_length_ = 0;
   bool owns_fd_ = false;
   std::shared_ptr<image_io::DataSegment> current_data_segment_;
+};
+
+// Random-access DataSource view backed by a MediaSource with 64 KiB chunked
+// caching for box/XMP inspection without buffering the whole payload.
+class MediaSourceDataSource : public image_io::DataSource {
+ public:
+  explicit MediaSourceDataSource(const MediaSource& source) : source_(source) {}
+
+  void Reset() override { cached_.reset(); }
+
+  std::shared_ptr<image_io::DataSegment> GetDataSegment(
+      size_t begin, size_t min_size) override;
+
+  TransferDataResult TransferData(
+      const image_io::DataRange& data_range, size_t best_size,
+      image_io::DataDestination* data_destination) override;
+
+ private:
+  const MediaSource& source_;
+  std::shared_ptr<image_io::DataSegment> cached_;
 };
 
 // Sniffs the container type (JPEG, HEIC, AVIF) from header bytes.

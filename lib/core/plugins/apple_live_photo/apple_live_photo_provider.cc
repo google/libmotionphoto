@@ -14,10 +14,9 @@
 
 #include "plugins/apple_live_photo/apple_live_photo_provider.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
-#include <fstream>
 #include <limits>
 #include <memory>
 #include <string>
@@ -26,11 +25,9 @@
 #include "absl/strings/match.h"
 #include "absl/strings/string_view.h"
 #include "apple_live_photo_metadata.pb.h"  // NOLINT
-#include "image_io/base/data_destination.h"
-#include "image_io/base/data_range.h"
-#include "image_io/base/data_segment.h"
-#include "image_io/base/data_source.h"
 #include "motion_photo/metadata_block.h"
+#include "motion_photo/motion_photo_source.h"
+#include "motion_photo/motion_photo_utils.h"
 
 namespace libmotionphoto {
 namespace motion_photo {
@@ -104,6 +101,240 @@ bool NextBox(const uint8_t* data, size_t end, size_t* pos,
   return true;
 }
 
+struct TrackTiming {
+  bool has_invalid_box = false;
+  bool is_meta_handler = false;
+  bool has_still_image_key = false;
+  uint32_t track_timescale = 0;
+  uint64_t tkhd_duration = 0;
+  uint64_t elst_empty_duration = 0;
+  uint32_t stts_entry_count = 0;
+  uint64_t first_stts_ticks = 0;
+};
+
+bool ParseMvhdTimescale(const uint8_t* data, size_t len,
+                        uint32_t* out_timescale) {
+  if (len < 1) return false;
+  const uint8_t version = data[0];
+  if (version == 0) {
+    if (len < 20) return false;
+    *out_timescale = ReadBe32(data + 12);
+    return true;
+  }
+  if (version == 1) {
+    if (len < 24) return false;
+    *out_timescale = ReadBe32(data + 20);
+    return true;
+  }
+  return false;
+}
+
+void ParseTkhdDuration(const uint8_t* data, size_t len, TrackTiming* trk) {
+  if (len < 1) return;
+  const uint8_t version = data[0];
+  if (version == 0) {
+    if (len >= 24) {
+      trk->tkhd_duration = ReadBe32(data + 20);
+    }
+    return;
+  }
+  if (version == 1) {
+    if (len >= 36) {
+      trk->tkhd_duration = ReadBe64(data + 28);
+    }
+    return;
+  }
+  trk->has_invalid_box = true;
+}
+
+void ParseMdhdTimescale(const uint8_t* data, size_t len, TrackTiming* trk) {
+  if (len < 1) return;
+  const uint8_t version = data[0];
+  if (version == 0) {
+    if (len >= 20) {
+      trk->track_timescale = ReadBe32(data + 12);
+    }
+    return;
+  }
+  if (version == 1) {
+    if (len >= 24) {
+      trk->track_timescale = ReadBe32(data + 20);
+    }
+    return;
+  }
+  trk->has_invalid_box = true;
+}
+
+void ParseElstBox(const uint8_t* data, size_t len, TrackTiming* trk) {
+  if (len < 8) return;
+  const uint8_t version = data[0];
+  if (version != 0 && version != 1) {
+    trk->has_invalid_box = true;
+    return;
+  }
+  const uint32_t count = ReadBe32(data + 4);
+  const size_t entry_size = (version == 1) ? 20 : 12;
+  if ((len - 8) / entry_size < count) {
+    trk->has_invalid_box = true;
+    return;
+  }
+  size_t cur = 8;
+  uint64_t empty_dur = 0;
+  for (uint32_t i = 0; i < count; ++i, cur += entry_size) {
+    const uint64_t seg_dur =
+        (version == 1) ? ReadBe64(data + cur) : ReadBe32(data + cur);
+    const int64_t media_time =
+        (version == 1) ? static_cast<int64_t>(ReadBe64(data + cur + 8))
+                       : static_cast<int64_t>(
+                             static_cast<int32_t>(ReadBe32(data + cur + 4)));
+    if (media_time != -1) {
+      break;
+    }
+    if (seg_dur > std::numeric_limits<uint64_t>::max() - empty_dur) {
+      trk->has_invalid_box = true;
+      return;
+    }
+    empty_dur += seg_dur;
+  }
+  trk->elst_empty_duration = empty_dur;
+}
+
+void ParseEdtsBox(const uint8_t* data, size_t start, size_t end,
+                  TrackTiming* trk) {
+  size_t pos = start;
+  absl::string_view type;
+  size_t p_start = 0;
+  size_t p_end = 0;
+  while (NextBox(data, end, &pos, &type, &p_start, &p_end)) {
+    if (type == "elst") {
+      ParseElstBox(data + p_start, p_end - p_start, trk);
+    }
+  }
+}
+
+bool ParseStsdForStillImageKey(const uint8_t* data, size_t len) {
+  if (len < 8) return false;
+  const uint32_t count = ReadBe32(data + 4);
+  size_t pos = 8;
+  for (uint32_t i = 0; i < count; ++i) {
+    absl::string_view fmt;
+    size_t p_start = 0;
+    size_t p_end = 0;
+    if (!NextBox(data, len, &pos, &fmt, &p_start, &p_end)) {
+      break;
+    }
+    if (fmt == "mebx") {
+      absl::string_view payload(reinterpret_cast<const char*>(data + p_start),
+                                p_end - p_start);
+      if (absl::StrContains(payload, kStillImageTimeKey)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+void ParseSttsFirstEntry(const uint8_t* data, size_t len, TrackTiming* trk) {
+  if (len < 8) return;
+  const uint32_t entry_count = ReadBe32(data + 4);
+  if (entry_count == 0 || (len - 8) / 8 < entry_count) {
+    return;
+  }
+  const uint32_t sc = ReadBe32(data + 8);
+  const uint32_t sd = ReadBe32(data + 12);
+  if (sc > 0 && sd > 0) {
+    trk->stts_entry_count = entry_count;
+    trk->first_stts_ticks = static_cast<uint64_t>(sc) * sd;
+  }
+}
+
+void ParseStblBox(const uint8_t* data, size_t start, size_t end,
+                  TrackTiming* trk) {
+  size_t pos = start;
+  absl::string_view type;
+  size_t p_start = 0;
+  size_t p_end = 0;
+  while (NextBox(data, end, &pos, &type, &p_start, &p_end)) {
+    if (type == "stsd" &&
+        ParseStsdForStillImageKey(data + p_start, p_end - p_start)) {
+      trk->has_still_image_key = true;
+    } else if (type == "stts") {
+      ParseSttsFirstEntry(data + p_start, p_end - p_start, trk);
+    }
+  }
+}
+
+void ParseMinfBox(const uint8_t* data, size_t start, size_t end,
+                  TrackTiming* trk) {
+  size_t pos = start;
+  absl::string_view type;
+  size_t p_start = 0;
+  size_t p_end = 0;
+  while (NextBox(data, end, &pos, &type, &p_start, &p_end)) {
+    if (type == "stbl") {
+      ParseStblBox(data, p_start, p_end, trk);
+    }
+  }
+}
+
+void ParseMdiaBox(const uint8_t* data, size_t start, size_t end,
+                  TrackTiming* trk) {
+  size_t pos = start;
+  absl::string_view type;
+  size_t p_start = 0;
+  size_t p_end = 0;
+  while (NextBox(data, end, &pos, &type, &p_start, &p_end)) {
+    const size_t p_len = p_end - p_start;
+    if (type == "mdhd") {
+      ParseMdhdTimescale(data + p_start, p_len, trk);
+    } else if (type == "hdlr" && p_len >= 12) {
+      absl::string_view hdlr_sub(
+          reinterpret_cast<const char*>(data + p_start + 8), 4);
+      if (hdlr_sub == "meta") {
+        trk->is_meta_handler = true;
+      }
+    } else if (type == "minf") {
+      ParseMinfBox(data, p_start, p_end, trk);
+    }
+  }
+}
+
+TrackTiming ParseTrakBox(const uint8_t* data, size_t start, size_t end) {
+  TrackTiming trk;
+  size_t pos = start;
+  absl::string_view type;
+  size_t p_start = 0;
+  size_t p_end = 0;
+  while (NextBox(data, end, &pos, &type, &p_start, &p_end)) {
+    if (type == "tkhd") {
+      ParseTkhdDuration(data + p_start, p_end - p_start, &trk);
+    } else if (type == "edts") {
+      ParseEdtsBox(data, p_start, p_end, &trk);
+    } else if (type == "mdia") {
+      ParseMdiaBox(data, p_start, p_end, &trk);
+    }
+  }
+  return trk;
+}
+
+int64_t ResolveTrackTimestampUs(const TrackTiming& trk,
+                                uint32_t movie_timescale) {
+  if (trk.has_invalid_box || !trk.is_meta_handler || !trk.has_still_image_key) {
+    return -1;
+  }
+  if (trk.elst_empty_duration > 0 && movie_timescale > 0) {
+    return SafeScaleTicksToUs(trk.elst_empty_duration, movie_timescale);
+  }
+  if (trk.stts_entry_count > 1 && trk.first_stts_ticks > 0 &&
+      trk.track_timescale > 0) {
+    return SafeScaleTicksToUs(trk.first_stts_ticks, trk.track_timescale);
+  }
+  if (trk.tkhd_duration >= 1 && movie_timescale > 0) {
+    return SafeScaleTicksToUs(trk.tkhd_duration - 1, movie_timescale);
+  }
+  return -1;
+}
+
 bool ParseMoovPayload(const uint8_t* data, size_t moov_size,
                       size_t total_stream_size,
                       AppleLivePhotoMetadata* out_meta,
@@ -116,174 +347,24 @@ bool ParseMoovPayload(const uint8_t* data, size_t moov_size,
   absl::string_view type;
   size_t p_start = 0;
   size_t p_end = 0;
-
-  struct TrackTiming {
-    bool is_meta_handler = false;
-    bool has_still_image_key = false;
-    uint32_t track_timescale = 0;
-    uint64_t tkhd_duration = 0;
-    uint64_t elst_empty_duration = 0;
-    uint32_t stts_entry_count = 0;
-    uint64_t first_stts_ticks = 0;
-  };
   std::vector<TrackTiming> tracks;
 
   while (NextBox(data, moov_size, &pos, &type, &p_start, &p_end)) {
-    const size_t p_len = p_end - p_start;
-    if (type == "mvhd" && p_len >= 20) {
-      uint8_t version = data[p_start];
-      if (version == 0) {
-        movie_timescale = ReadBe32(data + p_start + 12);
-      } else if (version == 1 && p_len >= 24) {
-        movie_timescale = ReadBe32(data + p_start + 20);
+    if (type == "mvhd") {
+      if (!ParseMvhdTimescale(data + p_start, p_end - p_start,
+                              &movie_timescale)) {
+        if (error_message) {
+          *error_message = "Unsupported or truncated mvhd box";
+        }
+        return false;
       }
     } else if (type == "trak") {
-      TrackTiming trk;
-      size_t tpos = p_start;
-      absl::string_view ttype;
-      size_t tp_start = 0;
-      size_t tp_end = 0;
-      while (NextBox(data, p_end, &tpos, &ttype, &tp_start, &tp_end)) {
-        const size_t tp_len = tp_end - tp_start;
-        if (ttype == "tkhd" && tp_len >= 24) {
-          uint8_t version = data[tp_start];
-          if (version == 0) {
-            trk.tkhd_duration = ReadBe32(data + tp_start + 20);
-          } else if (version == 1 && tp_len >= 36) {
-            trk.tkhd_duration = ReadBe64(data + tp_start + 28);
-          }
-        } else if (ttype == "edts") {
-          size_t epos = tp_start;
-          absl::string_view etype;
-          size_t ep_start = 0;
-          size_t ep_end = 0;
-          while (NextBox(data, tp_end, &epos, &etype, &ep_start, &ep_end)) {
-            if (etype == "elst" && ep_end - ep_start >= 8) {
-              uint8_t version = data[ep_start];
-              if (version != 0 && version != 1) {
-                continue;
-              }
-              uint32_t count = ReadBe32(data + ep_start + 4);
-              size_t entry_size = (version == 1) ? 20 : 12;
-              size_t cur = ep_start + 8;
-              bool elst_valid = true;
-              uint64_t empty_dur = 0;
-              for (uint32_t i = 0;
-                   i < count && cur <= ep_end && entry_size <= ep_end - cur;
-                   ++i, cur += entry_size) {
-                uint64_t seg_dur = (version == 1) ? ReadBe64(data + cur)
-                                                  : ReadBe32(data + cur);
-                int64_t media_time =
-                    (version == 1)
-                        ? static_cast<int64_t>(ReadBe64(data + cur + 8))
-                        : static_cast<int64_t>(
-                              static_cast<int32_t>(ReadBe32(data + cur + 4)));
-                if (media_time == -1) {
-                  if (seg_dur >
-                      std::numeric_limits<uint64_t>::max() - empty_dur) {
-                    elst_valid = false;
-                    break;
-                  }
-                  empty_dur += seg_dur;
-                } else {
-                  break;
-                }
-              }
-              if (elst_valid) {
-                trk.elst_empty_duration = empty_dur;
-              }
-            }
-          }
-        } else if (ttype == "mdia") {
-          size_t mpos = tp_start;
-          absl::string_view mtype;
-          size_t mp_start = 0;
-          size_t mp_end = 0;
-          while (NextBox(data, tp_end, &mpos, &mtype, &mp_start, &mp_end)) {
-            const size_t mp_len = mp_end - mp_start;
-            if (mtype == "mdhd" && mp_len >= 20) {
-              uint8_t version = data[mp_start];
-              if (version == 0) {
-                trk.track_timescale = ReadBe32(data + mp_start + 12);
-              } else if (version == 1 && mp_len >= 24) {
-                trk.track_timescale = ReadBe32(data + mp_start + 20);
-              }
-            } else if (mtype == "hdlr" && mp_len >= 12) {
-              absl::string_view hdlr_sub(
-                  reinterpret_cast<const char*>(data + mp_start + 8), 4);
-              if (hdlr_sub == "meta") {
-                trk.is_meta_handler = true;
-              }
-            } else if (mtype == "minf") {
-              size_t ipos = mp_start;
-              absl::string_view itype;
-              size_t ip_start = 0;
-              size_t ip_end = 0;
-              while (NextBox(data, mp_end, &ipos, &itype, &ip_start, &ip_end)) {
-                if (itype == "stbl") {
-                  size_t spos = ip_start;
-                  absl::string_view stype;
-                  size_t sp_start = 0;
-                  size_t sp_end = 0;
-                  while (NextBox(data, ip_end, &spos, &stype, &sp_start,
-                                 &sp_end)) {
-                    if (stype == "stsd" && sp_end - sp_start >= 8) {
-                      uint32_t count = ReadBe32(data + sp_start + 4);
-                      size_t epos = sp_start + 8;
-                      for (uint32_t i = 0; i < count; ++i) {
-                        absl::string_view fmt;
-                        size_t ep_start = 0;
-                        size_t ep_end = 0;
-                        if (!NextBox(data, sp_end, &epos, &fmt, &ep_start,
-                                     &ep_end)) {
-                          break;
-                        }
-                        if (fmt == "mebx") {
-                          absl::string_view payload_view(
-                              reinterpret_cast<const char*>(data + ep_start),
-                              ep_end - ep_start);
-                          if (absl::StrContains(payload_view,
-                                                kStillImageTimeKey)) {
-                            trk.has_still_image_key = true;
-                          }
-                        }
-                      }
-                    } else if (stype == "stts" && sp_end - sp_start >= 8) {
-                      uint32_t entry_count = ReadBe32(data + sp_start + 4);
-                      if ((sp_end - sp_start - 8) / 8 >= entry_count &&
-                          entry_count > 0) {
-                        uint32_t sc = ReadBe32(data + sp_start + 8);
-                        uint32_t sd = ReadBe32(data + sp_start + 12);
-                        if (sc > 0 && sd > 0) {
-                          trk.stts_entry_count = entry_count;
-                          trk.first_stts_ticks = static_cast<uint64_t>(sc) * sd;
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-      tracks.push_back(trk);
+      tracks.push_back(ParseTrakBox(data, p_start, p_end));
     }
   }
 
   for (const auto& trk : tracks) {
-    if (!trk.is_meta_handler || !trk.has_still_image_key) {
-      continue;
-    }
-    int64_t ts_us = -1;
-    if (trk.elst_empty_duration > 0 && movie_timescale > 0) {
-      ts_us = SafeScaleTicksToUs(trk.elst_empty_duration, movie_timescale);
-    } else if (trk.stts_entry_count > 1 && trk.first_stts_ticks > 0 &&
-               trk.track_timescale > 0) {
-      ts_us = SafeScaleTicksToUs(trk.first_stts_ticks, trk.track_timescale);
-    } else if (trk.tkhd_duration >= 1 && movie_timescale > 0) {
-      ts_us = SafeScaleTicksToUs(trk.tkhd_duration - 1, movie_timescale);
-    }
+    const int64_t ts_us = ResolveTrackTimestampUs(trk, movie_timescale);
     if (ts_us >= 0) {
       out_meta->set_has_still_image_time_track(true);
       out_meta->set_primary_image_timestamp_us(ts_us);
@@ -301,6 +382,28 @@ bool ParseMoovPayload(const uint8_t* data, size_t moov_size,
   return false;
 }
 
+bool IsQuickTimeFtyp(const RawMetadataBlock& block, size_t payload_offset,
+                     size_t payload_size, std::vector<uint8_t>* scratch) {
+  if (payload_size < 4) {
+    return false;
+  }
+  const size_t check_len = std::min<size_t>(payload_size, 4096);
+  const uint8_t* ftyp = nullptr;
+  if (!block.ReadView(payload_offset, check_len, &ftyp, scratch)) {
+    return false;
+  }
+  if (absl::string_view(reinterpret_cast<const char*>(ftyp), 4) == "qt  ") {
+    return true;
+  }
+  for (size_t off = 8; off + 4 <= check_len; off += 4) {
+    if (absl::string_view(reinterpret_cast<const char*>(ftyp + off), 4) ==
+        "qt  ") {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool ParseAppleLivePhotoBlock(const RawMetadataBlock& block,
                               AppleLivePhotoMetadata* out_meta,
                               std::string* error_message) {
@@ -312,11 +415,12 @@ bool ParseAppleLivePhotoBlock(const RawMetadataBlock& block,
     return false;
   }
 
+  std::vector<uint8_t> scratch;
   size_t pos = 0;
   while (pos <= total_size && total_size - pos >= 8) {
+    const size_t hdr_read_len = std::min<size_t>(16, total_size - pos);
     const uint8_t* hdr = nullptr;
-    std::vector<uint8_t> hdr_scratch;
-    if (!block.ReadView(pos, 8, &hdr, &hdr_scratch)) {
+    if (!block.ReadView(pos, hdr_read_len, &hdr, &scratch)) {
       break;
     }
     absl::string_view tag(reinterpret_cast<const char*>(hdr + 4), 4);
@@ -329,8 +433,7 @@ bool ParseAppleLivePhotoBlock(const RawMetadataBlock& block,
     uint64_t box_size = ReadBe32(hdr);
     size_t header_size = 8;
     if (box_size == 1) {
-      if (total_size - pos < 16 ||
-          !block.ReadView(pos, 16, &hdr, &hdr_scratch)) {
+      if (hdr_read_len < 16) {
         break;
       }
       box_size = ReadBe64(hdr + 8);
@@ -340,6 +443,15 @@ bool ParseAppleLivePhotoBlock(const RawMetadataBlock& block,
     }
     if (box_size < header_size || box_size > total_size - pos) {
       break;
+    }
+    if (pos == 0 && tag == "ftyp" &&
+        !IsQuickTimeFtyp(block, pos + header_size,
+                         static_cast<size_t>(box_size) - header_size,
+                         &scratch)) {
+      if (error_message) {
+        *error_message = "ftyp box does not declare QuickTime qt brand";
+      }
+      return false;
     }
     if (tag == "moov") {
       size_t moov_payload_size = static_cast<size_t>(box_size) - header_size;
@@ -462,69 +574,18 @@ int64_t AppleLivePhotoProvider::ExtractStillImageTimestampUs(
   return ExtractStillImageTimestampUs(block);
 }
 
-class IfstreamDataSource
-    : public ::photos_editing_formats::image_io::DataSource {
- public:
-  IfstreamDataSource(std::ifstream* stream, size_t file_size)
-      : stream_(stream), file_size_(file_size) {}
-
-  std::shared_ptr<::photos_editing_formats::image_io::DataSegment>
-  GetDataSegment(size_t begin, size_t min_size) override {
-    if (stream_ == nullptr || begin >= file_size_ || min_size == 0) {
-      return nullptr;
-    }
-    const size_t avail = file_size_ - begin;
-    const size_t to_read = std::min(avail, min_size);
-    auto* buf = new ::photos_editing_formats::image_io::Byte[to_read];
-    stream_->clear();
-    stream_->seekg(static_cast<std::streamoff>(begin), std::ios::beg);
-    if (!stream_->read(reinterpret_cast<char*>(buf),
-                       static_cast<std::streamsize>(to_read))) {
-      delete[] buf;
-      return nullptr;
-    }
-    return ::photos_editing_formats::image_io::DataSegment::Create(
-        ::photos_editing_formats::image_io::DataRange(begin, begin + to_read),
-        buf,
-        ::photos_editing_formats::image_io::DataSegment::
-            BufferDispositionPolicy::kDelete);
-  }
-
-  void Reset() override {
-    if (stream_) {
-      stream_->clear();
-      stream_->seekg(0, std::ios::beg);
-    }
-  }
-
-  TransferDataResult TransferData(
-      const ::photos_editing_formats::image_io::DataRange&, size_t,
-      ::photos_editing_formats::image_io::DataDestination*) override {
-    return kTransferDataNone;
-  }
-
- private:
-  std::ifstream* stream_;
-  size_t file_size_;
-};
-
 // static
 int64_t AppleLivePhotoProvider::ExtractStillImageTimestampUsFromFile(
     const std::string& file_path) {
-  std::ifstream stream(file_path, std::ios::binary | std::ios::ate);
-  if (!stream.is_open()) {
+  auto source = MediaSource::FromFile(file_path, nullptr);
+  if (!source || source->GetSize() < 16) {
     return -1;
   }
-  const std::streamoff end_pos = stream.tellg();
-  if (end_pos < 16) {
-    return -1;
-  }
-  const size_t total_size = static_cast<size_t>(end_pos);
-  IfstreamDataSource data_source(&stream, total_size);
+  MediaSourceDataSource data_source(*source);
   RawMetadataBlock block;
   block.type = "PROPRIETARY";
   block.format_identifier = "video.mov";
-  block.total_payload_size = total_size;
+  block.total_payload_size = source->GetSize();
   block.data_source = &data_source;
   return ExtractStillImageTimestampUs(block);
 }

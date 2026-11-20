@@ -90,36 +90,78 @@ const char kBuilderVersion[] = " V1.0";
 const char kWorkVideoFileName[] = "/tmp/motion_photo_working_trailer.mp4";
 const char kOptVideoFileName[] = "/tmp/motion_photo_optimized_trailer.mp4";
 
-class MediaSourceDataSource : public image_io::DataSource {
- public:
-  explicit MediaSourceDataSource(const MediaSource* source) : source_(source) {}
+uint32_t ReadBe32(const uint8_t* p) {
+  return (static_cast<uint32_t>(p[0]) << 24) |
+         (static_cast<uint32_t>(p[1]) << 16) |
+         (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
+}
 
-  std::shared_ptr<DataSegment> GetDataSegment(size_t begin,
-                                              size_t min_size) override {
-    if (source_ == nullptr || begin >= source_->GetSize() || min_size == 0) {
-      return nullptr;
-    }
-    const size_t avail = source_->GetSize() - begin;
-    const size_t to_read = std::min(avail, min_size);
-    auto* buf = new Byte[to_read];
-    if (!source_->ReadAt(begin, to_read, buf)) {
-      delete[] buf;
-      return nullptr;
-    }
-    return DataSegment::Create(DataRange(begin, begin + to_read), buf,
-                               DataSegment::BufferDispositionPolicy::kDelete);
+uint64_t ReadBe64(const uint8_t* p) {
+  return (static_cast<uint64_t>(ReadBe32(p)) << 32) | ReadBe32(p + 4);
+}
+
+bool IsTopLevelQuickTimeTag(std::string_view tag) {
+  return tag == "ftyp" || tag == "wide" || tag == "mdat" || tag == "moov" ||
+         tag == "free" || tag == "skip" || tag == "pnot" || tag == "uuid";
+}
+
+bool MightBeQuickTimeMov(const MediaSource& source) {
+  const size_t total = source.GetSize();
+  if (total < 16) {
+    return false;
   }
-
-  void Reset() override {}
-
-  TransferDataResult TransferData(const DataRange&, size_t,
-                                  image_io::DataDestination*) override {
-    return kTransferDataNone;
+  uint8_t hdr_buf[64] = {};
+  const size_t initial_len = std::min(total, sizeof(hdr_buf));
+  const uint8_t* hdr = source.GetData();
+  if (hdr == nullptr) {
+    if (!source.ReadAt(0, initial_len, hdr_buf)) {
+      return false;
+    }
+    hdr = hdr_buf;
   }
-
- private:
-  const MediaSource* source_;
-};
+  std::string_view tag(reinterpret_cast<const char*>(hdr + 4), 4);
+  if (!IsTopLevelQuickTimeTag(tag)) {
+    return false;
+  }
+  if (tag != "ftyp") {
+    return true;
+  }
+  uint64_t box_size = ReadBe32(hdr);
+  size_t header_size = 8;
+  if (box_size == 1) {
+    box_size = ReadBe64(hdr + 8);
+    header_size = 16;
+  } else if (box_size == 0) {
+    box_size = total;
+  }
+  if (box_size < header_size + 4 || box_size > total) {
+    return false;
+  }
+  const size_t check_len =
+      std::min<size_t>(static_cast<size_t>(box_size), 4096);
+  std::vector<uint8_t> ftyp_buf;
+  const uint8_t* ftyp = hdr;
+  if (check_len > initial_len) {
+    if (source.GetData() == nullptr) {
+      ftyp_buf.resize(check_len);
+      if (!source.ReadAt(0, check_len, ftyp_buf.data())) {
+        return false;
+      }
+      ftyp = ftyp_buf.data();
+    }
+  }
+  if (std::string_view(reinterpret_cast<const char*>(ftyp + header_size), 4) ==
+      "qt  ") {
+    return true;
+  }
+  for (size_t off = header_size + 8; off + 4 <= check_len; off += 4) {
+    if (std::string_view(reinterpret_cast<const char*>(ftyp + off), 4) ==
+        "qt  ") {
+      return true;
+    }
+  }
+  return false;
+}
 
 int64_t ExtractPresentationTimestampFromProviders(
     const RawMetadataBlock& block, const HandlerOptions& options) {
@@ -145,14 +187,15 @@ int64_t ExtractPresentationTimestampFromProviders(
 
 int64_t ExtractPresentationTimestampFromVideoSource(
     const MediaSource* video_source, const HandlerOptions& options) {
-  if (video_source == nullptr || video_source->GetSize() == 0) {
+  if (options.disable_3p_plugins || video_source == nullptr ||
+      !MightBeQuickTimeMov(*video_source)) {
     return -1;
   }
   RawMetadataBlock block;
   block.type = "PROPRIETARY";
   block.format_identifier = "video.mov";
   block.total_payload_size = video_source->GetSize();
-  MediaSourceDataSource lazy_source(video_source);
+  MediaSourceDataSource lazy_source(*video_source);
   if (video_source->GetData() != nullptr) {
     block.data_view = video_source->GetData();
     block.data_view_size = video_source->GetSize();
@@ -160,16 +203,6 @@ int64_t ExtractPresentationTimestampFromVideoSource(
     block.data_source = &lazy_source;
   }
   return ExtractPresentationTimestampFromProviders(block, options);
-}
-
-int64_t ExtractPresentationTimestampFromVideoFile(
-    const std::string& file_path, const HandlerOptions& options) {
-  if (file_path.empty() || options.disable_3p_plugins) {
-    return -1;
-  }
-  auto file_source = MediaSource::FromFile(file_path, nullptr);
-  return ExtractPresentationTimestampFromVideoSource(file_source.get(),
-                                                     options);
 }
 
 template <typename FallbackFn>
@@ -428,67 +461,6 @@ FileType DetectFileType(const MediaSource& source) {
   return SniffFileType(magic, read_len);
 }
 
-// Random-access DataSource view backed by a MediaSource for zero-copy box/XMP
-// inspection without buffering the whole HEIC/AVIF pixel payload.
-class MediaSourceDataSource : public image_io::DataSource {
- public:
-  explicit MediaSourceDataSource(const MediaSource& source) : source_(source) {}
-
-  void Reset() override { cached_.reset(); }
-
-  std::shared_ptr<DataSegment> GetDataSegment(size_t begin,
-                                              size_t min_size) override {
-    const size_t total = source_.GetSize();
-    if (begin >= total) return nullptr;
-    if (cached_ && cached_->Contains(begin) &&
-        cached_->GetEnd() - begin >= std::min(min_size, total - begin)) {
-      return cached_;
-    }
-    const size_t chunk_size =
-        std::min(total - begin, std::max<size_t>(min_size, 64 * 1024));
-    std::unique_ptr<Byte[]> buf(new Byte[chunk_size]);
-    if (!source_.ReadAt(begin, chunk_size, buf.get())) {
-      return nullptr;
-    }
-    cached_ = DataSegment::Create(DataRange(begin, begin + chunk_size),
-                                  buf.release(), DataSegment::kDelete);
-    return cached_;
-  }
-
-  TransferDataResult TransferData(
-      const DataRange& data_range, size_t best_size,
-      image_io::DataDestination* data_destination) override {
-    if (!data_destination) return kTransferDataError;
-    const size_t total = source_.GetSize();
-    DataRange clipped = data_range.GetIntersection(DataRange(0, total));
-    if (!clipped.IsValid()) return kTransferDataNone;
-    const size_t step = std::max<size_t>(best_size, 1);
-    bool transferred = false;
-    image_io::DataDestination::TransferStatus status =
-        image_io::DataDestination::kTransferDone;
-    for (size_t pos = clipped.GetBegin(); pos < clipped.GetEnd();) {
-      const size_t req = std::min(step, clipped.GetEnd() - pos);
-      std::shared_ptr<DataSegment> seg = GetDataSegment(pos, req);
-      if (!seg || !seg->GetDataRange().Contains(pos)) break;
-      const size_t seg_end = std::min(clipped.GetEnd(), seg->GetEnd());
-      status = data_destination->Transfer(DataRange(pos, seg_end), *seg);
-      transferred = true;
-      if (status != image_io::DataDestination::kTransferOk || seg_end <= pos) {
-        break;
-      }
-      pos = seg_end;
-    }
-    if (!transferred) return kTransferDataNone;
-    return status == image_io::DataDestination::kTransferError
-               ? kTransferDataError
-               : kTransferDataSuccess;
-  }
-
- private:
-  const MediaSource& source_;
-  std::shared_ptr<DataSegment> cached_;
-};
-
 void InspectPrimaryImage(
     const MediaSource& image_source, FileType file_type,
     MotionPhoto* motion_photo, MessageHandler* message_handler,
@@ -499,20 +471,19 @@ void InspectPrimaryImage(
     size_t image_size = image_source.GetSize();
     if (image_size == 0) {
       message_handler->ReportMessage(Message::kDecodingError,
-                                    "Empty primary image");
+                                     "Empty primary image");
       *out_ok = false;
       return;
     }
     std::unique_ptr<Byte[]> img_buf(new Byte[image_size]);
     if (!image_source.ReadAt(0, image_size, img_buf.get())) {
       message_handler->ReportMessage(Message::kDecodingError,
-                                    "Failed to read primary image");
+                                     "Failed to read primary image");
       *out_ok = false;
       return;
     }
-    auto jpeg_segment = DataSegment::Create(DataRange(0, image_size),
-                                            img_buf.release(),
-                                            DataSegment::kDelete);
+    auto jpeg_segment = DataSegment::Create(
+        DataRange(0, image_size), img_buf.release(), DataSegment::kDelete);
     DataSegmentDataSource jpeg_source(jpeg_segment);
     auto jpeg_info_builder =
         std::make_unique<MotionPhotoJpegInfoBuilder>(message_handler);
@@ -553,11 +524,18 @@ void InspectPrimaryImage(
           items.erase(it);
           break;
         }
+      }
+    }
+    motion_photo->SetContainerMetadata(std::move(container));
+    *out_jpeg_info_builder = std::move(jpeg_info_builder);
   } else if (IsHeif(file_type)) {
     MediaSourceDataSource heif_source(image_source);
     std::vector<DataRange> xmp_ranges =
         FindHeifPrimaryXmpRanges(&heif_source, image_source.GetSize());
     if (!xmp_ranges.empty()) {
+      size_t bytes_parsed = 0;
+      MotionPhotoReader image_reader(motion_photo, message_handler);
+      image_reader.ReadImageMetadata(xmp_ranges, &heif_source, &bytes_parsed);
       ReadDataRangesToString(&heif_source, xmp_ranges, out_existing_xmp);
     }
   }
@@ -647,8 +625,8 @@ string MergeXmpMetadata(const string& original_xmp,
       "              Item:Length=\"" +
       std::to_string(video_length) + "\"";
   if (video_padding > 0) {
-    video_item +=
-        "\n              Item:Padding=\"" + std::to_string(video_padding) + "\"";
+    video_item += "\n              Item:Padding=\"" +
+                  std::to_string(video_padding) + "\"";
   }
   video_item += "/>\n          </rdf:li>\n";
 
@@ -680,8 +658,8 @@ string MergeXmpMetadata(const string& original_xmp,
               size_t close_idx = updated_primary.rfind("/>");
               if (close_idx != string::npos) {
                 updated_primary.insert(
-                    close_idx, " Item:Padding=\"" +
-                                   std::to_string(image_padding) + "\"");
+                    close_idx,
+                    " Item:Padding=\"" + std::to_string(image_padding) + "\"");
               }
             }
           } else {
@@ -920,6 +898,7 @@ int BuildMotionPhotoFromMemory(const MotionPhotoBuilderMemoryParams& params,
   stream_params.primary_video = std::move(vid_source);
   stream_params.moments_xmp = params.moments_xmp;
   stream_params.presentation_timestamp_us = params.presentation_timestamp_us;
+  stream_params.handler_options = params.handler_options;
 
   return BuildMotionPhotoDirect(stream_params, out_sink.get(), outputter);
 }
@@ -998,11 +977,20 @@ int BuildMotionPhoto(const MotionPhotoBuilderParams& params,
         motion_photo_reader.ReadVideoMetadata(xmpss.str(), &count);
   }
 
+  std::unique_ptr<MediaSource> direct_vid_source;
+  auto get_primary_video_source = [&]() -> MediaSource* {
+    if (!direct_vid_source && !local_params.primary_video_file_name.empty()) {
+      direct_vid_source = MediaSource::FromFile(
+          local_params.primary_video_file_name, &message_handler);
+    }
+    return direct_vid_source.get();
+  };
+
   ResolvePresentationTimestamp(
       local_params.presentation_timestamp_us, has_valid_video_xmp,
       [&]() {
-        return ExtractPresentationTimestampFromVideoFile(
-            local_params.primary_video_file_name, local_params.handler_options);
+        return ExtractPresentationTimestampFromVideoSource(
+            get_primary_video_source(), local_params.handler_options);
       },
       &motion_photo);
   motion_photo.EnforceConsistentValues();
@@ -1025,7 +1013,6 @@ int BuildMotionPhoto(const MotionPhotoBuilderParams& params,
   string video_to_append = local_params.primary_video_file_name;
   bool use_mp4_file_builder = !local_params.moments_video_file_name.empty();
   bool use_direct_mett_injector = false;
-  std::unique_ptr<MediaSource> direct_vid_source;
   PreparedMp4MettInjection prepared_mp4;
 
   if (use_mp4_file_builder) {
@@ -1097,9 +1084,7 @@ int BuildMotionPhoto(const MotionPhotoBuilderParams& params,
     motion_photo.SetVideoLength(file_size);
   } else if (!local_params.primary_video_file_name.empty()) {
     outputter("\nReading " + local_params.primary_video_file_name + "\n");
-    direct_vid_source = MediaSource::FromFile(
-        local_params.primary_video_file_name, &message_handler);
-    if (!direct_vid_source) {
+    if (!get_primary_video_source()) {
       return 1;
     }
     outputter("\nWriting video metadata: " + String(video_metadata.size()) +

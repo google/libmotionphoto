@@ -34,6 +34,7 @@
 #include "image_io/base/data_source.h"
 #include "image_io/base/types.h"
 #include "motion_photo/motion_photo.h"
+#include "motion_photo/motion_photo_source.h"
 
 namespace libmotionphoto {
 namespace motion_photo {
@@ -90,7 +91,8 @@ FileType SniffFileType(const uint8_t* data, size_t size) {
   if (IsAvifBrand(major_brand)) {
     return FileType::kAvif;
   }
-  if (MatchesFourCc(major_brand, "mif1") || MatchesFourCc(major_brand, "msf1")) {
+  if (MatchesFourCc(major_brand, "mif1") ||
+      MatchesFourCc(major_brand, "msf1")) {
     uint32_t box_size = (static_cast<uint32_t>(data[0]) << 24) |
                         (static_cast<uint32_t>(data[1]) << 16) |
                         (static_cast<uint32_t>(data[2]) << 8) |
@@ -221,9 +223,9 @@ std::shared_ptr<image_io::DataSegment> FdDataSource::Read(size_t begin,
   auto buffer = std::make_shared<std::vector<image_io::Byte>>(to_read);
   size_t total_bytes_read = 0;
   while (total_bytes_read < to_read) {
-    ssize_t bytes =
-        pread(fd_, buffer->data() + total_bytes_read, to_read - total_bytes_read,
-              static_cast<off_t>(base_offset_ + read_begin + total_bytes_read));
+    ssize_t bytes = pread(
+        fd_, buffer->data() + total_bytes_read, to_read - total_bytes_read,
+        static_cast<off_t>(base_offset_ + read_begin + total_bytes_read));
     if (bytes <= 0) {
       if (bytes < 0 && errno == EINTR) continue;
       break;
@@ -241,6 +243,57 @@ std::shared_ptr<image_io::DataSegment> FdDataSource::Read(size_t begin,
       image_io::DataSegment::BufferDispositionPolicy::kDontDelete);
   return std::shared_ptr<image_io::DataSegment>(
       segment.get(), [segment, buffer](image_io::DataSegment*) {});
+}
+
+std::shared_ptr<image_io::DataSegment> MediaSourceDataSource::GetDataSegment(
+    size_t begin, size_t min_size) {
+  const size_t total = source_.GetSize();
+  if (begin >= total) return nullptr;
+  if (cached_ && cached_->Contains(begin) &&
+      cached_->GetEnd() - begin >= std::min(min_size, total - begin)) {
+    return cached_;
+  }
+  const size_t chunk_size =
+      std::min(total - begin, std::max<size_t>(min_size, 64 * 1024));
+  std::unique_ptr<image_io::Byte[]> buf(new image_io::Byte[chunk_size]);
+  if (!source_.ReadAt(begin, chunk_size, buf.get())) {
+    return nullptr;
+  }
+  cached_ = image_io::DataSegment::Create(
+      image_io::DataRange(begin, begin + chunk_size), buf.release(),
+      image_io::DataSegment::kDelete);
+  return cached_;
+}
+
+image_io::DataSource::TransferDataResult MediaSourceDataSource::TransferData(
+    const image_io::DataRange& data_range, size_t best_size,
+    image_io::DataDestination* data_destination) {
+  if (!data_destination) return kTransferDataError;
+  const size_t total = source_.GetSize();
+  image_io::DataRange clipped =
+      data_range.GetIntersection(image_io::DataRange(0, total));
+  if (!clipped.IsValid()) return kTransferDataNone;
+  const size_t step = std::max<size_t>(best_size, 1);
+  bool transferred = false;
+  image_io::DataDestination::TransferStatus status =
+      image_io::DataDestination::kTransferDone;
+  for (size_t pos = clipped.GetBegin(); pos < clipped.GetEnd();) {
+    const size_t req = std::min(step, clipped.GetEnd() - pos);
+    std::shared_ptr<image_io::DataSegment> seg = GetDataSegment(pos, req);
+    if (!seg || !seg->GetDataRange().Contains(pos)) break;
+    const size_t seg_end = std::min(clipped.GetEnd(), seg->GetEnd());
+    status =
+        data_destination->Transfer(image_io::DataRange(pos, seg_end), *seg);
+    transferred = true;
+    if (status != image_io::DataDestination::kTransferOk || seg_end <= pos) {
+      break;
+    }
+    pos = seg_end;
+  }
+  if (!transferred) return kTransferDataNone;
+  return status == image_io::DataDestination::kTransferError
+             ? kTransferDataError
+             : kTransferDataSuccess;
 }
 
 bool ReadDataRange(image_io::DataSource* data_source, size_t start,
@@ -491,8 +544,9 @@ std::string RemoveSimpleElements(
       continue;
     }
     const size_t next_lt = s.find('<', gt + 1);
-    if (next_lt == std::string_view::npos || next_lt + 2 + tag.size() >= s.size() ||
-        s[next_lt + 1] != '/' || s.substr(next_lt + 2, tag.size()) != tag ||
+    if (next_lt == std::string_view::npos ||
+        next_lt + 2 + tag.size() >= s.size() || s[next_lt + 1] != '/' ||
+        s.substr(next_lt + 2, tag.size()) != tag ||
         s[next_lt + 2 + tag.size()] != '>') {
       search_pos = gt + 1;
       continue;
@@ -615,11 +669,10 @@ std::string StripMotionPhotoMetadata(const std::string& xmp) {
          "GCamera:MotionPhotoPresentationTimestampUs"},
         /*trim_leading_ws=*/false);
     result = RemoveSimpleElements(
-        result,
-        {"Camera:MotionPhoto", "Camera:MotionPhotoVersion",
-         "Camera:MotionPhotoPresentationTimestampUs", "GCamera:MotionPhoto",
-         "GCamera:MotionPhotoVersion",
-         "GCamera:MotionPhotoPresentationTimestampUs"});
+        result, {"Camera:MotionPhoto", "Camera:MotionPhotoVersion",
+                 "Camera:MotionPhotoPresentationTimestampUs",
+                 "GCamera:MotionPhoto", "GCamera:MotionPhotoVersion",
+                 "GCamera:MotionPhotoPresentationTimestampUs"});
     result = RemoveMotionPhotoListItems(result);
   } else {
     result = RemoveXmlAttributes(
@@ -642,8 +695,7 @@ std::string StripMotionPhotoMetadata(const std::string& xmp) {
     const std::string needle = std::string(prefix) + ":";
     size_t pos = 0;
     while ((pos = text.find(needle, pos)) != std::string_view::npos) {
-      const bool is_xmlns =
-          pos >= 6 && text.compare(pos - 6, 6, "xmlns:") == 0;
+      const bool is_xmlns = pos >= 6 && text.compare(pos - 6, 6, "xmlns:") == 0;
       if (!is_xmlns) {
         return true;
       }

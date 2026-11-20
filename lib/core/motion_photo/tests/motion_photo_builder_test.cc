@@ -14,16 +14,8 @@
 
 #include <absl/strings/match.h>
 #include <absl/strings/string_view.h>
-#if defined(MOTION_PHOTO_HEIC_SUPPORT)
-#include <libheif/heif.h>  // IWYU pragma: keep
-#if __has_include(<libheif/heif_decoding.h>)
-#include <libheif/heif_decoding.h>
-#endif
-#if __has_include(<libheif/heif_encoding.h>)
-#include <libheif/heif_encoding.h>
-#endif
-#endif  // defined(MOTION_PHOTO_HEIC_SUPPORT)
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -62,15 +54,6 @@ namespace fs = std::filesystem;
 using std::string;
 
 namespace {
-
-bool HasHevcSupport() {
-#if defined(MOTION_PHOTO_HEIC_SUPPORT)
-  return heif_have_decoder_for_format(heif_compression_HEVC) &&
-         heif_have_encoder_for_format(heif_compression_HEVC);
-#else
-  return false;
-#endif  // defined(MOTION_PHOTO_HEIC_SUPPORT)
-}
 
 string CreateTestDir(const std::string& subdir_name) {
   const char* test_tmpdir = std::getenv("TEST_TMPDIR");
@@ -290,10 +273,6 @@ TEST(MotionPhotoBuilderTest, CLI_HighResMultiTrackBuild) {
 // 5. CLI HEIC Motion Photo Build
 // -----------------------------------------------------------------------------
 TEST(MotionPhotoBuilderTest, CLI_HeicBuild) {
-  if (!HasHevcSupport()) {
-    std::cout << "Skipping CLI_HeicBuild test because HEVC codec is not supported" << std::endl;
-    return;
-  }
   const string kTestDir = CreateTestDir("CLI_HeicBuild");
   const string kPrimaryImageFile = "lib/core/motion_photo/testdata/motion_photo_photo_only.heic";
   const string kPrimaryVideoFile = "lib/core/motion_photo/testdata/motion_photo_video_only.mp4";
@@ -318,6 +297,27 @@ TEST(MotionPhotoBuilderTest, CLI_HeicBuild) {
   EXPECT_EQ(status, 0);
   EXPECT_TRUE(has_zero_errors);
   EXPECT_TRUE(fs::exists(kOutputFile));
+
+  // The HEIF build is lossless: the coded HEVC image item (9304 bytes at
+  // offset 518) and the Exif item (4572 bytes at offset 9822) of the input are
+  // carried over bit-exactly instead of being decoded and re-encoded.
+  auto read_all = [](const string& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::vector<char>(std::istreambuf_iterator<char>(in),
+                             std::istreambuf_iterator<char>());
+  };
+  const std::vector<char> input = read_all(kPrimaryImageFile);
+  const std::vector<char> output = read_all(kOutputFile);
+  ASSERT_TRUE(input.size() == 15399u);
+  for (auto [offset, length] : {std::pair<size_t, size_t>{518, 9304},
+                                std::pair<size_t, size_t>{9822, 4572}}) {
+    auto begin = input.begin() + offset;
+    EXPECT_TRUE(std::search(output.begin(), output.end(), begin,
+                            begin + length) != output.end());
+  }
+  // The result is recognized as a HEIC motion photo and round-trips through
+  // the extractor.
+  EXPECT_EQ(CheckMotionPhoto(kOutputFile, [](absl::string_view) {}), 0);
 
   fs::remove_all(kTestDir);
 }
@@ -1989,6 +1989,187 @@ TEST(MotionPhotoBuilderTest,
   }
   EXPECT_FALSE(MotionPhotoMp4FileBuilder::StripMetadataTrack(
       (fs::path(kTestDir) / "does_not_exist.mp4").string(), nullptr));
+
+  fs::remove_all(kTestDir);
+}
+
+TEST(MotionPhotoBuilderTest,
+     HEIC_PreservesGainMapAndCustomXmpAndUpdatesItemPadding) {
+  const string kTestDir = CreateTestDir("HEIC_PreservesGainMapAndCustomXmp");
+  const string kVideoSrc =
+      "lib/core/motion_photo/testdata/motion_photo_video_only.mp4";
+  auto put = [](std::vector<uint8_t>* out, uint64_t val, size_t n) {
+    for (size_t i = n; i > 0; --i) {
+      size_t shift = 8 * (i - 1);
+      out->push_back(
+          static_cast<uint8_t>(shift >= 64 ? 0 : ((val >> shift) & 0xFF)));
+    }
+  };
+  auto put_str = [](std::vector<uint8_t>* out, absl::string_view s) {
+    out->insert(out->end(), s.begin(), s.end());
+  };
+  auto make_box = [&](absl::string_view type, const std::vector<uint8_t>& p) {
+    std::vector<uint8_t> b;
+    put(&b, 8 + p.size(), 4);
+    put_str(&b, type);
+    b.insert(b.end(), p.begin(), p.end());
+    return b;
+  };
+  auto make_full_box = [&](absl::string_view type, uint8_t ver,
+                           const std::vector<uint8_t>& p) {
+    std::vector<uint8_t> fp;
+    fp.push_back(ver);
+    put(&fp, 0, 3);
+    fp.insert(fp.end(), p.begin(), p.end());
+    return make_box(type, fp);
+  };
+
+  const string primary_pixels = "PRIMARY_HEVC_PIXELS";
+  const string gm_pixels = "GAINMAP_HEVC_PIXELS";
+  const string gm_xmp =
+      "<x:xmpmeta><rdf:Description hdrgm:Version=\"1.0\"/></x:xmpmeta>";
+  // Existing Primary XMP carries custom exif:Make AND stale GCamera/JPEG tags.
+  const string old_primary_xmp =
+      "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">"
+      "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">"
+      "<rdf:Description xmlns:exif=\"http://ns.adobe.com/exif/1.0/\" "
+      "xmlns:GCamera=\"http://ns.google.com/photos/1.0/camera/\" "
+      "xmlns:Container=\"http://ns.google.com/photos/1.0/container/\" "
+      "xmlns:Item=\"http://ns.google.com/photos/1.0/container/item/\" "
+      "exif:Make=\"CustomCam\" GCamera:MotionPhoto=\"1\">"
+      "<Container:Directory><rdf:Seq>"
+      "<rdf:li rdf:parseType=\"Resource\"><Container:Item "
+      "Item:Semantic=\"Primary\" Item:Mime=\"image/jpeg\"/></rdf:li>"
+      "<rdf:li rdf:parseType=\"Resource\"><Container:Item "
+      "Item:Semantic=\"GainMap\" Item:Mime=\"image/jpeg\" "
+      "Item:Length=\"123\"/></rdf:li>"
+      "<rdf:li rdf:parseType=\"Resource\"><Container:Item "
+      "Item:Semantic=\"MotionPhoto\" Item:Mime=\"video/mp4\" "
+      "Item:Length=\"999\"/></rdf:li>"
+      "</rdf:Seq></Container:Directory>"
+      "</rdf:Description></rdf:RDF></x:xmpmeta>";
+
+  std::vector<uint8_t> mdat_p;
+  put_str(&mdat_p, primary_pixels);
+  put_str(&mdat_p, gm_pixels);
+  put_str(&mdat_p, gm_xmp);
+  put_str(&mdat_p, old_primary_xmp);
+
+  auto make_infe = [&](uint16_t id, absl::string_view type,
+                       absl::string_view mime) {
+    std::vector<uint8_t> p;
+    put(&p, id, 2);
+    put(&p, 0, 2);
+    put_str(&p, type);
+    p.push_back(0);
+    if (type == "mime") {
+      put_str(&p, mime);
+      p.push_back(0);
+    }
+    return make_full_box("infe", 2, p);
+  };
+  auto build_heic = [&](uint32_t mdat_off) {
+    std::vector<uint8_t> ftyp_p;
+    put_str(&ftyp_p, "heic");
+    put(&ftyp_p, 0, 4);
+    put_str(&ftyp_p, "mif1heic");
+    std::vector<uint8_t> hdlr_p;
+    put(&hdlr_p, 0, 4);
+    put_str(&hdlr_p, "pict");
+    hdlr_p.insert(hdlr_p.end(), 13, 0);
+    std::vector<uint8_t> pitm_p;
+    put(&pitm_p, 1, 2);
+    std::vector<uint8_t> iinf_p;
+    put(&iinf_p, 4, 2);
+    for (const auto& box : {make_infe(1, "hvc1", ""),
+                            make_infe(2, "mime", "application/rdf+xml"),
+                            make_infe(3, "hvc1", ""),
+                            make_infe(5, "mime", "application/rdf+xml")}) {
+      iinf_p.insert(iinf_p.end(), box.begin(), box.end());
+    }
+    std::vector<uint8_t> cdsc1, cdsc2;
+    put(&cdsc1, 2, 2);
+    put(&cdsc1, 1, 2);
+    put(&cdsc1, 1, 2);
+    put(&cdsc2, 5, 2);
+    put(&cdsc2, 1, 2);
+    put(&cdsc2, 3, 2);
+    std::vector<uint8_t> iref_p = make_box("cdsc", cdsc1);
+    auto b2 = make_box("cdsc", cdsc2);
+    iref_p.insert(iref_p.end(), b2.begin(), b2.end());
+
+    std::vector<uint8_t> iloc_p;
+    put(&iloc_p, 0x4400, 2);
+    put(&iloc_p, 4, 2);
+    auto add_loc = [&](uint16_t id, uint32_t off, uint32_t len) {
+      put(&iloc_p, id, 2);
+      put(&iloc_p, 0, 2);
+      put(&iloc_p, 0, 2);
+      put(&iloc_p, 1, 2);
+      put(&iloc_p, off, 4);
+      put(&iloc_p, len, 4);
+    };
+    uint32_t cur = mdat_off;
+    add_loc(1, cur, static_cast<uint32_t>(primary_pixels.size()));
+    cur += static_cast<uint32_t>(primary_pixels.size());
+    add_loc(3, cur, static_cast<uint32_t>(gm_pixels.size()));
+    cur += static_cast<uint32_t>(gm_pixels.size());
+    add_loc(5, cur, static_cast<uint32_t>(gm_xmp.size()));
+    cur += static_cast<uint32_t>(gm_xmp.size());
+    add_loc(2, cur, static_cast<uint32_t>(old_primary_xmp.size()));
+
+    std::vector<uint8_t> meta_p;
+    for (const auto& c :
+         {make_full_box("hdlr", 0, hdlr_p), make_full_box("pitm", 0, pitm_p),
+          make_full_box("iinf", 0, iinf_p), make_full_box("iref", 0, iref_p),
+          make_full_box("iloc", 1, iloc_p)}) {
+      meta_p.insert(meta_p.end(), c.begin(), c.end());
+    }
+    std::vector<uint8_t> out = make_box("ftyp", ftyp_p);
+    auto meta = make_full_box("meta", 0, meta_p);
+    auto mdat = make_box("mdat", mdat_p);
+    out.insert(out.end(), meta.begin(), meta.end());
+    out.insert(out.end(), mdat.begin(), mdat.end());
+    return out;
+  };
+  auto probe = build_heic(0);
+  auto synth_heic = build_heic(static_cast<uint32_t>(probe.size() - mdat_p.size()));
+  const string kInputHeic = (fs::path(kTestDir) / "gainmap_custom.heic").string();
+  const string kOutHeic = (fs::path(kTestDir) / "built_gainmap.MP.heic").string();
+  {
+    std::ofstream out(kInputHeic, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(synth_heic.data()),
+              synth_heic.size());
+  }
+
+  ASSERT_EQ(libmotionphoto::api::BuildMotionPhotoFromFile(
+                kInputHeic, kVideoSrc, kOutHeic, 12345),
+            0);
+  EXPECT_EQ(CheckMotionPhoto(kOutHeic,
+                             [](absl::string_view m) { std::cout << m; }),
+            0);
+
+  libmotionphoto::api::MotionPhotoMetadata parsed;
+  ASSERT_TRUE(libmotionphoto::api::ParseMotionPhotoFromFile(kOutHeic, &parsed));
+  EXPECT_TRUE(parsed.is_motion_photo);
+  EXPECT_EQ(parsed.presentation_timestamp_us, 12345);
+  EXPECT_EQ(parsed.primary_image_mime, "image/heic");
+  EXPECT_EQ(parsed.image_padding, 16);
+  ASSERT_TRUE(parsed.container.items.size() >= 3u);
+  EXPECT_EQ(parsed.container.items[0].semantic, "Primary");
+  EXPECT_EQ(parsed.container.items[0].mime, "image/heic");
+  EXPECT_EQ(parsed.container.items[0].padding, 16);
+  bool saw_gainmap = false;
+  for (const auto& item : parsed.container.items) {
+    if (item.semantic == "GainMap") saw_gainmap = true;
+    if (item.semantic == "MotionPhoto") EXPECT_NE(item.length, 999);
+  }
+  EXPECT_TRUE(saw_gainmap);
+
+  const std::vector<uint8_t> built_bytes = ReadFileBytes(kOutHeic);
+  const string built_str(built_bytes.begin(), built_bytes.end());
+  EXPECT_NE(built_str.find("exif:Make=\"CustomCam\""), string::npos);
+  EXPECT_NE(built_str.find("hdrgm:Version=\"1.0\""), string::npos);
 
   fs::remove_all(kTestDir);
 }

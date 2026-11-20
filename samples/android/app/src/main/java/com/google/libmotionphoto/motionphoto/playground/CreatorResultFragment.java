@@ -30,7 +30,6 @@ import android.view.LayoutInflater;
 import android.view.SurfaceView;
 import android.view.View;
 import android.view.ViewGroup;
-import android.webkit.MimeTypeMap;
 import android.widget.Button;
 import android.widget.ImageView;
 import android.widget.ScrollView;
@@ -289,8 +288,8 @@ public class CreatorResultFragment extends Fragment {
               File builtFile = viewModel.getBuiltMotionPhotoFile().getValue();
               if (builtFile != null && builtFile.exists()) {
                 pendingFileToSave = builtFile;
-                String mimeType = getMimeType(builtFile);
-                String ext = builtFile.getName().substring(builtFile.getName().lastIndexOf('.'));
+                String mimeType = StorageUtils.getMimeType(builtFile);
+                String ext = StorageUtils.getFileExtension(builtFile.getName(), ".jpg");
                 saveLauncher.launch(
                     new CreateDocumentDynamic.Params(mimeType, "motion_photo" + ext));
               }
@@ -456,21 +455,6 @@ public class CreatorResultFragment extends Fragment {
     updateDownloadButtonState();
   }
 
-  private String getMimeType(File file) {
-    String ext = MimeTypeMap.getFileExtensionFromUrl(file.getAbsolutePath());
-    if (ext == null || ext.isEmpty()) {
-      String name = file.getName();
-      int lastDot = name.lastIndexOf('.');
-      if (lastDot != -1) {
-        ext = name.substring(lastDot + 1);
-      }
-    }
-    if (ext != null) {
-      return MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext.toLowerCase(Locale.US));
-    }
-    return "*/*";
-  }
-
   @SuppressWarnings("ContentResolverUri")
   private void savePendingFile(Uri destinationUri) {
     if (pendingFileToSave == null || !pendingFileToSave.exists()) {
@@ -557,49 +541,57 @@ public class CreatorResultFragment extends Fragment {
             }
 
             viewModel.appendCreatorLog("Copying input files to temp directory...");
-            String imagePath =
-                StorageUtils.copyUriToTempFile(context, imageUri, "input_image", ".jpg");
-            String videoPath =
-                StorageUtils.copyUriToTempFile(context, videoUri, "input_video", ".mp4");
+            String imagePath = null;
+            String videoPath = null;
+            try {
+              imagePath =
+                  StorageUtils.copyUriToTempFile(context, imageUri, "input_image", ".jpg");
+              videoPath =
+                  StorageUtils.copyUriToTempFile(context, videoUri, "input_video", ".mp4");
 
-            if (imagePath == null || videoPath == null) {
-              viewModel.appendCreatorLog("Failed to copy input files.");
-              return;
+              if (imagePath == null || videoPath == null) {
+                viewModel.appendCreatorLog("Failed to copy input files.");
+                return;
+              }
+
+              String ext = StorageUtils.getFileExtension(imagePath, ".jpg");
+              File outputFile =
+                  new File(context.getExternalFilesDir(null), "output_motion_photo" + ext);
+              viewModel.appendCreatorLog("Output file will be: " + outputFile.getAbsolutePath());
+
+              viewModel.appendCreatorLog("Calling Sandboxed MotionPhotoBuilderService...");
+              int result = -1;
+              if (isBuilderBound && builderService != null) {
+                result =
+                    builderService.buildMotionPhoto(
+                        imagePath,
+                        videoPath,
+                        null,
+                        null,
+                        timestampUs,
+                        outputFile.getAbsolutePath());
+              } else {
+                viewModel.appendCreatorLog(
+                    "Builder service not bound, cannot build motion photo.");
+              }
+
+              viewModel.appendCreatorLog("Builder returned: " + result);
+              if (result == 0) {
+                viewModel.appendCreatorLog(
+                    "SUCCESS! Motion photo created at " + outputFile.getAbsolutePath());
+                viewModel.setBuiltMotionPhotoFile(outputFile);
+                prepareResultPreview(context, outputFile);
+              } else {
+                viewModel.appendCreatorLog("FAILED! Check logs above.");
+              }
+            } finally {
+              if (imagePath != null) {
+                new File(imagePath).delete();
+              }
+              if (videoPath != null) {
+                new File(videoPath).delete();
+              }
             }
-
-            String ext = imagePath.substring(imagePath.lastIndexOf('.'));
-            File outputFile =
-                new File(context.getExternalFilesDir(null), "output_motion_photo" + ext);
-            viewModel.appendCreatorLog("Output file will be: " + outputFile.getAbsolutePath());
-
-            viewModel.appendCreatorLog("Calling Sandboxed MotionPhotoBuilderService...");
-            int result = -1;
-            if (isBuilderBound && builderService != null) {
-              result =
-                  builderService.buildMotionPhoto(
-                      imagePath,
-                      videoPath,
-                      null,
-                      null,
-                      timestampUs,
-                      outputFile.getAbsolutePath());
-            } else {
-              viewModel.appendCreatorLog("Builder service not bound, cannot build motion photo.");
-            }
-
-            viewModel.appendCreatorLog("Builder returned: " + result);
-            if (result == 0) {
-              viewModel.appendCreatorLog(
-                  "SUCCESS! Motion photo created at " + outputFile.getAbsolutePath());
-              viewModel.setBuiltMotionPhotoFile(outputFile);
-              prepareResultPreview(context, outputFile);
-            } else {
-              viewModel.appendCreatorLog("FAILED! Check logs above.");
-            }
-
-            // Clean up temp files
-            new File(imagePath).delete();
-            new File(videoPath).delete();
 
           } catch (IOException e) {
             viewModel.appendCreatorLog("IOException: " + e.getMessage());
@@ -622,7 +614,7 @@ public class CreatorResultFragment extends Fragment {
       return;
     }
 
-    String ext = motionPhotoFile.getName().substring(motionPhotoFile.getName().lastIndexOf('.'));
+    String ext = StorageUtils.getFileExtension(motionPhotoFile.getName(), ".jpg");
     File tempImageFile = new File(context.getCacheDir(), "extracted_temp_image" + ext);
     File tempMetadataFile = new File(context.getCacheDir(), "extracted_temp_metadata.xml");
 

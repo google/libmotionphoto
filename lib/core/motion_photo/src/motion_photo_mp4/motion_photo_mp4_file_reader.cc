@@ -32,8 +32,21 @@ bool MotionPhotoMp4FileReader::Read(const string& file_name, int64_t offset) {
   if (!reader.ParseFromFile(file_name, offset)) {
     return false;
   }
+  return ExtractFromReader(reader);
+}
 
+bool MotionPhotoMp4FileReader::ReadFromMemory(const uint8_t* data, size_t size,
+                                              int64_t offset) {
+  Mp4BoxReader reader;
+  if (!reader.ParseFromMemory(data, size, offset)) {
+    return false;
+  }
+  return ExtractFromReader(reader);
+}
+
+bool MotionPhotoMp4FileReader::ExtractFromReader(const Mp4BoxReader& reader) {
   track_data_ = VideoTrackData();
+  high_res_track_metadata_.clear();
   size_t track_count = reader.GetTrackCount();
 
   for (size_t index = 0; index < track_count; ++index) {

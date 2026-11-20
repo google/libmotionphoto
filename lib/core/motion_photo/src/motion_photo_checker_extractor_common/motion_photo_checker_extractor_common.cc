@@ -74,29 +74,17 @@ string Track(TrackId track_id) {
 }
 }  // namespace
 
-bool WriteToOutput(const std::string& inputFilePath,
-                   const std::string& outputFilePath,
-                   std::streamoff beginOffset,
-                   std::streamoff endOffset) {
+namespace {
+bool CopyRangeToStream(std::ifstream* inputFile, std::ofstream* outputFile,
+                       std::streamoff beginOffset, std::streamoff endOffset) {
   if (beginOffset < 0 || endOffset <= beginOffset) {
-    std::cerr << "Error: Invalid range (end must be > begin and both >= 0)." << std::endl;
+    std::cerr << "Error: Invalid range (end must be > begin and both >= 0)."
+              << std::endl;
     return false;
   }
-
-  std::ifstream inputFile(inputFilePath, std::ios::in | std::ios::binary);
-  if (!inputFile.is_open()) {
-    std::cerr << "Error: Could not open input file: " << inputFilePath << std::endl;
-    return false;
-  }
-
-  std::ofstream outputFile(outputFilePath, std::ios::out | std::ios::binary);
-  if (!outputFile.is_open()) {
-    std::cerr << "Error: Could not open output file: " << outputFilePath << std::endl;
-    return false;
-  }
-
-  if (!inputFile.seekg(beginOffset)) {
-    std::cerr << "Error: Could not seek to begin offset in input file." << std::endl;
+  if (!inputFile->seekg(beginOffset)) {
+    std::cerr << "Error: Could not seek to begin offset in input file."
+              << std::endl;
     return false;
   }
 
@@ -105,21 +93,24 @@ bool WriteToOutput(const std::string& inputFilePath,
   std::streamoff bytesRemaining = endOffset - beginOffset;
 
   while (bytesRemaining > 0) {
-    size_t readCount = static_cast<size_t>(std::min<std::streamoff>(kBufferSize, bytesRemaining));
-    inputFile.read(buffer, readCount);
-    std::streamoff bytesRead = inputFile.gcount();
+    size_t readCount = static_cast<size_t>(
+        std::min<std::streamoff>(kBufferSize, bytesRemaining));
+    inputFile->read(buffer, readCount);
+    std::streamoff bytesRead = inputFile->gcount();
 
     if (bytesRead > 0) {
-      outputFile.write(buffer, bytesRead);
+      outputFile->write(buffer, bytesRead);
     }
 
-    if (inputFile.fail() && !inputFile.eof()) {
+    if (inputFile->fail() && !inputFile->eof()) {
       std::cerr << "Error during file read operation." << std::endl;
       return false;
     }
 
-    if (bytesRead < readCount) {
-      std::cerr << "Warning: Reached end of file before reaching the specified endOffset." << std::endl;
+    if (bytesRead < static_cast<std::streamoff>(readCount)) {
+      std::cerr << "Warning: Reached end of file before reaching the specified "
+                   "endOffset."
+                << std::endl;
       break;
     }
 
@@ -128,10 +119,53 @@ bool WriteToOutput(const std::string& inputFilePath,
 
   return bytesRemaining == 0;
 }
+}  // namespace
 
-tuple<unique_ptr<DataSource>, size_t> ReadFile(const string& file_name,
-                                                const StringOutputter& outputter,
-                                                MessageHandler* message_handler) {
+bool WriteToOutput(const std::string& inputFilePath,
+                   const std::string& outputFilePath,
+                   std::streamoff beginOffset, std::streamoff endOffset) {
+  return WriteRangesToOutput(
+      inputFilePath, outputFilePath,
+      {DataRange(static_cast<size_t>(beginOffset),
+                 static_cast<size_t>(endOffset))});
+}
+
+bool WriteRangesToOutput(const std::string& inputFilePath,
+                         const std::string& outputFilePath,
+                         const std::vector<DataRange>& ranges) {
+  if (ranges.empty()) {
+    std::cerr << "Error: Invalid empty range list." << std::endl;
+    return false;
+  }
+
+  std::ifstream inputFile(inputFilePath, std::ios::in | std::ios::binary);
+  if (!inputFile.is_open()) {
+    std::cerr << "Error: Could not open input file: " << inputFilePath
+              << std::endl;
+    return false;
+  }
+
+  std::ofstream outputFile(outputFilePath, std::ios::out | std::ios::binary);
+  if (!outputFile.is_open()) {
+    std::cerr << "Error: Could not open output file: " << outputFilePath
+              << std::endl;
+    return false;
+  }
+
+  for (const auto& range : ranges) {
+    if (!range.IsValid() ||
+        !CopyRangeToStream(&inputFile, &outputFile,
+                           static_cast<std::streamoff>(range.GetBegin()),
+                           static_cast<std::streamoff>(range.GetEnd()))) {
+      return false;
+    }
+  }
+  return outputFile.good();
+}
+
+tuple<unique_ptr<DataSource>, size_t> ReadFile(
+    const string& file_name, const StringOutputter& outputter,
+    MessageHandler* message_handler) {
   size_t file_size = 0;
   unique_ptr<DataSource> data_source;
   outputter("\nReading " + file_name + "\n");
@@ -154,16 +188,16 @@ tuple<unique_ptr<DataSource>, size_t> ReadFile(const string& file_name,
   return make_tuple(std::move(data_source), file_size);
 }
 
-tuple<size_t, DataRange, MpvdBox> GetImageSizeAndXmpRange(
+tuple<size_t, std::vector<DataRange>, MpvdBox> GetImageSizeAndXmpRanges(
     DataSource* data_source, size_t data_source_length, FileType file_type,
     const std::string& motion_photo_file_name,
     const std::string& primary_image_file_name_output,
     const StringOutputter& outputter, MessageHandler* message_handler) {
-  auto error_value = make_tuple(0, DataRange(), MpvdBox());
+  auto error_value = make_tuple(0, std::vector<DataRange>(), MpvdBox());
   outputter("\nReading XMP metadata\n");
 
   size_t image_size = 0;
-  DataRange primary_xmp_range;
+  std::vector<DataRange> primary_xmp_ranges;
   MpvdBox mpvd_box;
   bool valid_mpvd_box = true;
 
@@ -189,7 +223,10 @@ tuple<size_t, DataRange, MpvdBox> GetImageSizeAndXmpRange(
                     image_ranges[0].GetBegin(), image_ranges.back().GetEnd());
     }
 
-    primary_xmp_range = info_builder.GetPrimaryXmpStringRange();
+    const DataRange& primary_xmp_range = info_builder.GetPrimaryXmpStringRange();
+    if (primary_xmp_range.IsValid()) {
+      primary_xmp_ranges.push_back(primary_xmp_range);
+    }
     const auto& extended_ranges = info_builder.GetExtendedXmpStringRanges();
     if (!extended_ranges.empty()) {
       if (message_handler) {
@@ -206,9 +243,8 @@ tuple<size_t, DataRange, MpvdBox> GetImageSizeAndXmpRange(
     if (!info_builder.Build(data_source, data_source_length)) {
       return error_value;
     }
-    MpvdBoxScanReceiver receiver(mpvd_box);
-    MpvdBox::Scan(data_source, 0, receiver);
-    primary_xmp_range = info_builder.GetXmpStringRange();
+    mpvd_box = info_builder.GetMpvdBox();
+    primary_xmp_ranges = info_builder.GetXmpStringRanges();
     image_size = mpvd_box.GetStartIndex();
     valid_mpvd_box = mpvd_box.IsValid();
     if (!valid_mpvd_box) {
@@ -216,43 +252,34 @@ tuple<size_t, DataRange, MpvdBox> GetImageSizeAndXmpRange(
         message_handler->ReportMessage(Message::kValueError,
                                        "No MpvdBox found in input");
       }
-    } else if (!primary_image_file_name_output.empty()) {
-      MotionPhotoHeifImageBuilder heif_builder(primary_image_file_name_output,
-                                               message_handler);
-      std::shared_ptr<DataSegment> xmp_segment = data_source->GetDataSegment(
-          primary_xmp_range.GetBegin(), primary_xmp_range.GetLength());
-      if (!xmp_segment) {
-        message_handler->ReportMessage(Message::kValueError,
-                                       "Failed to read XMP metadata segment.");
-        return error_value;
-      }
-      std::string xmp_metadata(
-          reinterpret_cast<const char*>(
-              xmp_segment->GetBuffer(primary_xmp_range.GetBegin())),
-          primary_xmp_range.GetLength());
-      if (!heif_builder.AddImageFileAndMetadata(motion_photo_file_name,
-                                                xmp_metadata)) {
-        message_handler->ReportMessage(Message::kValueError,
-                                       "Failure in writing HEIF image output.");
+    } else if (!primary_image_file_name_output.empty() &&
+               mpvd_box.GetStartIndex() + mpvd_box.GetLength() ==
+                   data_source_length) {
+      if (!WriteToOutput(motion_photo_file_name, primary_image_file_name_output,
+                         0, mpvd_box.GetStartIndex())) {
+        if (message_handler) {
+          message_handler->ReportMessage(
+              Message::kValueError, "Failure in writing HEIF image output.");
+        }
       }
     }
   }
 
-  if (!primary_xmp_range.IsValid()) {
+  if (primary_xmp_ranges.empty()) {
     if (message_handler) {
       message_handler->ReportMessage(Message::kValueError,
                                      "No XMP data found in input");
     }
   }
-  if (!primary_xmp_range.IsValid() || !valid_mpvd_box) {
+  if (primary_xmp_ranges.empty() || !valid_mpvd_box) {
     return error_value;
   }
-  return make_tuple(image_size, primary_xmp_range, mpvd_box);
+  return make_tuple(image_size, std::move(primary_xmp_ranges), mpvd_box);
 }
 
 bool ParseXmpMetadata(DataSource* data_source,
                       const string& motion_photo_file_name,
-                      const DataRange& xmp_range,
+                      const std::vector<DataRange>& xmp_ranges,
                       const std::string& metadata_file_name_output,
                       MotionPhotoReader* motion_photo_reader,
                       const StringOutputter& outputter) {
@@ -261,27 +288,28 @@ bool ParseXmpMetadata(DataSource* data_source,
   DataLineMap data_line_map;
   stringstream ss;
   XmpListingBuilder listing_builder(ss, kMaxXmpLineLength);
-  listing_builder.Build(data_source, {xmp_range}, &data_line_map);
+  listing_builder.Build(data_source, xmp_ranges, &data_line_map);
   outputter(ss.str());
   size_t bytes_parsed = 0;
   if (!metadata_file_name_output.empty()) {
-    WriteToOutput(motion_photo_file_name, metadata_file_name_output,
-                  xmp_range.GetBegin(), xmp_range.GetEnd());
+    WriteRangesToOutput(motion_photo_file_name, metadata_file_name_output,
+                        xmp_ranges);
   }
-  return motion_photo_reader->ReadImageMetadata({xmp_range}, data_source,
+  return motion_photo_reader->ReadImageMetadata(xmp_ranges, data_source,
                                                 &bytes_parsed);
 }
 
 bool ParseAndCheckXmpMetadata(DataSource* data_source, size_t file_size,
                               FileType file_type,
                               const string& motion_photo_file_name,
-                              const DataRange& xmp_range, size_t image_size,
+                              const std::vector<DataRange>& xmp_ranges,
+                              size_t image_size,
                               const std::string& metadata_file_name_output,
                               MotionPhoto* motion_photo,
                               MotionPhotoReader* motion_photo_reader,
                               MotionPhotoChecker* motion_photo_checker,
                               const StringOutputter& outputter) {
-  if (!ParseXmpMetadata(data_source, motion_photo_file_name, xmp_range,
+  if (!ParseXmpMetadata(data_source, motion_photo_file_name, xmp_ranges,
                         metadata_file_name_output, motion_photo_reader,
                         outputter)) {
     return false;
@@ -291,7 +319,9 @@ bool ParseAndCheckXmpMetadata(DataSource* data_source, size_t file_size,
   size_t error_count = motion_photo_checker->GetErrorCount();
   size_t warning_count = motion_photo_checker->GetWarningCount();
   outputter("...XMP metadata indicates a motion photo\n");
-  motion_photo_checker->CheckFileName(motion_photo_file_name);
+  if (!motion_photo_file_name.empty()) {
+    motion_photo_checker->CheckFileName(motion_photo_file_name);
+  }
   motion_photo_checker->CheckCameraMetadata();
   motion_photo_checker->CheckContainerMetadata();
   if (file_type == FileType::kJpeg) {
@@ -322,22 +352,14 @@ bool ParseAndCheckXmpMetadata(DataSource* data_source, size_t file_size,
   return motion_photo_checker->GetErrorCount() == error_count;
 }
 
-bool ReadDecodeAndCheckVideoMetadata(const std::string& motion_photo_file_name,
-                                     int64_t mp4_offset,
-                                     MotionPhoto* motion_photo,
-                                     MotionPhotoReader* motion_photo_reader,
-                                     MotionPhotoChecker* motion_photo_checker,
-                                     const StringOutputter& outputter,
-                                     MessageHandler* message_handler) {
-  outputter("\nReading MP4 data\n");
-  MotionPhotoMp4FileReader mp4_reader;
-  if (!mp4_reader.Read(motion_photo_file_name, mp4_offset)) {
-    if (message_handler) {
-      message_handler->ReportMessage(
-          Message(Message::kStdLibError, EIO, motion_photo_file_name));
-    }
-    return false;
-  }
+namespace {
+
+bool CheckDecodedVideoMetadata(const MotionPhotoMp4FileReader& mp4_reader,
+                               MotionPhoto* motion_photo,
+                               MotionPhotoReader* motion_photo_reader,
+                               MotionPhotoChecker* motion_photo_checker,
+                               const StringOutputter& outputter,
+                               MessageHandler* message_handler) {
   std::vector<uint8_t> video_metadata;
   const auto& track_data = mp4_reader.GetVideoTrackData();
   outputter("...Low res video track id: " +
@@ -381,6 +403,74 @@ bool ReadDecodeAndCheckVideoMetadata(const std::string& motion_photo_file_name,
   }
 
   return true;
+}
+
+}  // namespace
+
+bool ReadDecodeAndCheckVideoMetadata(const std::string& motion_photo_file_name,
+                                     int64_t mp4_offset,
+                                     MotionPhoto* motion_photo,
+                                     MotionPhotoReader* motion_photo_reader,
+                                     MotionPhotoChecker* motion_photo_checker,
+                                     const StringOutputter& outputter,
+                                     MessageHandler* message_handler) {
+  outputter("\nReading MP4 data\n");
+  MotionPhotoMp4FileReader mp4_reader;
+  if (!mp4_reader.Read(motion_photo_file_name, mp4_offset)) {
+    if (message_handler) {
+      message_handler->ReportMessage(
+          Message(Message::kStdLibError, EIO, motion_photo_file_name));
+    }
+    return false;
+  }
+  return CheckDecodedVideoMetadata(mp4_reader, motion_photo, motion_photo_reader,
+                                   motion_photo_checker, outputter,
+                                   message_handler);
+}
+
+bool ReadDecodeAndCheckVideoMetadata(DataSource* data_source, size_t file_size,
+                                     const std::string& motion_photo_file_name,
+                                     int64_t mp4_offset,
+                                     MotionPhoto* motion_photo,
+                                     MotionPhotoReader* motion_photo_reader,
+                                     MotionPhotoChecker* motion_photo_checker,
+                                     const StringOutputter& outputter,
+                                     MessageHandler* message_handler) {
+  if (data_source == nullptr && !motion_photo_file_name.empty()) {
+    return ReadDecodeAndCheckVideoMetadata(
+        motion_photo_file_name, mp4_offset, motion_photo, motion_photo_reader,
+        motion_photo_checker, outputter, message_handler);
+  }
+  outputter("\nReading MP4 data\n");
+  MotionPhotoMp4FileReader mp4_reader;
+  bool read_ok = false;
+  if (data_source != nullptr && mp4_offset >= 0 &&
+      static_cast<size_t>(mp4_offset) < file_size) {
+    const size_t start = static_cast<size_t>(mp4_offset);
+    const size_t len = file_size - start;
+    std::shared_ptr<DataSegment> seg = data_source->GetDataSegment(start, len);
+    if (seg && seg->GetBegin() <= start && seg->GetEnd() >= file_size) {
+      read_ok = mp4_reader.ReadFromMemory(seg->GetBuffer(start), len, 0);
+    } else {
+      std::vector<uint8_t> mp4_bytes;
+      if (ReadDataRangeToBytes(data_source, start, file_size, &mp4_bytes)) {
+        read_ok =
+            mp4_reader.ReadFromMemory(mp4_bytes.data(), mp4_bytes.size(), 0);
+      }
+    }
+  }
+  if (!read_ok) {
+    if (message_handler) {
+      message_handler->ReportMessage(
+          Message(Message::kStdLibError, EIO,
+                  motion_photo_file_name.empty() ? "data_source"
+                                                 : motion_photo_file_name));
+    }
+    return false;
+  }
+  return CheckDecodedVideoMetadata(mp4_reader, motion_photo, motion_photo_reader,
+                                   motion_photo_checker, outputter,
+                                   message_handler);
 }
 
 }  // namespace motion_photo

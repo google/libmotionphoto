@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
@@ -31,6 +32,7 @@
 #include "motion_photo/metadata_block.h"
 #include "motion_photo/metadata_engine.h"
 #include "motion_photo/motion_photo.h"
+#include "motion_photo/motion_photo_utils.h"
 #include "motion_photo/tests/test_framework.h"
 
 namespace libmotionphoto {
@@ -430,6 +432,249 @@ TEST(MetadataEngineHeifTest, RejectsHeicWithoutVideo) {
   ASSERT_FALSE(file.empty());
 
   EXPECT_FALSE(IsMotionPhotoPerEngine(file, FileType::kHeic));
+}
+
+TEST(HeifContainerSplitterTest,
+     EmitsSefdWithoutMpvdAndRejectsNonContiguousRange) {
+  const Bytes sefd_payload = {'S', 'E', 'F', 'H'};
+  const Bytes ftyp = MakeBox("ftyp", {'h', 'e', 'i', 'c', 0, 0, 0, 0});
+  const Bytes sefd = MakeBox("sefd", sefd_payload);
+  Bytes file;
+  file.insert(file.end(), ftyp.begin(), ftyp.end());
+  file.insert(file.end(), sefd.begin(), sefd.end());
+
+  std::vector<RawMetadataBlock> blocks = SplitHeif(file);
+  ASSERT_EQ(blocks.size(), 1u);
+  EXPECT_EQ(blocks[0].type, std::string("SEFD"));
+  EXPECT_EQ(blocks[0].offset, ftyp.size() + 8);
+  EXPECT_EQ(blocks[0].total_payload_size, sefd_payload.size());
+}
+
+TEST(HeifContainerSplitterTest, StripMotionPhotoMetadata_EdgeCases) {
+  // Single-quoted MotionPhoto item with GainMap preserved.
+  const std::string single_quote_gm =
+      "<x:xmpmeta xmlns:x='adobe:ns:meta/' "
+      "xmlns:Camera='http://ns.google.com/photos/1.0/camera/' "
+      "xmlns:Container='http://ns.google.com/photos/1.0/container/' "
+      "xmlns:Item='http://ns.google.com/photos/1.0/container/item/' "
+      "Camera:MotionPhoto='1' Container:Version='1'>"
+      "<Container:Directory><rdf:Seq>"
+      "<rdf:li Item:Semantic='Primary' Item:Mime='image/heic'/>"
+      "<rdf:li Item:Semantic='GainMap' Item:Mime='image/jpeg'/>"
+      "<rdf:li Item:Semantic='MotionPhoto' Item:Mime='video/mp4'/>"
+      "</rdf:Seq></Container:Directory></x:xmpmeta>";
+  std::string stripped_sq = StripMotionPhotoMetadata(single_quote_gm);
+  EXPECT_EQ(stripped_sq.find("MotionPhoto"), std::string::npos);
+  EXPECT_NE(stripped_sq.find("GainMap"), std::string::npos);
+
+  // Element-form <Item:Semantic>MotionPhoto</Item:Semantic> with GainMap.
+  const std::string elem_gm =
+      "<x:xmpmeta><Container:Directory><rdf:Seq>"
+      "<rdf:li><Item:Semantic>GainMap</Item:Semantic></rdf:li>"
+      "<rdf:li><Item:Semantic>MotionPhoto</Item:Semantic></rdf:li>"
+      "</rdf:Seq></Container:Directory></x:xmpmeta>";
+  std::string stripped_elem = StripMotionPhotoMetadata(elem_gm);
+  EXPECT_EQ(stripped_elem.find("MotionPhoto"), std::string::npos);
+  EXPECT_NE(stripped_elem.find("GainMap"), std::string::npos);
+
+  // Container:Version="1" and orphaned xmlns without GainMap.
+  const std::string no_gm =
+      "<x:xmpmeta xmlns:Camera=\"http://ns.google.com/photos/1.0/camera/\" "
+      "xmlns:Container=\"http://ns.google.com/photos/1.0/container/\" "
+      "xmlns:Item=\"http://ns.google.com/photos/1.0/container/item/\" "
+      "Camera:MotionPhoto=\"1\" Container:Version=\"1\">"
+      "<Container:Directory><rdf:Seq><rdf:li Item:Semantic=\"MotionPhoto\"/>"
+      "</rdf:Seq></Container:Directory></x:xmpmeta>";
+  std::string stripped_no_gm = StripMotionPhotoMetadata(no_gm);
+  EXPECT_EQ(stripped_no_gm.find("Container:Version"), std::string::npos);
+  EXPECT_EQ(stripped_no_gm.find("MotionPhoto"), std::string::npos);
+  EXPECT_EQ(stripped_no_gm.find("xmlns:Camera"), std::string::npos);
+  EXPECT_EQ(stripped_no_gm.find("xmlns:Container"), std::string::npos);
+  EXPECT_EQ(stripped_no_gm.find("xmlns:Item"), std::string::npos);
+}
+
+TEST(HeifContainerSplitterTest,
+     DoesNotMisattributeGainMapXmpWhenPrimaryHasNone) {
+  auto make_CustomInfe = [](uint16_t id, std::string_view type,
+                            std::string_view mime, std::string_view enc) {
+    Bytes p;
+    AppendUInt(id, 2, &p);
+    AppendUInt(0, 2, &p);
+    AppendString(type, &p);
+    AppendCString("", &p);
+    if (type == "mime") {
+      AppendCString(mime, &p);
+      if (!enc.empty()) AppendCString(enc, &p);
+    }
+    return MakeFullBox("infe", 2, p);
+  };
+  const std::string_view gainmap_xmp =
+      "<x:xmpmeta><rdf:Description hdrgm:Version=\"1.0\"/></x:xmpmeta>";
+  Bytes idat;
+  AppendString(gainmap_xmp, &idat);
+  const IdatItem gm_loc = {4, 0, static_cast<uint32_t>(gainmap_xmp.size()), 0};
+
+  // Primary=1, GainMap=3, GainMap XMP=4 ('cdsc' 4->3), NO Primary XMP.
+  const Bytes file_no_primary_xmp = Concat(
+      {MakeFtypBox(),
+       MakeFullBox("meta", 0,
+                   Concat({MakePitmV0(1),
+                           MakeIinfV0({make_CustomInfe(1, "hvc1", "", ""),
+                                       make_CustomInfe(3, "hvc1", "", ""),
+                                       make_CustomInfe(4, "mime",
+                                                       kXmpContentType, "")}),
+                           MakeCdscIrefV0({{4, 3}}), MakeIdatIlocV1({gm_loc}),
+                           MakeBox("idat", idat)})),
+       MakeMpvdBox()});
+  EXPECT_TRUE(SplitHeif(file_no_primary_xmp).empty());
+
+  auto segment = image_io::DataSegment::Create(
+      image_io::DataRange(0, file_no_primary_xmp.size()),
+      file_no_primary_xmp.data(), image_io::DataSegment::kDontDelete);
+  image_io::DataSegmentDataSource source(segment);
+  EXPECT_TRUE(
+      FindHeifPrimaryXmpRanges(&source, file_no_primary_xmp.size()).empty());
+}
+
+TEST(HeifContainerSplitterTest,
+     FallsBackToUnlinkedXmpOnlyWhenZeroCdscRefsExist) {
+  const std::string_view unlinked_xmp = "<x:xmpmeta>unlinked</x:xmpmeta>";
+  Bytes idat;
+  AppendString(unlinked_xmp, &idat);
+  const IdatItem xmp_loc = {2, 0, static_cast<uint32_t>(unlinked_xmp.size()), 0};
+
+  // 'iref' exists with a non-'cdsc' ('dimg') reference, zero 'cdsc' refs.
+  Bytes dimg;
+  AppendUInt(3, 2, &dimg);
+  AppendUInt(1, 2, &dimg);
+  AppendUInt(1, 2, &dimg);
+  const Bytes file = Concat(
+      {MakeFtypBox(),
+       MakeFullBox("meta", 0,
+                   Concat({MakePitmV0(1),
+                           MakeIinfV0({MakeInfeV2(1, "hvc1", ""),
+                                       MakeInfeV2(2, "mime", kXmpContentType),
+                                       MakeInfeV2(3, "tmap", "")}),
+                           MakeFullBox("iref", 0, MakeBox("dimg", dimg)),
+                           MakeIdatIlocV1({xmp_loc}), MakeBox("idat", idat)})),
+       MakeMpvdBox()});
+  std::vector<RawMetadataBlock> blocks = SplitHeif(file);
+  ASSERT_EQ(blocks.size(), 1u);
+  EXPECT_EQ(AsString(blocks[0].bytes), std::string(unlinked_xmp));
+}
+
+TEST(HeifContainerSplitterTest,
+     SupportsMultiExtentCaseInsensitiveMimeAndSkipsGzipXmp) {
+  auto make_encoded_infe = [](uint16_t id, std::string_view mime,
+                              std::string_view enc) {
+    Bytes p;
+    AppendUInt(id, 2, &p);
+    AppendUInt(0, 2, &p);
+    AppendString("mime", &p);
+    AppendCString("", &p);
+    AppendCString(mime, &p);
+    AppendCString(enc, &p);
+    return MakeFullBox("infe", 2, p);
+  };
+  const std::string ext1 = "<x:xmpmeta>PART1_";
+  const std::string gap = "IMAGE_BYTES_GAP";
+  const std::string ext2 = "PART2</x:xmpmeta>";
+  Bytes mdat_payload;
+  AppendString(ext1, &mdat_payload);
+  AppendString(gap, &mdat_payload);
+  AppendString(ext2, &mdat_payload);
+
+  auto build = [&](uint32_t mdat_data_off) {
+    Bytes iloc_p;
+    AppendUInt(0x4400, 2, &iloc_p);
+    AppendUInt(2, 2, &iloc_p);  // item 2 (gzipped) + item 3 (multi-extent)
+    // Item 2: gzipped XMP (should be skipped even though linked to primary)
+    AppendUInt(2, 2, &iloc_p);
+    AppendUInt(0, 2, &iloc_p);
+    AppendUInt(0, 2, &iloc_p);
+    AppendUInt(1, 2, &iloc_p);
+    AppendUInt(mdat_data_off, 4, &iloc_p);
+    AppendUInt(4, 4, &iloc_p);
+    // Item 3: valid case-insensitive XMP in 2 non-contiguous extents
+    AppendUInt(3, 2, &iloc_p);
+    AppendUInt(0, 2, &iloc_p);
+    AppendUInt(0, 2, &iloc_p);
+    AppendUInt(2, 2, &iloc_p);
+    AppendUInt(mdat_data_off, 4, &iloc_p);
+    AppendUInt(static_cast<uint32_t>(ext1.size()), 4, &iloc_p);
+    AppendUInt(mdat_data_off + static_cast<uint32_t>(ext1.size() + gap.size()),
+               4, &iloc_p);
+    AppendUInt(static_cast<uint32_t>(ext2.size()), 4, &iloc_p);
+
+    return Concat(
+        {MakeFtypBox(),
+         MakeFullBox("meta", 0,
+                     Concat({MakePitmV0(1),
+                             MakeIinfV0({MakeInfeV2(1, "hvc1", ""),
+                                         make_encoded_infe(2, kXmpContentType,
+                                                           "gzip"),
+                                         MakeInfeV2(3, "mime",
+                                                    "Application/RDF+XML")}),
+                             MakeCdscIrefV0({{2, 1}, {3, 1}}),
+                             MakeFullBox("iloc", 1, iloc_p)})),
+         MakeBox("mdat", mdat_payload), MakeMpvdBox()});
+  };
+  Bytes probe = build(0);
+  uint32_t mdat_off = static_cast<uint32_t>(
+      probe.size() - MakeMpvdBox().size() - mdat_payload.size());
+  Bytes file = build(mdat_off);
+
+  auto segment = image_io::DataSegment::Create(
+      image_io::DataRange(0, file.size()), file.data(),
+      image_io::DataSegment::kDontDelete);
+  image_io::DataSegmentDataSource source(segment);
+  std::vector<image_io::DataRange> ranges =
+      FindHeifPrimaryXmpRanges(&source, file.size());
+  ASSERT_EQ(ranges.size(), 2u);
+  EXPECT_EQ(ranges[0].GetBegin(), mdat_off);
+  EXPECT_EQ(ranges[0].GetLength(), ext1.size());
+  EXPECT_EQ(ranges[1].GetBegin(), mdat_off + ext1.size() + gap.size());
+  EXPECT_EQ(ranges[1].GetLength(), ext2.size());
+
+  std::vector<RawMetadataBlock> blocks = SplitHeif(file);
+  ASSERT_EQ(blocks.size(), 1u);
+  EXPECT_EQ(AsString(blocks[0].bytes), ext1 + ext2);
+}
+
+TEST(HeifContainerSplitterTest,
+     StripMotionPhotoMetadata_LargeSpacePaddedXmpFast) {
+  std::string padded_xmp =
+      "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">"
+      "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">"
+      "<rdf:Description xmlns:dc=\"http://purl.org/dc/elements/1.1/\" "
+      "xmlns:Camera=\"http://ns.google.com/photos/1.0/camera/\" "
+      "xmlns:Container=\"http://ns.google.com/photos/1.0/container/\" "
+      "xmlns:Item=\"http://ns.google.com/photos/1.0/container/item/\" "
+      "Camera:MotionPhoto=\"1\" Camera:MotionPhotoVersion=\"1\" "
+      "Container:Version=\"1\">"
+      "<dc:description><rdf:Alt><rdf:li xml:lang=\"x-default\">"
+      "Adobe</rdf:li></rdf:Alt></dc:description>"
+      "<Container:Directory><rdf:Seq>"
+      "<rdf:li Item:Semantic=\"Primary\" Item:Mime=\"image/heic\"/>"
+      "<rdf:li Item:Semantic=\"GainMap\" Item:Mime=\"image/jpeg\"/>"
+      "<rdf:li Item:Semantic=\"MotionPhoto\" Item:Mime=\"video/mp4\" "
+      "Item:Length=\"12345\"/>"
+      "</rdf:Seq></Container:Directory>"
+      "</rdf:Description></rdf:RDF>";
+  padded_xmp.append(60 * 1024, ' ');
+  padded_xmp += "</x:xmpmeta>";
+
+  const auto start = std::chrono::steady_clock::now();
+  const std::string stripped = StripMotionPhotoMetadata(padded_xmp);
+  const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - start)
+                              .count();
+  EXPECT_TRUE(elapsed_ms < 1000);
+  EXPECT_EQ(stripped.find("MotionPhoto"), std::string::npos);
+  EXPECT_NE(stripped.find("GainMap"), std::string::npos);
+  EXPECT_NE(stripped.find("xml:lang=\"x-default\""), std::string::npos);
+  EXPECT_EQ(stripped.find("xmlns:Camera"), std::string::npos);
+  EXPECT_NE(stripped.find("xmlns:Container"), std::string::npos);
 }
 
 }  // namespace

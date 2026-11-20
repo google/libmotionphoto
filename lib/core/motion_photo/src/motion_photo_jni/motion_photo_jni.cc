@@ -63,133 +63,11 @@ using libmotionphoto::jni::ScopedUtfChars;
 using libmotionphoto::jni::ThrowOutOfMemoryError;
 using libmotionphoto::jni::ThrowRuntimeException;
 
-// Returns kHeic for ISO BMFF images, which start with an 'ftyp' box, and kJpeg
-// otherwise. The metadata engine parses HEIC and AVIF the same way.
+// Sniffs container file type from header bytes, falling back to kJpeg.
 libmotionphoto::motion_photo::FileType SniffFileType(const uint8_t* data,
                                                      size_t size) {
-  if (data != nullptr && size >= 8 && data[4] == 'f' && data[5] == 't' &&
-      data[6] == 'y' && data[7] == 'p') {
-    return libmotionphoto::motion_photo::FileType::kHeic;
-  }
-  return libmotionphoto::motion_photo::FileType::kJpeg;
+  return libmotionphoto::motion_photo::SniffFileTypeOrDefaultJpeg(data, size);
 }
-
-// Lazy random-access DataSource backed by pread() on an open file descriptor.
-// Reads 64 KB chunks on demand over the full [0, total_length_) range without
-// buffering the entire file in memory.
-class FdDataSource : public libmotionphoto::image_io::DataSource {
- public:
-  FdDataSource(int fd, int64_t base_offset, int64_t total_length)
-      : fd_(fd), base_offset_(base_offset), total_length_(total_length) {}
-
-  ~FdDataSource() override = default;
-
-  void Reset() override { current_data_segment_.reset(); }
-
-  std::shared_ptr<libmotionphoto::image_io::DataSegment> GetDataSegment(
-      size_t begin, size_t min_size) override {
-    if (current_data_segment_ && current_data_segment_->Contains(begin)) {
-      size_t remaining = current_data_segment_->GetEnd() - begin;
-      if (remaining >= min_size) {
-        return current_data_segment_;
-      }
-    }
-    current_data_segment_ = Read(begin, min_size);
-    return current_data_segment_;
-  }
-
-  TransferDataResult TransferData(
-      const libmotionphoto::image_io::DataRange& data_range, size_t best_size,
-      libmotionphoto::image_io::DataDestination* data_destination) override {
-    namespace ii = libmotionphoto::image_io;
-    bool data_transferred = false;
-    ii::DataDestination::TransferStatus status =
-        ii::DataDestination::kTransferDone;
-    if (data_destination && data_range.IsValid() && fd_ >= 0) {
-      size_t min_size = std::min(data_range.GetLength(), best_size);
-      if (current_data_segment_ &&
-          current_data_segment_->GetLength() >= min_size &&
-          current_data_segment_->GetDataRange().Contains(data_range)) {
-        status = data_destination->Transfer(data_range, *current_data_segment_);
-        data_transferred = true;
-      } else {
-        size_t chunk_size = std::max(min_size, static_cast<size_t>(64 * 1024));
-        for (size_t begin = data_range.GetBegin(); begin < data_range.GetEnd();
-             begin += chunk_size) {
-          size_t end = std::min(data_range.GetEnd(), begin + chunk_size);
-          auto data_segment = Read(begin, end - begin);
-          if (data_segment && data_segment->GetLength() > 0) {
-            status = data_destination->Transfer(data_segment->GetDataRange(),
-                                                *data_segment);
-            data_transferred = true;
-          }
-          if (status != ii::DataDestination::kTransferOk || !data_segment ||
-              data_segment->GetLength() == 0) {
-            break;
-          }
-        }
-      }
-    }
-    if (data_transferred) {
-      return status == ii::DataDestination::kTransferError
-                 ? kTransferDataError
-                 : kTransferDataSuccess;
-    }
-    return data_destination ? kTransferDataNone : kTransferDataError;
-  }
-
- private:
-  std::shared_ptr<libmotionphoto::image_io::DataSegment> Read(size_t begin,
-                                                              size_t min_size) {
-    namespace ii = libmotionphoto::image_io;
-    if (fd_ < 0 || total_length_ <= 0 ||
-        begin >= static_cast<size_t>(total_length_)) {
-      return nullptr;
-    }
-    const size_t total = static_cast<size_t>(total_length_);
-    const size_t default_chunk = (begin < 256 * 1024)
-                                     ? static_cast<size_t>(64 * 1024)
-                                     : static_cast<size_t>(4 * 1024);
-    size_t chunk_size = std::max(min_size, default_chunk);
-    size_t read_begin = begin;
-    size_t to_read = std::min(chunk_size, total - begin);
-    if (begin >= 256 * 1024 && total - begin < chunk_size) {
-      read_begin = (total > chunk_size) ? (total - chunk_size) : 0;
-      to_read = total - read_begin;
-    }
-    if (to_read == 0) {
-      return nullptr;
-    }
-
-    auto buffer = std::make_shared<std::vector<ii::Byte>>(to_read);
-    size_t total_bytes_read = 0;
-    while (total_bytes_read < to_read) {
-      ssize_t bytes = pread(
-          fd_, buffer->data() + total_bytes_read, to_read - total_bytes_read,
-          static_cast<off_t>(base_offset_ + read_begin + total_bytes_read));
-      if (bytes <= 0) {
-        if (bytes < 0 && errno == EINTR) continue;
-        break;
-      }
-      total_bytes_read += static_cast<size_t>(bytes);
-    }
-
-    if (total_bytes_read <= (begin - read_begin)) {
-      return nullptr;
-    }
-
-    auto segment = ii::DataSegment::Create(
-        ii::DataRange(read_begin, read_begin + total_bytes_read),
-        buffer->data(), ii::DataSegment::BufferDispositionPolicy::kDontDelete);
-    return std::shared_ptr<ii::DataSegment>(
-        segment.get(), [segment, buffer](ii::DataSegment*) {});
-  }
-
-  int fd_ = -1;
-  int64_t base_offset_ = 0;
-  int64_t total_length_ = 0;
-  std::shared_ptr<libmotionphoto::image_io::DataSegment> current_data_segment_;
-};
 
 jbyteArray ParseMetadataFromFd(JNIEnv* env, int fd, int64_t offset,
                                int64_t length, bool owns_fd) {
@@ -231,14 +109,14 @@ jbyteArray ParseMetadataFromFd(JNIEnv* env, int fd, int64_t offset,
   namespace ii = libmotionphoto::image_io;
 
   ii::MessageHandler message_handler;
-  FdDataSource data_source(fd, offset, slice_length);
+  mp::FdDataSource data_source(fd, offset, slice_length);
 
   mp::MetadataEngine engine(&message_handler);
   engine.RegisterProvider(std::make_unique<mp::GoogleMotionPhotoProvider>());
 
   mp::FileType file_type = mp::FileType::kJpeg;
   if (std::shared_ptr<ii::DataSegment> header_segment =
-          data_source.GetDataSegment(0, 8)) {
+          data_source.GetDataSegment(0, 64)) {
     file_type = SniffFileType(header_segment->GetBuffer(0),
                               header_segment->GetLength());
   }

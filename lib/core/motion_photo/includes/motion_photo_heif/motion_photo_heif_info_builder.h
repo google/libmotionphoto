@@ -15,6 +15,9 @@
 #ifndef MOTION_PHOTO_HEIF_MOTION_PHOTO_HEIF_INFO_BUILDER_H_  // NOLINT
 #define MOTION_PHOTO_HEIF_MOTION_PHOTO_HEIF_INFO_BUILDER_H_  // NOLINT
 
+#include <vector>
+
+#include "image_io/base/data_range.h"
 #include "image_io/base/data_source.h"
 #include "image_io/base/message_handler.h"
 #include "motion_photo/mpvd_box.h"
@@ -35,9 +38,15 @@ class MotionPhotoHeifInfoBuilder {
   /// @return Whether the information was built successfully.
   bool Build(image_io::DataSource* data_source, size_t data_source_length);
 
-  /// @return The data range in the data source that holds the primary XMP data.
+  /// @return The contiguous data range in the data source that holds the
+  /// primary XMP data, or an invalid range if missing or multi-extent.
   const image_io::DataRange& GetXmpStringRange() const {
     return xmp_string_range_;
+  }
+
+  /// @return All file-offset data ranges forming the primary XMP item.
+  const std::vector<image_io::DataRange>& GetXmpStringRanges() const {
+    return xmp_string_ranges_;
   }
 
   /// @return the MpvdBox; use the @c IsValid() function to determine if it was
@@ -47,6 +56,7 @@ class MotionPhotoHeifInfoBuilder {
  private:
   image_io::MessageHandler* message_handler_;
   image_io::DataRange xmp_string_range_;
+  std::vector<image_io::DataRange> xmp_string_ranges_;
   MpvdBox mpvd_box_;
 };
 

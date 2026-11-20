@@ -24,6 +24,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.Locale;
 
 /** Utility class for file operations in the sample app. */
 public class StorageUtils {
@@ -33,33 +34,95 @@ public class StorageUtils {
   @SuppressWarnings("ContentResolverUri")
   public static String copyUriToTempFile(
       Context context, Uri uri, String prefix, String defaultSuffix) throws IOException {
-    InputStream inputStream;
-    if ("file".equals(uri.getScheme())) {
-      inputStream = new FileInputStream(new File(uri.getPath()));
-    } else {
-      inputStream = context.getContentResolver().openInputStream(uri);
+    String suffix = resolveSuffix(context, uri, defaultSuffix);
+    File tempFile = File.createTempFile(prefix, suffix, context.getCacheDir());
+    try (InputStream inputStream = "file".equals(uri.getScheme())
+            ? new FileInputStream(new File(uri.getPath()))
+            : context.getContentResolver().openInputStream(uri)) {
+      if (inputStream == null) {
+        throw new IOException("Failed to open input stream for URI: " + uri);
+      }
+      try (FileOutputStream outputStream = new FileOutputStream(tempFile)) {
+        byte[] buffer = new byte[4096];
+        int bytesRead;
+        while ((bytesRead = inputStream.read(buffer)) != -1) {
+          outputStream.write(buffer, 0, bytesRead);
+        }
+      }
+    } catch (IOException | RuntimeException e) {
+      tempFile.delete();
+      throw e;
     }
-    if (inputStream == null) {
-      throw new IOException("Failed to open input stream for URI: " + uri);
-    }
-    String suffix = defaultSuffix;
+    return tempFile.getAbsolutePath();
+  }
+
+  private static String resolveSuffix(Context context, Uri uri, String defaultSuffix) {
     String mimeType = context.getContentResolver().getType(uri);
     if (mimeType != null) {
-      String ext = MimeTypeMap.getSingleton().getExtensionFromMimeType(mimeType);
-      if (ext != null) {
-        suffix = "." + ext;
+      if (mimeType.equalsIgnoreCase("image/heic") || mimeType.equalsIgnoreCase("image/heif")) {
+        return ".heic";
+      }
+      if (mimeType.equalsIgnoreCase("image/avif")) {
+        return ".avif";
+      }
+      if (!mimeType.equalsIgnoreCase("application/octet-stream") && !mimeType.endsWith("/*")) {
+        String ext = MimeTypeMap.getSingleton().getExtensionFromMimeType(mimeType);
+        if (ext != null && !ext.isEmpty() && !ext.equalsIgnoreCase("bin")) {
+          return "." + ext.toLowerCase(Locale.US);
+        }
       }
     }
-    File tempFile = File.createTempFile(prefix, suffix, context.getCacheDir());
-    FileOutputStream outputStream = new FileOutputStream(tempFile);
-    byte[] buffer = new byte[4096];
-    int bytesRead;
-    while ((bytesRead = inputStream.read(buffer)) != -1) {
-      outputStream.write(buffer, 0, bytesRead);
+    String fileName = getFileNameFromUri(context, uri);
+    return getFileExtension(fileName, defaultSuffix);
+  }
+
+  /** Returns the lowercase dot-prefixed file extension, or {@code fallback} if missing. */
+  public static String getFileExtension(String path, String fallback) {
+    if (path == null || path.isEmpty()) {
+      return fallback;
     }
-    inputStream.close();
-    outputStream.close();
-    return tempFile.getAbsolutePath();
+    int lastSep = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+    int lastDot = path.lastIndexOf('.');
+    if (lastDot > lastSep && lastDot < path.length() - 1) {
+      return path.substring(lastDot).toLowerCase(Locale.US);
+    }
+    return fallback;
+  }
+
+  /** Returns the MIME type for {@code file}, falling back cleanly for HEIC/AVIF/MP4/XML. */
+  public static String getMimeType(File file) {
+    if (file == null) {
+      return "*/*";
+    }
+    String dotExt = getFileExtension(file.getName(), "");
+    String ext = dotExt.isEmpty() ? "" : dotExt.substring(1);
+    if (ext.isEmpty()) {
+      String urlExt = MimeTypeMap.getFileExtensionFromUrl(file.getAbsolutePath());
+      ext = urlExt != null ? urlExt.toLowerCase(Locale.US) : "";
+    }
+    switch (ext) {
+      case "heic":
+      case "heif":
+        return "image/heic";
+      case "avif":
+        return "image/avif";
+      case "jpg":
+      case "jpeg":
+        return "image/jpeg";
+      case "mp4":
+        return "video/mp4";
+      case "xml":
+        return "text/xml";
+      default:
+        break;
+    }
+    if (!ext.isEmpty()) {
+      String resolved = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext);
+      if (resolved != null && !resolved.isEmpty()) {
+        return resolved;
+      }
+    }
+    return "*/*";
   }
 
   @SuppressWarnings("ContentResolverUri")

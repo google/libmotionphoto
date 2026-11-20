@@ -13,6 +13,8 @@ using std::string;
 
 const size_t kMaxSize = std::numeric_limits<size_t>::max();
 const char kXlmNs[] = "xmlns:";
+const char kXmlPrefix[] = "xml";
+const char kXmlUri[] = "http://www.w3.org/XML/1998/namespace";
 const char kXmpMetaPrefix[] = "x";
 const char kXmpMetaUri[] = "adobe:ns:meta/";
 const char kXmpMetaElementName[] = "x:xmpmeta";
@@ -53,8 +55,10 @@ XmpDispatchHandler::XmpDispatchHandler() : is_ns_element_(false) {
   ns_element_name_set_.insert(kXmpMetaElementName);
   ns_element_name_set_.insert(kRdfElementName);
   ns_element_name_set_.insert(kRdfDescriptionElementName);
+  prefix_uri_map_[kXmlPrefix] = kXmlUri;
   prefix_uri_map_[kXmpMetaPrefix] = kXmpMetaUri;
   prefix_uri_map_[kRdfPrefix] = kRdfUri;
+  uri_level_map_[kXmlUri] = 0;
   uri_level_map_[kXmpMetaUri] = 0;
   uri_level_map_[kRdfUri] = 0;
 }

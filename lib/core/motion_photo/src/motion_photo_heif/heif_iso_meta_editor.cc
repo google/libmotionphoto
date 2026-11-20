@@ -1,0 +1,986 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "motion_photo_heif/heif_iso_meta_editor.h"
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include "motion_photo/metadata_value.h"
+
+namespace libmotionphoto {
+namespace motion_photo {
+
+namespace {
+
+constexpr std::string_view kXmpContentType = "application/rdf+xml";
+
+constexpr uint32_t FourCc(const char (&s)[5]) {
+  return (static_cast<uint32_t>(static_cast<uint8_t>(s[0])) << 24) |
+         (static_cast<uint32_t>(static_cast<uint8_t>(s[1])) << 16) |
+         (static_cast<uint32_t>(static_cast<uint8_t>(s[2])) << 8) |
+         static_cast<uint32_t>(static_cast<uint8_t>(s[3]));
+}
+
+constexpr uint32_t kFtyp = FourCc("ftyp");
+constexpr uint32_t kMeta = FourCc("meta");
+constexpr uint32_t kMoov = FourCc("moov");
+constexpr uint32_t kMdat = FourCc("mdat");
+constexpr uint32_t kMpvd = FourCc("mpvd");
+constexpr uint32_t kSefd = FourCc("sefd");
+constexpr uint32_t kPitm = FourCc("pitm");
+constexpr uint32_t kIinf = FourCc("iinf");
+constexpr uint32_t kInfe = FourCc("infe");
+constexpr uint32_t kIloc = FourCc("iloc");
+constexpr uint32_t kIref = FourCc("iref");
+constexpr uint32_t kIdat = FourCc("idat");
+constexpr uint32_t kCdsc = FourCc("cdsc");
+constexpr uint32_t kMime = FourCc("mime");
+
+bool Fail(std::string* error, const char* message) {
+  if (error != nullptr) *error = message;
+  return false;
+}
+
+// Bounds-checked big-endian reader over [data, data + size).
+class Reader {
+ public:
+  Reader(const uint8_t* data, size_t size) : data_(data), size_(size) {}
+
+  bool ReadUint(size_t num_bytes, uint64_t* value) {
+    if (num_bytes > 8 || num_bytes > size_ - pos_) return false;
+    uint64_t v = 0;
+    for (size_t i = 0; i < num_bytes; ++i) v = (v << 8) | data_[pos_ + i];
+    pos_ += num_bytes;
+    *value = v;
+    return true;
+  }
+  bool Skip(size_t num_bytes) {
+    if (num_bytes > size_ - pos_) return false;
+    pos_ += num_bytes;
+    return true;
+  }
+  // Reads a NUL-terminated string (without the terminator).
+  bool ReadCString(std::string_view* value) {
+    const void* nul = std::memchr(data_ + pos_, 0, size_ - pos_);
+    if (nul == nullptr) return false;
+    size_t len = static_cast<const uint8_t*>(nul) - (data_ + pos_);
+    *value = std::string_view(reinterpret_cast<const char*>(data_ + pos_), len);
+    pos_ += len + 1;
+    return true;
+  }
+  size_t pos() const { return pos_; }
+  size_t remaining() const { return size_ - pos_; }
+
+ private:
+  const uint8_t* data_;
+  size_t size_;
+  size_t pos_ = 0;
+};
+
+void WriteUint(std::vector<uint8_t>* out, uint64_t value, size_t num_bytes) {
+  for (size_t i = num_bytes; i > 0; --i) {
+    out->push_back(static_cast<uint8_t>(value >> (8 * (i - 1))));
+  }
+}
+
+void PatchUint32(std::vector<uint8_t>* out, size_t pos, uint32_t value) {
+  for (size_t i = 0; i < 4; ++i) {
+    (*out)[pos + i] = static_cast<uint8_t>(value >> (8 * (3 - i)));
+  }
+}
+
+bool FitsIn(uint64_t value, size_t num_bytes) {
+  return num_bytes >= 8 || value < (uint64_t{1} << (8 * num_bytes));
+}
+
+struct Box {
+  size_t offset = 0;  // Absolute offset of the box header.
+  size_t size = 0;    // Total box size, including the header.
+  size_t header = 0;  // Header length (8, or 16 for a 64-bit size).
+  uint32_t type = 0;
+  bool size_was_zero = false;  // The box size field was 0 ("to end of file").
+
+  size_t end() const { return offset + size; }
+};
+
+// Parses the sequence of boxes inside [begin, end) of `data`.
+bool ParseBoxes(const uint8_t* data, size_t begin, size_t end,
+                std::vector<Box>* boxes) {
+  size_t pos = begin;
+  while (pos < end) {
+    Reader reader(data + pos, end - pos);
+    uint64_t size = 0, type = 0;
+    if (!reader.ReadUint(4, &size) || !reader.ReadUint(4, &type)) return false;
+    Box box;
+    box.offset = pos;
+    box.type = static_cast<uint32_t>(type);
+    box.header = 8;
+    if (size == 1) {
+      if (!reader.ReadUint(8, &size)) return false;
+      box.header = 16;
+    } else if (size == 0) {
+      size = end - pos;
+      box.size_was_zero = true;
+    }
+    if (size < box.header || size > end - pos) return false;
+    box.size = static_cast<size_t>(size);
+    boxes->push_back(box);
+    pos += box.size;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 'iloc' (ISO/IEC 14496-12 8.11.3)
+// ---------------------------------------------------------------------------
+struct IlocExtent {
+  uint64_t index = 0;
+  uint64_t offset = 0;  // base_offset already folded in.
+  uint64_t length = 0;
+};
+
+struct IlocItem {
+  uint32_t id = 0;
+  uint8_t construction_method = 0;
+  uint16_t data_reference_index = 0;
+  std::vector<IlocExtent> extents;
+
+  // True if the extents are absolute offsets into this file.
+  bool IsFileOffset() const {
+    return construction_method == 0 && data_reference_index == 0;
+  }
+};
+
+struct Iloc {
+  uint8_t version = 0;
+  uint32_t flags = 0;
+  uint8_t index_size = 0;
+  std::vector<IlocItem> items;
+};
+
+bool IsValidFieldSize(uint64_t size) {
+  return size == 0 || size == 4 || size == 8;
+}
+
+bool ParseIloc(const uint8_t* payload, size_t size, Iloc* iloc) {
+  Reader r(payload, size);
+  uint64_t version, flags, sizes1, sizes2;
+  if (!r.ReadUint(1, &version) || !r.ReadUint(3, &flags) ||
+      !r.ReadUint(1, &sizes1) || !r.ReadUint(1, &sizes2) || version > 2) {
+    return false;
+  }
+  iloc->version = static_cast<uint8_t>(version);
+  iloc->flags = static_cast<uint32_t>(flags);
+  const size_t offset_size = sizes1 >> 4;
+  const size_t length_size = sizes1 & 0xF;
+  const size_t base_offset_size = sizes2 >> 4;
+  const size_t index_size = version >= 1 ? (sizes2 & 0xF) : 0;
+  if (!IsValidFieldSize(offset_size) || !IsValidFieldSize(length_size) ||
+      !IsValidFieldSize(base_offset_size) || !IsValidFieldSize(index_size)) {
+    return false;
+  }
+  iloc->index_size = static_cast<uint8_t>(index_size);
+  const size_t id_size = version < 2 ? 2 : 4;
+  uint64_t item_count;
+  if (!r.ReadUint(id_size, &item_count)) return false;
+  // Each item needs at least 6 bytes, which bounds hostile item counts.
+  if (item_count > r.remaining() / 6) return false;
+  iloc->items.reserve(item_count);
+  for (uint64_t i = 0; i < item_count; ++i) {
+    IlocItem item;
+    uint64_t id, value, base_offset = 0, extent_count;
+    if (!r.ReadUint(id_size, &id)) return false;
+    item.id = static_cast<uint32_t>(id);
+    if (version >= 1) {
+      if (!r.ReadUint(2, &value)) return false;
+      item.construction_method = static_cast<uint8_t>(value & 0xF);
+    }
+    if (!r.ReadUint(2, &value)) return false;
+    item.data_reference_index = static_cast<uint16_t>(value);
+    if (!r.ReadUint(base_offset_size, &base_offset) ||
+        !r.ReadUint(2, &extent_count)) {
+      return false;
+    }
+    const size_t extent_bytes = index_size + offset_size + length_size;
+    if ((extent_bytes == 0 && extent_count > 1) ||
+        (extent_bytes > 0 && extent_count > r.remaining() / extent_bytes)) {
+      return false;
+    }
+    for (uint64_t e = 0; e < extent_count; ++e) {
+      IlocExtent extent;
+      uint64_t offset = 0;
+      if (!r.ReadUint(index_size, &extent.index) ||
+          !r.ReadUint(offset_size, &offset) ||
+          !r.ReadUint(length_size, &extent.length)) {
+        return false;
+      }
+      if (offset > std::numeric_limits<uint64_t>::max() - base_offset) {
+        return false;
+      }
+      extent.offset = base_offset + offset;
+      item.extents.push_back(extent);
+    }
+    iloc->items.push_back(std::move(item));
+  }
+  return true;
+}
+
+// Serializes `iloc` as a complete 'iloc' box with base_offset_size 0 and the
+// given offset/length field sizes.
+std::vector<uint8_t> SerializeIloc(const Iloc& iloc, size_t offset_size,
+                                   size_t length_size) {
+  std::vector<uint8_t> out;
+  WriteUint(&out, 0, 4);  // Size, patched below.
+  WriteUint(&out, kIloc, 4);
+  WriteUint(&out, iloc.version, 1);
+  WriteUint(&out, iloc.flags, 3);
+  WriteUint(&out, (offset_size << 4) | length_size, 1);
+  WriteUint(&out, iloc.version >= 1 ? iloc.index_size : 0, 1);
+  const size_t id_size = iloc.version < 2 ? 2 : 4;
+  WriteUint(&out, iloc.items.size(), id_size);
+  for (const IlocItem& item : iloc.items) {
+    WriteUint(&out, item.id, id_size);
+    if (iloc.version >= 1) WriteUint(&out, item.construction_method, 2);
+    WriteUint(&out, item.data_reference_index, 2);
+    WriteUint(&out, item.extents.size(), 2);
+    for (const IlocExtent& extent : item.extents) {
+      if (iloc.version >= 1) WriteUint(&out, extent.index, iloc.index_size);
+      WriteUint(&out, extent.offset, offset_size);
+      WriteUint(&out, extent.length, length_size);
+    }
+  }
+  if (!FitsIn(out.size(), 4)) return {};
+  PatchUint32(&out, 0, static_cast<uint32_t>(out.size()));
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// 'iinf' / 'infe' (ISO/IEC 14496-12 8.11.6)
+// ---------------------------------------------------------------------------
+struct InfeEntry {
+  uint32_t id = 0;
+  uint32_t item_type = 0;
+  std::string_view content_type;
+  std::string_view content_encoding;
+  size_t offset = 0;  // Absolute offset of the 'infe' box.
+  size_t size = 0;
+};
+
+struct Iinf {
+  uint8_t version = 0;
+  uint32_t flags = 0;
+  std::vector<InfeEntry> entries;
+};
+
+bool ParseIinf(const uint8_t* data, const Box& box, Iinf* iinf) {
+  Reader r(data + box.offset + box.header, box.size - box.header);
+  uint64_t version, flags, count;
+  if (!r.ReadUint(1, &version) || !r.ReadUint(3, &flags) ||
+      !r.ReadUint(version == 0 ? 2 : 4, &count)) {
+    return false;
+  }
+  iinf->version = static_cast<uint8_t>(version);
+  iinf->flags = static_cast<uint32_t>(flags);
+  std::vector<Box> infe_boxes;
+  const size_t children_begin = box.offset + box.header + r.pos();
+  if (!ParseBoxes(data, children_begin, box.end(), &infe_boxes)) return false;
+  for (const Box& infe : infe_boxes) {
+    if (infe.type != kInfe) continue;
+    InfeEntry entry;
+    entry.offset = infe.offset;
+    entry.size = infe.size;
+    Reader e(data + infe.offset + infe.header, infe.size - infe.header);
+    uint64_t infe_version, infe_flags, id, protection;
+    if (!e.ReadUint(1, &infe_version) || !e.ReadUint(3, &infe_flags) ||
+        !e.ReadUint(infe_version == 3 ? 4 : 2, &id) ||
+        !e.ReadUint(2, &protection)) {
+      return false;
+    }
+    entry.id = static_cast<uint32_t>(id);
+    if (infe_version >= 2) {
+      uint64_t item_type;
+      std::string_view name;
+      if (!e.ReadUint(4, &item_type) || !e.ReadCString(&name)) return false;
+      entry.item_type = static_cast<uint32_t>(item_type);
+      if (entry.item_type == kMime) {
+        if (!e.ReadCString(&entry.content_type)) return false;
+        if (e.remaining() > 0 && !e.ReadCString(&entry.content_encoding)) {
+          return false;
+        }
+      }
+    }
+    iinf->entries.push_back(entry);
+  }
+  if (iinf->entries.size() != count) return false;
+  return true;
+}
+
+std::vector<uint8_t> SerializeXmpInfe(uint32_t id) {
+  std::vector<uint8_t> out;
+  const uint8_t version = id > 0xFFFF ? 3 : 2;
+  WriteUint(&out, 0, 4);
+  WriteUint(&out, kInfe, 4);
+  WriteUint(&out, version, 1);
+  WriteUint(&out, 1, 3);  // flags: hidden (metadata item).
+  WriteUint(&out, id, version == 3 ? 4 : 2);
+  WriteUint(&out, 0, 2);  // item_protection_index
+  WriteUint(&out, kMime, 4);
+  out.push_back(0);  // item_name: empty
+  out.insert(out.end(), kXmpContentType.begin(), kXmpContentType.end());
+  out.push_back(0);
+  if (!FitsIn(out.size(), 4)) return {};
+  PatchUint32(&out, 0, static_cast<uint32_t>(out.size()));
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// 'iref' (ISO/IEC 14496-12 8.11.12)
+// ---------------------------------------------------------------------------
+struct ItemReference {
+  uint32_t type = 0;
+  uint32_t from = 0;
+  std::vector<uint32_t> to;
+};
+
+struct Iref {
+  uint8_t version = 0;
+  uint32_t flags = 0;
+  std::vector<ItemReference> references;
+};
+
+bool ParseIref(const uint8_t* data, const Box& box, Iref* iref) {
+  Reader r(data + box.offset + box.header, box.size - box.header);
+  uint64_t version, flags;
+  if (!r.ReadUint(1, &version) || !r.ReadUint(3, &flags) || version > 1) {
+    return false;
+  }
+  iref->version = static_cast<uint8_t>(version);
+  iref->flags = static_cast<uint32_t>(flags);
+  const size_t id_size = version == 0 ? 2 : 4;
+  std::vector<Box> children;
+  if (!ParseBoxes(data, box.offset + box.header + r.pos(), box.end(),
+                  &children)) {
+    return false;
+  }
+  for (const Box& child : children) {
+    Reader c(data + child.offset + child.header, child.size - child.header);
+    ItemReference ref;
+    ref.type = child.type;
+    uint64_t from, count;
+    if (!c.ReadUint(id_size, &from) || !c.ReadUint(2, &count) ||
+        count > c.remaining() / id_size) {
+      return false;
+    }
+    ref.from = static_cast<uint32_t>(from);
+    for (uint64_t i = 0; i < count; ++i) {
+      uint64_t to;
+      if (!c.ReadUint(id_size, &to)) return false;
+      ref.to.push_back(static_cast<uint32_t>(to));
+    }
+    iref->references.push_back(std::move(ref));
+  }
+  return true;
+}
+
+std::vector<uint8_t> SerializeIref(const Iref& iref) {
+  bool needs_wide_ids = false;
+  for (const ItemReference& ref : iref.references) {
+    needs_wide_ids |= ref.from > 0xFFFF;
+    for (uint32_t to : ref.to) needs_wide_ids |= to > 0xFFFF;
+  }
+  const uint8_t version = needs_wide_ids ? 1 : iref.version;
+  const size_t id_size = version == 0 ? 2 : 4;
+  std::vector<uint8_t> out;
+  WriteUint(&out, 0, 4);
+  WriteUint(&out, kIref, 4);
+  WriteUint(&out, version, 1);
+  WriteUint(&out, iref.flags, 3);
+  for (const ItemReference& ref : iref.references) {
+    if (ref.to.size() > 0xFFFFu) return {};
+    const size_t child_size = 8 + id_size + 2 + id_size * ref.to.size();
+    if (!FitsIn(child_size, 4)) return {};
+    WriteUint(&out, child_size, 4);
+    WriteUint(&out, ref.type, 4);
+    WriteUint(&out, ref.from, id_size);
+    WriteUint(&out, ref.to.size(), 2);
+    for (uint32_t to : ref.to) WriteUint(&out, to, id_size);
+  }
+  if (!FitsIn(out.size(), 4)) return {};
+  PatchUint32(&out, 0, static_cast<uint32_t>(out.size()));
+  return out;
+}
+
+bool ParsePitm(const uint8_t* data, const Box& box, uint32_t* primary_id) {
+  Reader r(data + box.offset + box.header, box.size - box.header);
+  uint64_t version, flags, id;
+  if (!r.ReadUint(1, &version) || !r.ReadUint(3, &flags) ||
+      !r.ReadUint(version == 0 ? 2 : 4, &id)) {
+    return false;
+  }
+  *primary_id = static_cast<uint32_t>(id);
+  return true;
+}
+
+// Returns the top-level box fully containing [offset, offset + length), or
+// nullptr if no single box does.
+const Box* FindContainingBox(const std::vector<Box>& boxes, uint64_t offset,
+                             uint64_t length) {
+  for (const Box& box : boxes) {
+    if (offset >= box.offset && offset <= box.end() &&
+        length <= box.end() - offset) {
+      return &box;
+    }
+  }
+  return nullptr;
+}
+
+bool ExtentsOverlap(const IlocExtent& a, const IlocExtent& b) {
+  if (a.length == 0 || b.length == 0) return false;
+  return a.offset < b.offset ? (b.offset - a.offset) < a.length
+                             : (a.offset - b.offset) < b.length;
+}
+
+// True if `extent` overlaps any extent of another item in the same address
+// space (`construction_method` and `data_reference_index`), i.e. shared bytes
+// that must not be modified.
+bool IsShared(const Iloc& iloc, const IlocItem& target,
+              const IlocExtent& extent) {
+  for (const IlocItem& item : iloc.items) {
+    if (item.id == target.id ||
+        item.construction_method != target.construction_method ||
+        item.data_reference_index != target.data_reference_index) {
+      continue;
+    }
+    for (const IlocExtent& other : item.extents) {
+      if (ExtentsOverlap(extent, other)) return true;
+    }
+  }
+  return false;
+}
+
+struct TopLevelLayout {
+  std::vector<Box> kept;
+  size_t meta_index = 0;
+  bool has_moov = false;
+  bool removed_box_before_kept_box = false;
+};
+
+struct MetaTables {
+  std::vector<Box> children;
+  const Box* pitm_box = nullptr;
+  const Box* iinf_box = nullptr;
+  const Box* iloc_box = nullptr;
+  const Box* iref_box = nullptr;
+  uint32_t primary_id = 0;
+  Iinf iinf;
+  Iloc iloc;
+  Iref iref;
+};
+
+struct PrimaryXmpTarget {
+  std::optional<uint32_t> xmp_id;
+  const InfeEntry* xmp_infe = nullptr;
+  IlocItem* xmp_item = nullptr;
+  bool needs_cdsc_ref = false;
+  uint32_t max_id = 0;
+};
+
+bool ParseTopLevelLayout(const uint8_t* data, size_t size,
+                         TopLevelLayout* out, std::string* error) {
+  std::vector<Box> top;
+  if (!ParseBoxes(data, 0, size, &top)) {
+    return Fail(error, "Malformed or truncated top-level ISO-BMFF boxes");
+  }
+  if (top.empty() || top.front().type != kFtyp) {
+    return Fail(error, "Not an ISO-BMFF file starting with 'ftyp'");
+  }
+  std::optional<size_t> meta_index;
+  bool removed_any = false;
+  for (const Box& box : top) {
+    if (box.type == kMpvd || box.type == kSefd) {
+      removed_any = true;
+      continue;
+    }
+    if (removed_any) out->removed_box_before_kept_box = true;
+    if (box.type == kMoov) out->has_moov = true;
+    if (box.type == kMeta) {
+      if (meta_index.has_value()) {
+        return Fail(error, "Multiple top-level 'meta' boxes");
+      }
+      meta_index = out->kept.size();
+    }
+    out->kept.push_back(box);
+  }
+  if (!meta_index.has_value()) return Fail(error, "No top-level 'meta' box");
+  out->meta_index = *meta_index;
+  return true;
+}
+
+bool ParseMetaTables(const uint8_t* data, const Box& meta_box,
+                     MetaTables* out, std::string* error) {
+  if (meta_box.size - meta_box.header < 4) return Fail(error, "Bad 'meta' box");
+  const size_t meta_children_begin = meta_box.offset + meta_box.header + 4;
+  if (!ParseBoxes(data, meta_children_begin, meta_box.end(), &out->children)) {
+    return Fail(error, "Malformed 'meta' children");
+  }
+  for (const Box& child : out->children) {
+    if (child.type == kPitm && out->pitm_box == nullptr) out->pitm_box = &child;
+    if (child.type == kIinf && out->iinf_box == nullptr) out->iinf_box = &child;
+    if (child.type == kIloc && out->iloc_box == nullptr) out->iloc_box = &child;
+    if (child.type == kIref && out->iref_box == nullptr) out->iref_box = &child;
+  }
+  if (out->pitm_box == nullptr || out->iinf_box == nullptr ||
+      out->iloc_box == nullptr) {
+    return Fail(error, "'meta' is missing 'pitm', 'iinf' or 'iloc'");
+  }
+  if (!ParsePitm(data, *out->pitm_box, &out->primary_id) ||
+      !ParseIinf(data, *out->iinf_box, &out->iinf) ||
+      !ParseIloc(data + out->iloc_box->offset + out->iloc_box->header,
+                 out->iloc_box->size - out->iloc_box->header, &out->iloc) ||
+      (out->iref_box != nullptr && !ParseIref(data, *out->iref_box, &out->iref))) {
+    return Fail(error, "Malformed 'pitm', 'iinf', 'iloc' or 'iref'");
+  }
+  return true;
+}
+
+bool LocatePrimaryXmp(MetaTables* tables, PrimaryXmpTarget* out,
+                      std::string* error) {
+  bool has_any_cdsc = false;
+  for (const ItemReference& ref : tables->iref.references) {
+    if (ref.type == kCdsc) {
+      has_any_cdsc = true;
+      break;
+    }
+  }
+  const InfeEntry* unlinked_xmp_infe = nullptr;
+  for (const InfeEntry& entry : tables->iinf.entries) {
+    out->max_id = std::max(out->max_id, entry.id);
+    if (out->xmp_id.has_value() || entry.item_type != kMime ||
+        !EqualsIgnoreCase(std::string_view(entry.content_type),
+                          kXmpContentType)) {
+      continue;
+    }
+    if (unlinked_xmp_infe == nullptr) {
+      unlinked_xmp_infe = &entry;
+    }
+    for (const ItemReference& ref : tables->iref.references) {
+      if (ref.type == kCdsc && ref.from == entry.id &&
+          std::find(ref.to.begin(), ref.to.end(), tables->primary_id) !=
+              ref.to.end()) {
+        out->xmp_id = entry.id;
+        out->xmp_infe = &entry;
+        break;
+      }
+    }
+  }
+  // Only fall back to an unlinked XMP item when 'iref' contains zero 'cdsc'
+  // references; otherwise keep other items' XMP (e.g. GainMap hdrgm) intact.
+  if (!out->xmp_id.has_value() && !has_any_cdsc &&
+      unlinked_xmp_infe != nullptr) {
+    out->xmp_id = unlinked_xmp_infe->id;
+    out->xmp_infe = unlinked_xmp_infe;
+    out->needs_cdsc_ref = true;
+  }
+  for (const IlocItem& item : tables->iloc.items) {
+    out->max_id = std::max(out->max_id, item.id);
+  }
+  if (out->xmp_id.has_value()) {
+    for (IlocItem& item : tables->iloc.items) {
+      if (item.id == *out->xmp_id) out->xmp_item = &item;
+    }
+    if (out->xmp_item == nullptr) {
+      return Fail(error, "XMP item has no 'iloc' entry");
+    }
+  }
+  return true;
+}
+
+bool ValidateRelocatableExtents(const std::vector<Box>& kept, const Iloc& iloc,
+                                const IlocItem* xmp_item, std::string* error) {
+  // Every non-XMP file-offset extent must live inside a single kept,
+  // non-'meta' top-level box so it can be relocated safely.
+  for (const IlocItem& item : iloc.items) {
+    if (!item.IsFileOffset() || &item == xmp_item) continue;
+    for (const IlocExtent& extent : item.extents) {
+      const Box* box = FindContainingBox(kept, extent.offset, extent.length);
+      if (extent.length == 0 || box == nullptr || box->type == kMeta) {
+        return Fail(error, "Unsupported item extent layout");
+      }
+    }
+  }
+  return true;
+}
+
+bool TryWriteXmpInPlace(const uint8_t* data, const TopLevelLayout& layout,
+                        const MetaTables& tables,
+                        const PrimaryXmpTarget& target, std::string_view xmp,
+                        std::vector<uint8_t>* output, std::string* error,
+                        bool* handled) {
+  *handled = false;
+  if (target.xmp_item == nullptr || !target.xmp_item->IsFileOffset() ||
+      target.xmp_item->extents.size() != 1 ||
+      layout.removed_box_before_kept_box || target.needs_cdsc_ref ||
+      target.xmp_infe == nullptr ||
+      !target.xmp_infe->content_encoding.empty()) {
+    return true;
+  }
+  const IlocExtent& extent = target.xmp_item->extents[0];
+  const Box* box =
+      FindContainingBox(layout.kept, extent.offset, extent.length);
+  if (box == nullptr || box->type == kMeta || xmp.size() > extent.length ||
+      IsShared(tables.iloc, *target.xmp_item, extent)) {
+    return true;
+  }
+  *handled = true;
+  const size_t end = layout.kept.back().end();
+  output->assign(data, data + end);
+  std::memcpy(output->data() + extent.offset, xmp.data(), xmp.size());
+  std::memset(output->data() + extent.offset + xmp.size(), ' ',
+              extent.length - xmp.size());
+  if (layout.kept.back().size_was_zero) {
+    if (!FitsIn(layout.kept.back().size, 4) ||
+        layout.kept.back().header != 8) {
+      return Fail(error, "Unsupported trailing box size");
+    }
+    PatchUint32(output, layout.kept.back().offset,
+                static_cast<uint32_t>(layout.kept.back().size));
+  }
+  return true;
+}
+
+bool BuildUpdatedIinf(const uint8_t* data, const Iinf& iinf,
+                      std::optional<uint32_t> xmp_id, uint32_t new_xmp_id,
+                      std::vector<uint8_t>* new_iinf, std::string* error) {
+  const size_t count = iinf.entries.size() + (new_xmp_id != 0 ? 1 : 0);
+  if (count > 0xFFFFFFFFu) return Fail(error, "'iinf' entry count overflow");
+  const uint8_t version = count > 0xFFFF ? 1 : iinf.version;
+  WriteUint(new_iinf, 0, 4);
+  WriteUint(new_iinf, kIinf, 4);
+  WriteUint(new_iinf, version, 1);
+  WriteUint(new_iinf, iinf.flags, 3);
+  WriteUint(new_iinf, count, version == 0 ? 2 : 4);
+  for (const InfeEntry& entry : iinf.entries) {
+    if (xmp_id.has_value() && entry.id == *xmp_id &&
+        !entry.content_encoding.empty()) {
+      std::vector<uint8_t> rewritten = SerializeXmpInfe(entry.id);
+      if (rewritten.empty()) return Fail(error, "'infe' too large");
+      new_iinf->insert(new_iinf->end(), rewritten.begin(), rewritten.end());
+    } else {
+      new_iinf->insert(new_iinf->end(), data + entry.offset,
+                       data + entry.offset + entry.size);
+    }
+  }
+  if (new_xmp_id != 0) {
+    std::vector<uint8_t> infe = SerializeXmpInfe(new_xmp_id);
+    if (infe.empty()) return Fail(error, "'infe' too large");
+    new_iinf->insert(new_iinf->end(), infe.begin(), infe.end());
+  }
+  if (!FitsIn(new_iinf->size(), 4)) return Fail(error, "'iinf' too large");
+  PatchUint32(new_iinf, 0, static_cast<uint32_t>(new_iinf->size()));
+  return true;
+}
+
+bool RebuildAndEmitContainer(const uint8_t* data, size_t size,
+                             const TopLevelLayout& layout, MetaTables* tables,
+                             PrimaryXmpTarget* target, std::string_view xmp,
+                             std::vector<uint8_t>* output,
+                             std::string* error) {
+  const Box& meta_box = layout.kept[layout.meta_index];
+  std::vector<IlocExtent> orphaned_file_extents;
+  std::vector<IlocExtent> orphaned_idat_extents;
+  if (target->xmp_item != nullptr) {
+    for (const IlocExtent& extent : target->xmp_item->extents) {
+      if (extent.length == 0) continue;
+      if (target->xmp_item->IsFileOffset()) {
+        const Box* box =
+            FindContainingBox(layout.kept, extent.offset, extent.length);
+        if (box != nullptr && box->type != kMeta &&
+            !IsShared(tables->iloc, *target->xmp_item, extent)) {
+          orphaned_file_extents.push_back(extent);
+        }
+      } else if (target->xmp_item->construction_method == 1 &&
+                 !IsShared(tables->iloc, *target->xmp_item, extent)) {
+        orphaned_idat_extents.push_back(extent);
+      }
+    }
+  }
+
+  uint32_t new_xmp_id = 0;
+  if (target->xmp_item == nullptr) {
+    if (target->max_id == std::numeric_limits<uint32_t>::max()) {
+      return Fail(error, "Item id space exhausted");
+    }
+    new_xmp_id = target->max_id + 1;
+    IlocItem item;
+    item.id = new_xmp_id;
+    tables->iloc.items.push_back(item);
+    target->xmp_item = &tables->iloc.items.back();
+    target->needs_cdsc_ref = true;
+  }
+  if (target->needs_cdsc_ref) {
+    ItemReference ref;
+    ref.type = kCdsc;
+    ref.from = new_xmp_id != 0 ? new_xmp_id : target->xmp_item->id;
+    ref.to.push_back(tables->primary_id);
+    tables->iref.references.push_back(ref);
+  }
+  target->xmp_item->construction_method = 0;
+  target->xmp_item->data_reference_index = 0;
+  target->xmp_item->extents.assign(1, IlocExtent{});
+  target->xmp_item->extents[0].length = xmp.size();
+  if (new_xmp_id > 0xFFFF && tables->iloc.version < 2) {
+    tables->iloc.version = 2;
+  }
+
+  std::vector<uint8_t> new_iinf;
+  if (!BuildUpdatedIinf(data, tables->iinf, target->xmp_id, new_xmp_id,
+                        &new_iinf, error)) {
+    return false;
+  }
+  const std::vector<uint8_t> new_iref = SerializeIref(tables->iref);
+  if (new_iref.empty()) return Fail(error, "'iref' too large");
+
+  // Pick iloc field sizes so the 'meta' size does not depend on offsets.
+  uint64_t max_length = xmp.size();
+  for (const IlocItem& item : tables->iloc.items) {
+    for (const IlocExtent& extent : item.extents) {
+      max_length = std::max(max_length, extent.length);
+    }
+  }
+  const size_t length_size = FitsIn(max_length, 4) ? 4 : 8;
+  const std::vector<uint8_t> iloc_wide =
+      SerializeIloc(tables->iloc, 8, length_size);
+  if (iloc_wide.empty()) return Fail(error, "'iloc' too large");
+  uint64_t meta_upper_bound =
+      meta_box.size + new_iinf.size() + new_iref.size() + iloc_wide.size() + 16;
+  const uint64_t total_upper_bound =
+      static_cast<uint64_t>(size) + meta_upper_bound + xmp.size() + 16;
+  const size_t offset_size = FitsIn(total_upper_bound, 4) ? 4 : 8;
+  for (const IlocItem& item : tables->iloc.items) {
+    if (item.IsFileOffset()) continue;
+    for (const IlocExtent& extent : item.extents) {
+      if (!FitsIn(extent.offset, offset_size)) {
+        return Fail(error, "'iloc' offset does not fit");
+      }
+    }
+  }
+  const std::vector<uint8_t> iloc_sized =
+      SerializeIloc(tables->iloc, offset_size, length_size);
+  if (iloc_sized.empty()) return Fail(error, "'iloc' too large");
+  const size_t new_iloc_size = iloc_sized.size();
+
+  size_t meta_payload = 4;  // version + flags
+  for (const Box& child : tables->children) {
+    if (&child == tables->iinf_box) {
+      meta_payload += new_iinf.size();
+    } else if (&child == tables->iloc_box) {
+      meta_payload += new_iloc_size;
+    } else if (&child == tables->iref_box) {
+      meta_payload += new_iref.size();
+    } else {
+      meta_payload += child.size;
+    }
+  }
+  if (tables->iref_box == nullptr) meta_payload += new_iref.size();
+  const size_t meta_header = FitsIn(meta_payload + 8, 4) ? 8 : 16;
+  const size_t new_meta_size = meta_header + meta_payload;
+
+  std::vector<size_t> new_offsets(layout.kept.size());
+  size_t cursor = 0;
+  for (size_t i = 0; i < layout.kept.size(); ++i) {
+    new_offsets[i] = cursor;
+    const Box& box = layout.kept[i];
+    const size_t box_size = box.type == kMeta ? new_meta_size : box.size;
+    if (box.type != kMeta && box.size_was_zero &&
+        (!FitsIn(box.size, 4) || box.header != 8)) {
+      return Fail(error, "Unsupported box size");
+    }
+    cursor += box_size;
+  }
+  const size_t xmp_mdat_header = FitsIn(xmp.size() + 8, 4) ? 8 : 16;
+  const size_t xmp_offset = cursor + xmp_mdat_header;
+  const size_t new_total = xmp_offset + xmp.size();
+
+  for (IlocItem& item : tables->iloc.items) {
+    if (!item.IsFileOffset()) continue;
+    if (&item == target->xmp_item) {
+      item.extents[0].offset = xmp_offset;
+      continue;
+    }
+    for (IlocExtent& extent : item.extents) {
+      for (size_t i = 0; i < layout.kept.size(); ++i) {
+        const Box& box = layout.kept[i];
+        if (extent.offset >= box.offset && extent.offset <= box.end() &&
+            extent.length <= box.end() - extent.offset) {
+          extent.offset = new_offsets[i] + (extent.offset - box.offset);
+          break;
+        }
+      }
+    }
+  }
+  for (const IlocItem& item : tables->iloc.items) {
+    for (const IlocExtent& extent : item.extents) {
+      if (!FitsIn(extent.offset, offset_size)) {
+        return Fail(error, "'iloc' offset does not fit");
+      }
+    }
+  }
+  const std::vector<uint8_t> new_iloc =
+      SerializeIloc(tables->iloc, offset_size, length_size);
+  if (new_iloc.size() != new_iloc_size) {
+    return Fail(error, "Internal 'iloc' size mismatch");
+  }
+
+  output->clear();
+  output->reserve(new_total);
+  for (const Box& box : layout.kept) {
+    if (box.type != kMeta) {
+      const size_t start = output->size();
+      output->insert(output->end(), data + box.offset, data + box.end());
+      if (box.size_was_zero) {
+        PatchUint32(output, start, static_cast<uint32_t>(box.size));
+      }
+      continue;
+    }
+    if (meta_header == 8) {
+      WriteUint(output, new_meta_size, 4);
+      WriteUint(output, kMeta, 4);
+    } else {
+      WriteUint(output, 1, 4);
+      WriteUint(output, kMeta, 4);
+      WriteUint(output, new_meta_size, 8);
+    }
+    output->insert(output->end(), data + box.offset + box.header,
+                   data + box.offset + box.header + 4);
+    if (tables->iref_box == nullptr && !tables->children.empty() &&
+        tables->children.back().size_was_zero) {
+      if (!FitsIn(tables->children.back().size, 4) ||
+          tables->children.back().header != 8) {
+        return Fail(error, "Unsupported 'meta' child box size");
+      }
+    }
+    for (const Box& child : tables->children) {
+      if (&child == tables->iinf_box) {
+        output->insert(output->end(), new_iinf.begin(), new_iinf.end());
+      } else if (&child == tables->iloc_box) {
+        output->insert(output->end(), new_iloc.begin(), new_iloc.end());
+      } else if (&child == tables->iref_box) {
+        output->insert(output->end(), new_iref.begin(), new_iref.end());
+      } else {
+        const size_t child_start = output->size();
+        output->insert(output->end(), data + child.offset, data + child.end());
+        if (child.size_was_zero && tables->iref_box == nullptr) {
+          PatchUint32(output, child_start, static_cast<uint32_t>(child.size));
+        }
+        if (child.type == kIdat && !orphaned_idat_extents.empty()) {
+          const size_t idat_payload_len = child.size - child.header;
+          for (const IlocExtent& extent : orphaned_idat_extents) {
+            if (extent.offset <= idat_payload_len &&
+                extent.length <= idat_payload_len - extent.offset) {
+              std::memset(output->data() + child_start + child.header +
+                              static_cast<size_t>(extent.offset),
+                          ' ', static_cast<size_t>(extent.length));
+            }
+          }
+        }
+      }
+    }
+    if (tables->iref_box == nullptr) {
+      output->insert(output->end(), new_iref.begin(), new_iref.end());
+    }
+  }
+  if (xmp_mdat_header == 8) {
+    WriteUint(output, xmp.size() + 8, 4);
+    WriteUint(output, kMdat, 4);
+  } else {
+    WriteUint(output, 1, 4);
+    WriteUint(output, kMdat, 4);
+    WriteUint(output, xmp.size() + 16, 8);
+  }
+  output->insert(output->end(), xmp.begin(), xmp.end());
+  if (output->size() != new_total) {
+    return Fail(error, "Internal layout size mismatch");
+  }
+
+  // Blank superseded XMP payloads so tools scanning raw bytes skip stale data.
+  for (const IlocExtent& extent : orphaned_file_extents) {
+    for (size_t i = 0; i < layout.kept.size(); ++i) {
+      const Box& box = layout.kept[i];
+      if (extent.offset >= box.offset && extent.offset <= box.end() &&
+          extent.length <= box.end() - extent.offset && box.type != kMeta) {
+        std::memset(
+            output->data() + new_offsets[i] + (extent.offset - box.offset), ' ',
+            extent.length);
+        break;
+      }
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
+bool HeifIsoMetaEditor::SetPrimaryXmp(const uint8_t* data, size_t size,
+                                      std::string_view xmp,
+                                      std::vector<uint8_t>* output,
+                                      std::string* error) {
+  if (data == nullptr || output == nullptr || xmp.empty()) {
+    return Fail(error, "Invalid arguments");
+  }
+
+  TopLevelLayout layout;
+  if (!ParseTopLevelLayout(data, size, &layout, error)) {
+    return false;
+  }
+
+  MetaTables tables;
+  if (!ParseMetaTables(data, layout.kept[layout.meta_index], &tables, error)) {
+    return false;
+  }
+
+  PrimaryXmpTarget target;
+  if (!LocatePrimaryXmp(&tables, &target, error)) {
+    return false;
+  }
+  if (!ValidateRelocatableExtents(layout.kept, tables.iloc, target.xmp_item,
+                                  error)) {
+    return false;
+  }
+  if (layout.has_moov) {
+    return Fail(error, "Image sequences ('moov') are not supported");
+  }
+
+  bool in_place_handled = false;
+  if (!TryWriteXmpInPlace(data, layout, tables, target, xmp, output, error,
+                          &in_place_handled)) {
+    return false;
+  }
+  if (in_place_handled) {
+    return true;
+  }
+
+  return RebuildAndEmitContainer(data, size, layout, &tables, &target, xmp,
+                                 output, error);
+}
+
+}  // namespace motion_photo
+}  // namespace libmotionphoto

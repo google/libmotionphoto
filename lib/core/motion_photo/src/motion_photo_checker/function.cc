@@ -127,6 +127,39 @@ string String(const T& value) {
 
 int CheckMotionPhoto(const string& motion_photo_file_name,
                      const StringOutputter& outputter) {
+  FileType file_type = GetFileTypeFromFileName(motion_photo_file_name);
+  if (file_type == FileType::kUnsupported) {
+    MessageHandler message_handler;
+    unique_ptr<image_io::MessageWriter> message_writer(
+        new StringOutputterMessageWriter(outputter));
+    message_handler.SetMessageWriter(std::move(message_writer));
+    auto message_stats = message_handler.GetMessageStats();
+    MessageStatsWriter stats_writer(message_stats, kCheckerName, outputter);
+    message_handler.ReportMessage(
+        Message::kDecodingError,
+        "File type (based on extension) not supported");
+    return -1;
+  }
+
+  MessageHandler message_handler;
+  unique_ptr<image_io::MessageWriter> message_writer(
+      new StringOutputterMessageWriter(outputter));
+  message_handler.SetMessageWriter(std::move(message_writer));
+  unique_ptr<DataSource> data_source;
+  size_t file_size = 0;
+  tie(data_source, file_size) =
+      ReadFile(motion_photo_file_name, outputter, &message_handler);
+  if (data_source == nullptr || file_size == 0) {
+    return 1;
+  }
+  return CheckMotionPhotoFromSource(data_source.get(), file_size, file_type,
+                                    motion_photo_file_name, outputter);
+}
+
+int CheckMotionPhotoFromSource(DataSource* data_source, size_t file_size,
+                               FileType file_type,
+                               const string& motion_photo_file_name,
+                               const StringOutputter& outputter) {
   MessageHandler message_handler;
   unique_ptr<image_io::MessageWriter> message_writer(
       new StringOutputterMessageWriter(outputter));
@@ -134,44 +167,35 @@ int CheckMotionPhoto(const string& motion_photo_file_name,
   auto message_stats = message_handler.GetMessageStats();
   MessageStatsWriter stats_writer(message_stats, kCheckerName, outputter);
 
-  // Check the file name (which can produce only warnings, no errors).
-  // Read the file into a data source for later.
-  size_t file_size = 0;
-  FileType file_type = GetFileTypeFromFileName(motion_photo_file_name);
   if (file_type == FileType::kUnsupported) {
-    message_handler.ReportMessage(
-        Message::kDecodingError,
-        "File type (based on extension) not supported");
+    message_handler.ReportMessage(Message::kDecodingError,
+                                  "File type not supported");
     return -1;
+  }
+  if (data_source == nullptr || file_size == 0) {
+    return 1;
   }
 
   MotionPhoto motion_photo(file_type);
   MotionPhotoReader motion_photo_reader(&motion_photo, &message_handler);
   MotionPhotoChecker motion_photo_checker(motion_photo, &message_handler);
 
-  unique_ptr<DataSource> data_source;
-  tie(data_source, file_size) =
-      ReadFile(motion_photo_file_name, outputter, &message_handler);
-  if (data_source == nullptr || file_size == 0) {
-    return 1;
-  }
-
   // Get the primary image size and the location in the data source of the
   // primary XMP segment string.
   size_t image_size = 0;
-  DataRange xmp_range;
+  std::vector<DataRange> xmp_ranges;
   MpvdBox mpvd_box;
-  tie(image_size, xmp_range, mpvd_box) = GetImageSizeAndXmpRange(
-      data_source.get(), file_size, file_type, motion_photo_file_name, "", outputter,
+  tie(image_size, xmp_ranges, mpvd_box) = GetImageSizeAndXmpRanges(
+      data_source, file_size, file_type, motion_photo_file_name, "", outputter,
       &message_handler);
-  if ((image_size == 0) || !xmp_range.IsValid()) {
+  if ((image_size == 0) || xmp_ranges.empty()) {
     return 1;
   }
   motion_photo.SetMpvdBox(mpvd_box);
 
   // Parse the XMP metadata string from the data source and check the values.
-  if (!ParseAndCheckXmpMetadata(data_source.get(), file_size, file_type,
-                                motion_photo_file_name, xmp_range, image_size,
+  if (!ParseAndCheckXmpMetadata(data_source, file_size, file_type,
+                                motion_photo_file_name, xmp_ranges, image_size,
                                 "", &motion_photo, &motion_photo_reader,
                                 &motion_photo_checker, outputter)) {
     return 1;
@@ -180,10 +204,11 @@ int CheckMotionPhoto(const string& motion_photo_file_name,
   // Read and decode and check the MP4 track data and metadata.
   int64_t offset = motion_photo.GetMp4FileOffset(file_size);
 
-  if (offset < file_size) {
+  if (offset >= 0 && static_cast<size_t>(offset) < file_size) {
     if (!ReadDecodeAndCheckVideoMetadata(
-            motion_photo_file_name, offset, &motion_photo, &motion_photo_reader,
-            &motion_photo_checker, outputter, &message_handler)) {
+            data_source, file_size, motion_photo_file_name, offset,
+            &motion_photo, &motion_photo_reader, &motion_photo_checker,
+            outputter, &message_handler)) {
       return 0;
     }
   }
